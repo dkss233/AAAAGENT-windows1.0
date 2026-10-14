@@ -1,156 +1,70 @@
 ========================================================================
-  Live2D 表情情绪映射 —— 修改说明
+  Live2D 表情与情绪映射 —— 说明
 ========================================================================
 
-【★ 2026/10/14 更新：现在不需要改文件了 ★】
+【★ 现在不需要手工改文件 ★】
 
-  控制台的「表情与动作」页面已经支持直接操作：
+  控制台的「表情与动作」页面已经支持直接操作，改完立即生效，
+  不需要重新构建、不需要重新固定指纹、不需要重启桌宠。
 
-    · 情绪映射：每张表情卡片下方有一排情绪勾选框
-                （开心 / 悲伤 / 温柔 / 生气 / 惊讶），点一下就保存生效。
-                同一个情绪被别的表情占用时会标注出来（如「温柔 · 飞天」），
-                勾选即改由本表情使用。
+    · 情绪映射
+        在「表情与动作」页里，为每个情绪指定一个表情。
+        一个情绪对应一个表情；改配到新的表情会自动从旧的那里移过来。
 
-    · 隐藏表情：每张卡片有「不显示」勾选框。
-                不需要的表情（例如作者署名的「水印」）勾上后就不再出现在列表里，
-                也不会被自动使用。想找回来时点「已隐藏」分类即可恢复。
+    · 是否持续启用该表情
+        勾上后该表情的效果常驻。
+        适用于"外观开关"型的表情 —— 例如模型作者署名用的标记类表情。
 
-  以上两项都是【立即生效】，不需要重新构建、不需要重新固定指纹、不需要重启桌宠。
+    · 预览
+        预览面板下方有缩放滑块（0.2×–8×），便于看清模型细节。
 
-  下面的手工修改方式保留作参考（例如需要批量改或控制台打不开时）。
-
-========================================================================
-
-【要改的文件】
-    D:\AAAAGENT\windows\code\desktop-pet\desktop\assets\local-model\presets.json
-
-  （另一个 desktop\assets\jellyfish\presets.json 是镜像副本，构建时会同步处理，
-    不要手动改它。）
+  完整的界面说明见同目录的《使用说明.txt》。
 
 
 ========================================================================
-【目的】
+【什么时候还需要手工改】
 ========================================================================
-  桌宠不是"手动选表情"，而是「根据对话情绪自动切表情」。
-  要让某个表情被自动使用，必须给它加两条信息：
+  仅在以下情况才需要直接编辑预设文件：
+
+    · 控制台打不开
+    · 需要批量修改很多条目
+    · 需要在桌宠启动前就准备好配置
+
+  手工修改的对象是模型自己的预设文件，其中的条目由导入工具生成：
+
+    <项目根>\code\desktop-pet\desktop\assets\<模型目录>\presets.json
+
+  ★ 不要手改 desktop\assets\jellyfish\ 下的副本 —— 它是构建时同步的镜像。
+
+
+========================================================================
+【条目字段的含义】
+========================================================================
+  要让一个表情被自动使用，条目需要有这三条信息：
+
       "availability": "automatic"     ← 允许自动使用
-      "emotions": ["happy"]           ← 挂到哪种情绪
-      "expressionName": "飞天"        ← 对应模型里的表情名（必须完全一致）
+      "emotions": ["happy"]           ← 挂到哪种情绪（可多个）
+      "expressionName": "<表情名>"     ← 必须与模型里的表情名完全一致
 
-  ★ 没有这三条的条目，只能在控制台里"手动预览"，桌宠运行时永远不会用。
+  ★ 缺少这三条的条目只能在控制台里手动预览，运行时不会被自动使用。
+
+  注意：expressionName 必须填**你自己模型里的真实表情名**。
+  不同模型的表情名各不相同，请以导入后 presets.json 里生成的内容为准。
 
 
 ========================================================================
-【可用的情绪值】必须从这 6 个里选，写错会被当成 neutral
+【可用的情绪值】
 ========================================================================
-    neutral      中性（默认，不触发表情）
-    happy        开心
-    sad          悲伤
-    warm         温柔 / 温暖 / 安慰
-    angry        生气
-    surprised    惊讶
+  必须从这 6 个里选，写错会被当成 neutral：
+
+      neutral      中性（默认，不触发表情）
+      happy        开心
+      sad          悲伤
+      warm         温柔 / 温暖 / 安慰
+      angry        生气
+      surprised    惊讶
 
   一个表情可以挂多个情绪，例如： "emotions": ["happy", "surprised"]
-
-
-========================================================================
-【表情名对照表】expressionName 必须写模型里的真实名字
-========================================================================
-    id                  label     expressionName（要填这个）
-    ------------------  --------  ----------------------
-    expr-expression-1   水印      水印
-    expr-expression-2   生气      生气
-    expr-expression-3   脖子      脖子
-    expr-expression-4   脸红      脸红
-    expr-expression-5   飞天      飞天
-    expr-expression-6   黑        黑
-
-
-========================================================================
-【完整模板】把 items 数组整个替换成下面内容，按你的想法改 emotions
-========================================================================
-{
-  "schemaVersion": 1,
-  "modelId": "local-model",
-  "modelFingerprint": "50b01ce028a4beb49785bd498e152ef0df9589b57aedd9340fddfb99d90e0b37",
-  "items": [
-    {
-      "id": "expr-expression-1",
-      "label": "水印",
-      "category": "expression",
-      "source": "model-expression",
-      "availability": "manual",
-      "defaultEnabled": false,
-      "previewable": true
-    },
-    {
-      "id": "expr-expression-2",
-      "label": "生气",
-      "category": "expression",
-      "source": "model-expression",
-      "availability": "automatic",
-      "defaultEnabled": true,
-      "previewable": true,
-      "emotions": ["angry"],
-      "expressionName": "生气"
-    },
-    {
-      "id": "expr-expression-3",
-      "label": "脖子",
-      "category": "expression",
-      "source": "model-expression",
-      "availability": "manual",
-      "defaultEnabled": false,
-      "previewable": true
-    },
-    {
-      "id": "expr-expression-4",
-      "label": "脸红",
-      "category": "expression",
-      "source": "model-expression",
-      "availability": "automatic",
-      "defaultEnabled": true,
-      "previewable": true,
-      "emotions": ["warm"],
-      "expressionName": "脸红"
-    },
-    {
-      "id": "expr-expression-5",
-      "label": "飞天",
-      "category": "expression",
-      "source": "model-expression",
-      "availability": "automatic",
-      "defaultEnabled": true,
-      "previewable": true,
-      "emotions": ["happy", "surprised"],
-      "expressionName": "飞天"
-    },
-    {
-      "id": "expr-expression-6",
-      "label": "黑",
-      "category": "expression",
-      "source": "model-expression",
-      "availability": "automatic",
-      "defaultEnabled": true,
-      "previewable": true,
-      "emotions": ["sad"],
-      "expressionName": "黑"
-    }
-  ]
-}
-
-  上面是"建议映射"，你可以自由改 emotions。想保留某个表情纯手动预览，
-  就不要加 availability/emotions/expressionName 这三条（照 expr-expression-1 的写法）。
-
-
-========================================================================
-【★ 重要：modelFingerprint 那一行不要改 ★】
-========================================================================
-  它必须保持：
-      "modelFingerprint": "50b01ce028a4beb49785bd498e152ef0df9589b57aedd9340fddfb99d90e0b37"
-
-  这是模型内容的指纹校验值。改了它、或改了模型文件，桌宠会报
-  「模型与预设目录版本不一致」并拒绝加载。
 
 
 ========================================================================
@@ -158,28 +72,31 @@
 ========================================================================
   打开 PowerShell，依次执行：
 
-    cd D:\AAAAGENT\windows\code\desktop-pet
-    npm run build:desktop
-    node tools\repin-config.mjs --activate
+      cd <项目根>\code\desktop-pet
+      npm run build:desktop
+      node tools\repin-config.mjs --activate
 
-  原因：presets.json 会被「烘焙」进渲染器（desktop\build\renderer.js），
+  原因：presets.json 会被"烘焙"进渲染器（desktop\build\renderer.js），
         不重新构建的话桌宠读到的还是旧配置。
 
-  然后重启桌宠（双击 D:\AAAAGENT\windows\启动桌宠.cmd）。
+  然后重启桌宠（双击 启动桌宠.cmd）。
 
 
 ========================================================================
 【改前建议备份】
 ========================================================================
-    copy "D:\AAAAGENT\windows\code\desktop-pet\desktop\assets\local-model\presets.json" ^
-         "D:\AAAAGENT\windows\.local\presets-backup.json"
+  复制 presets.json 到项目外任意位置留底即可。
 
 
 ========================================================================
-【一个注意点】
+【注意点】
 ========================================================================
-  连字符写法（"modelFingerprint"）是对的 —— JSON 里不能用下划线。
+  · 文件必须保存为 UTF-8 **无 BOM**，否则解析会失败。
+    推荐用 VS Code 保存。
 
-  文件必须保存为 UTF-8 无 BOM，否则解析会失败。
-  推荐用 VS Code 或 记事本 保存。
+  · 字段名用连字符写法（"modelFingerprint"）—— JSON 里不能用下划线。
+
+  · 不要手改 modelFingerprint —— 它是模型内容的校验值。
+    改了它、或改了模型文件，桌宠会报「模型与预设目录版本不一致」并拒绝加载。
+    更换模型后应让换模型工具重新生成，而不是手工编辑。
 ========================================================================
