@@ -60,3 +60,7 @@ id_ed25519*
 
 # This merged font includes glyph sources without established redistribution terms.
 /t3-source/apps/web/src/terminal/ghostty/fonts/SymbolsNerdFontMono-Regular.woff2
+
+# Private working log. The repository ships the sanitised public edition instead, so this one
+# stays on the operator machine.
+/桌宠开发日志.md
