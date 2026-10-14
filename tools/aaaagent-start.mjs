@@ -4,12 +4,15 @@
 // AAAAGENT_START_HARNESS=1 to get the old behaviour of starting it up front.
 import { spawn } from 'node:child_process';
 import { closeSync, existsSync, openSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { loadProfile, originAlive, readOrigin, readTokenUrl, startHarnessHost } from './aaaagent-harness-host.mjs';
 import { clearOrphanedPetProcesses } from './aaaagent-pet-orphans.mjs';
 // Starting the host itself (spawn/openSync/engineEnvironment) lives in aaaagent-harness-host.mjs.
 
-const root = 'D:\\AAAAGENT\\windows';
+// tools/ sits directly under the project root, so derive it instead of hard-coding an install path.
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const profile = loadProfile(root);
 
 // A stale lock from an earlier attempt makes the project refuse a new host; clear only ours.
@@ -53,10 +56,10 @@ const orphans = clearOrphanedPetProcesses();
 if (orphans.skipped) console.log('  检测到桌宠已在运行，跳过残留清理');
 else if (orphans.shells > 0) console.log('  已清理上次强制关闭留下的残留进程（' + orphans.cleaned + ' 个）');
 
-// Which tree Harness sessions run in. Defaults to the operator's own workspace so the pet sees real
+// Which tree Harness sessions run in. Defaults to the operator's home directory so the pet sees real
 // projects instead of the engine's private empty workspace; override with the first argument or
 // AAAAGENT_HARNESS_WORKSPACE.
-const workspace = process.argv[2] ?? process.env.AAAAGENT_HARNESS_WORKSPACE ?? 'D:\\deepseek';
+const workspace = process.argv[2] ?? process.env.AAAAGENT_HARNESS_WORKSPACE ?? homedir();
 const workspaceOk = existsSync(workspace);
 if (workspaceOk) console.log('  Harness 工作区: ' + workspace);
 else console.log('  ⚠ Harness 工作区不存在（' + workspace + '），桌宠将回退到自带的空工作区');

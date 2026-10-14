@@ -180,7 +180,7 @@ export function createPresentationView(client,render) {
           el('span',{class:'preset-summary-value'+(item?'':' is-empty')},item?item.label:'（未设置，不会切换表情）'));
       })));
     const list=el('section',{class:'card preset-list'},el('div',{class:'section-head'},el('h2',{},'表情与动作'),el('span',{class:'subtle'},filtered.length+' 项')),search,filters,
-      el('p',{class:'subtle'},'每张表情卡片右侧的下拉框决定它对应哪种情绪。勾选「是否持续启用该表情」后，桌宠会一直保持这个表情的效果（例如「水印」持续启用后，它的 Param50 会一直为 1，水印就不再显示）—— 取消勾选即可恢复。'),
+      el('p',{class:'subtle'},'每张表情卡片右侧的下拉框决定它对应哪种情绪。勾选「是否持续启用该表情」后，桌宠会一直保持这个表情的效果（例如署名标记类的表情持续启用后就不再显示）—— 取消勾选即可恢复。'),
       el('div',{class:'preset-cards'},filtered.map(p=>{
         const allowed=enabled.has(p.id),isSelected=selected===p.id,isHidden=hidden.has(p.id);
         const card=el('article',{class:'preset-card'+(isSelected?' is-selected':'')+(isHidden?' is-hidden':''),'data-preset-id':p.id},

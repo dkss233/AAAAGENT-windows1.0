@@ -23,7 +23,8 @@ export interface PresentationPolicy {
    *  to the value in `hiddenValues`, which is what actually removes them from the rendered rig. */
   readonly hiddenIds: readonly string[];
   /** preset id → the value to force that preset's parameters to when hidden. Defaults to 0, but a
-   *  rig may invert its control (this rig shows its watermark at Param50 = 1, so hiding needs 0). */
+   *  rig may invert its control — an author-mark expression can be shown at one value and hidden at
+   *  another — so the stored value is whatever the operator measured on their own model. */
   readonly hiddenValues: Readonly<Record<string, number>>;
 }
 export interface PresentationControls {

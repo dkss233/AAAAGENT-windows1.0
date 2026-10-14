@@ -110,10 +110,11 @@
 
   Q: 启动时提示「试用程序文件缺失或已变化」？
   A: 程序文件被改动过但没重新固定。在
-       D:\AAAAGENT\windows\code\desktop-pet
+       <项目根>\code\desktop-pet
      目录里执行：
        node tools\repin-config.mjs --activate
      然后重启桌宠。
+     （<项目根> 就是你放这个项目的位置，例如 D:\AAAAGENT\windows）
 
   Q: 换了模型后控制台报「只能隐藏本模型的预设条目」？
   A: 旧设置里残留了上一个模型的条目。已修复为启动时自动丢弃失效设置。

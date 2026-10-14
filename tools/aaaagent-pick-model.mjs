@@ -39,7 +39,7 @@ console.log('  更换 Live2D 模型');
 console.log('============================================');
 console.log('');
 console.log('  即将打开文件夹选择窗口，请选到模型所在的文件夹。');
-console.log('  （例如 D:\\live2d\\蚊子 —— 如果里面还套了一层同名文件夹，');
+console.log('  （例如 D:\\live2d\\<你的模型文件夹> —— 如果里面还套了一层同名文件夹，');
 console.log('    安装工具会自动进入，你不用手动点进去。）');
 console.log('');
 

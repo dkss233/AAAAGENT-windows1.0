@@ -182,7 +182,8 @@ export class JellyfishRenderer extends CubismUserModel {
   }
   /** Parameters forced by the operator's "隐藏" choices, as offsets from the rig's own baseline.
    *  The value comes from the policy (or the hidden expression's own parameter value), because a
-   *  rig may invert its control: this rig shows its watermark at Param50 = 0 and hides it at 1. */
+   *  rig may invert its control — an author-mark expression can be shown at one value and hidden at
+ *  another — so the forced value is taken from the policy or from the expression itself. */
   hiddenParameters() {
     const result = new Map();
     for (const [presetId, chosen] of this.hiddenValues ?? []) {
