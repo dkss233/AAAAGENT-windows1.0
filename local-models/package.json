@@ -1,0 +1,15 @@
+{
+  "name": "aaaagent-local-models",
+  "version": "0.2.0-dev.1",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "start": "node src/cli.mjs serve",
+    "configure": "node src/cli.mjs init",
+    "doctor": "node src/cli.mjs doctor",
+    "verify:speech": "node tools/verify-speech-matrix.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
+  },
+  "dependencies": { "sherpa-onnx-node": "1.13.8" }
+}

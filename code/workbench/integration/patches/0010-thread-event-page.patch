@@ -1,0 +1,116 @@
+diff --git a/packages/contracts/src/environmentHttp.ts b/packages/contracts/src/environmentHttp.ts
+--- a/packages/contracts/src/environmentHttp.ts
++++ b/packages/contracts/src/environmentHttp.ts
+@@ -522,6 +522,32 @@
+   status: OrchestrationCommandReceiptStatus,
+ }));
+ 
++/** A bounded, metadata-only page. Raw messages and tool payloads never leave this route. */
++const EnvironmentThreadEventPage = Schema.Struct({
++  threadId: ThreadId,
++  afterSequence: NonNegativeInt,
++  headSequence: NonNegativeInt,
++  nextSequence: NonNegativeInt,
++  hasMore: Schema.Boolean,
++  resetRequired: Schema.Boolean,
++  resetReason: Schema.optional(Schema.Literals(["cursor_ahead", "gap_too_large", "payload_too_large"])),
++  events: Schema.Array(Schema.Struct({
++    eventId: TrimmedNonEmptyString,
++    sequence: NonNegativeInt,
++    occurredAt: IsoDateTime,
++    type: TrimmedNonEmptyString,
++    turnId: Schema.optional(TrimmedNonEmptyString),
++    activityId: Schema.optional(TrimmedNonEmptyString),
++    activityKind: Schema.optional(TrimmedNonEmptyString),
++    activityTone: Schema.optional(Schema.Literals(["info", "tool", "approval", "error"])),
++    sessionStatus: Schema.optional(TrimmedNonEmptyString),
++  })),
++});
++const EnvironmentThreadEventPageQuery = {
++  afterSequence: Schema.FiniteFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
++  limit: Schema.FiniteFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(100)),
++};
++
+ const EnvironmentProviderModels = Schema.Struct({
+   providers: Schema.Array(Schema.Struct({
+     instanceId: TrimmedNonEmptyString,
+@@ -571,6 +597,15 @@
+       params: EnvironmentOrchestrationThreadSnapshotParams,
+       payload: EnvironmentOrchestrationThreadSnapshotQuery,
+       success: OrchestrationThreadDetailSnapshot,
++      error: EnvironmentOrchestrationThreadSnapshotErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
++  .add(
++    HttpApiEndpoint.get("threadEventPage", "/api/orchestration/threads/:threadId/events", {
++      headers: OptionalBearerHeaders,
++      params: EnvironmentOrchestrationThreadSnapshotParams,
++      payload: EnvironmentThreadEventPageQuery,
++      success: EnvironmentThreadEventPage,
+       error: EnvironmentOrchestrationThreadSnapshotErrors,
+     }).middleware(EnvironmentAuthenticatedAuth),
+   )
+diff --git a/apps/server/src/orchestration/http.ts b/apps/server/src/orchestration/http.ts
+--- a/apps/server/src/orchestration/http.ts
++++ b/apps/server/src/orchestration/http.ts
+@@ -7,6 +7,7 @@
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+ import * as Option from "effect/Option";
++import * as Stream from "effect/Stream";
+ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+ 
+ import { projectThreadDetailSnapshot } from "./ActivityPayloadProjection.ts";
+@@ -132,6 +133,52 @@
+         }),
+       )
+       .handle(
++        "threadEventPage",
++        Effect.fn("environment.orchestration.threadEventPage")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
++          const threadId = args.params.threadId;
++          const afterSequence = args.payload.afterSequence;
++          const limit = args.payload.limit;
++          const existing = yield* projectionSnapshotQuery.getThreadDetailSnapshot(threadId, { turnLimit: 1 }).pipe(
++            Effect.catch((cause) => failEnvironmentInternal("orchestration_thread_snapshot_failed", cause)),
++          );
++          if (Option.isNone(existing)) return yield* failEnvironmentNotFound("thread_not_found");
++          const headSequence = yield* orchestrationEngine.latestSequence;
++          const reset = (reason: "cursor_ahead" | "gap_too_large" | "payload_too_large") => ({
++            threadId, afterSequence, headSequence, nextSequence: headSequence,
++            hasMore: false, resetRequired: true, resetReason: reason, events: [],
++          });
++          if (afterSequence > headSequence) return reset("cursor_ahead");
++          if (headSequence - afterSequence > 1_000) return reset("gap_too_large");
++          const range = { threadId, fromSequenceExclusive: afterSequence, toSequenceInclusive: headSequence };
++          const stats = yield* orchestrationEngine.getThreadReplayStats({ ...range, maxEvents: limit + 1 }).pipe(
++            Effect.catch((cause) => failEnvironmentInternal("orchestration_snapshot_failed", cause)),
++          );
++          if (stats.payloadBytes > 8 * 1024 * 1024) return reset("payload_too_large");
++          const chunk = yield* orchestrationEngine.readThreadEvents({ ...range, limit }).pipe(
++            Stream.runCollect,
++            Effect.catch((cause) => failEnvironmentInternal("orchestration_snapshot_failed", cause)),
++          );
++          const events = chunk.map((event) => {
++            const payload = event.payload as { turnId?: unknown };
++            const activity = event.type === "thread.activity-appended" ? event.payload.activity : null;
++            const session = event.type === "thread.session-set" ? event.payload.session : null;
++            const turnId = activity?.turnId ?? (typeof payload.turnId === "string" ? payload.turnId : null) ?? session?.activeTurnId;
++            return {
++              eventId: event.eventId, sequence: event.sequence, occurredAt: event.occurredAt, type: event.type,
++              ...(turnId ? { turnId } : {}),
++              ...(activity ? { activityId: activity.id, activityKind: activity.kind, activityTone: activity.tone } : {}),
++              ...(session ? { sessionStatus: session.status } : {}),
++            };
++          });
++          const hasMore = stats.eventCount > limit;
++          return { threadId, afterSequence, headSequence,
++            nextSequence: hasMore ? events[events.length - 1]!.sequence : headSequence,
++            hasMore, resetRequired: false, events };
++        }),
++      )
++      .handle(
+         "dispatch",
+         Effect.fn("environment.orchestration.dispatch")(function* (args) {
+           yield* annotateEnvironmentRequest(args.endpoint.name);

@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {writeFile,readFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {fixture} from './helpers.js';
+import {ManagementSettingsStore} from '../../management/settings-store.js';
+import {defaultManagedSettings,effectiveTrialConfiguration,validateManagedSettings} from '../../management/settings.js';
+import {deepseekFlashModel} from '../../providers/text-protocol.js';
+import {dialogueReservation} from '../../providers/input-count.js';
+
+test('B01/B05 legacy current/history migration, save/reopen/rollback preserve references and background budgets',async t=>{
+ const f=await fixture(t),old=deepseekFlashModel(f.c.models.memory_turn.credentialFile);
+ const base={...f.c,models:{...f.c.models,dialogue:old,summary:old,admission:old}};
+ const file=join(base.projectRoot,'settings-legacy.json'),legacy=defaultManagedSettings(base);
+ delete legacy.context.targetInputTokens;delete legacy.context.currentEmotionReserveTokens;
+ Object.assign(legacy.providers.dialogue,{inputTokenLimit:32768,reservationMicros:3211264});delete (legacy.providers.dialogue as {contextWindowTokens?:number}).contextWindowTokens;
+ legacy.context.maxRecentMessages=24;legacy.context.maxMemories=6;legacy.providers.tts.voice='Serena';
+ await writeFile(file,JSON.stringify({version:1,current:{revision:1,savedAt:'2026-10-03T12:00:00Z',settings:legacy},history:[{revision:0,savedAt:'2026-10-02T12:00:00Z',settings:legacy}]}),{mode:0o600});
+ const store=await ManagementSettingsStore.open(file,base),first=store.snapshot();
+ assert.equal(first.effective.context.targetInputTokens,200000);assert.equal(first.effective.context.currentEmotionReserveTokens,512);assert.equal(first.effectiveBudget!.effectiveInputTokens,200000);
+ assert.equal(first.effective.providers.dialogue.inputTokenLimit,1048576);assert.equal(first.effective.providers.summary.inputTokenLimit,32768);assert.equal(first.effective.providers.admission.inputTokenLimit,32768);
+ assert.equal(first.effective.context.summaryMinMessages,12);assert.equal(first.effective.context.summaryMaxMessages,24);assert.equal(first.effective.context.maxMemories,6);assert.equal(first.effective.providers.tts.voice,'Serena');assert.deepEqual(first.effective.providers.memory_turn,legacy.providers.memory_turn);
+ const persisted=JSON.parse(await readFile(file,'utf8'));assert.equal(persisted.history[0].settings.context.targetInputTokens,200000);assert.equal(persisted.current.revision,1);
+ const next=structuredClone(first.saved);next.context.targetInputTokens=400000;
+ const saved=await store.save(1,next);assert.equal(saved.pending,true);assert.equal(saved.effectiveBudget!.effectiveInputTokens,200000);assert.equal(saved.savedBudget!.effectiveInputTokens,400000);
+ const reopened=await ManagementSettingsStore.open(file,base);assert.equal(reopened.snapshot().pending,false);assert.equal(reopened.effective.context.targetInputTokens,400000);
+ const effective=effectiveTrialConfiguration(base,reopened.effective);assert.equal(effective.models.dialogue.reservationMicros,dialogueReservation(effective.models.dialogue));assert.equal(effective.models.dialogue.reservationMicros,3945728);
+ await reopened.rollback(2,0);const restored=await ManagementSettingsStore.open(file,base);assert.equal(restored.effective.context.targetInputTokens,200000);assert.equal(restored.effective.providers.dialogue.credentialRef,legacy.providers.dialogue.credentialRef);assert.equal(restored.effective.providers.tts.voice,'Serena');
+ const forged=structuredClone(restored.effective);Object.assign(forged.providers.dialogue,{contextWindowTokens:99999999});assert.throws(()=>validateManagedSettings(forged,base));
+});

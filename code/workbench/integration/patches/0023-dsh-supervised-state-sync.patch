@@ -1,0 +1,217 @@
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.ts b/apps/server/src/provider/Layers/DshHostProtocol.ts
+index 92daafd0..2c68e80c 100644
+--- a/apps/server/src/provider/Layers/DshHostProtocol.ts
++++ b/apps/server/src/provider/Layers/DshHostProtocol.ts
+@@ -244,7 +244,7 @@ export function makeDshHostProtocol(rpc: DshSessionRpc, options: { attachmentsDi
+     release: sessionId => rpc.events?.release(sessionId),
+     permission: async (sessionId: string, mode: RuntimeMode) => {
+       if (!nativeId(sessionId)) throw new DshTransportError("incompatible");
+-      const preset = mode === "auto-accept-edits" ? "workspace-write" : mode === "full-access" ? "danger-full-access" : null;
++      const preset = mode === "approval-required" ? "read-only" : mode === "auto-accept-edits" ? "workspace-write" : mode === "full-access" ? "danger-full-access" : null;
+       const catalog = record(await rpc.call("permissionPresets/catalog", {}));
+       if (!preset || !Array.isArray(catalog?.options) || !catalog.options.some(option => record(option)?.value === preset))
+         throw new DshTransportError("incompatible");
+@@ -258,7 +258,7 @@ export function makeDshHostProtocol(rpc: DshSessionRpc, options: { attachmentsDi
+       if (current.length !== 1 || record(current[0]?.projections?.values?.permissions)?.currentValue !== preset)
+         throw new DshTransportError("incompatible");
+       const knobs = await readPermissionKnobs(rpc, sessionId, current[0]!.projections!.asOfSeq);
+-      if (knobs.sandbox !== preset || knobs.approval !== (preset === "workspace-write" ? "ask" : "never"))
++      if (knobs.sandbox !== preset || knobs.approval !== (preset === "danger-full-access" ? "never" : "ask"))
+         throw new DshTransportError("incompatible");
+     },
+     interrupt: async (sessionId, requestId) => {
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.test.ts b/apps/server/src/provider/Layers/DshHostProtocol.test.ts
+index c398e66a..58e90f23 100644
+--- a/apps/server/src/provider/Layers/DshHostProtocol.test.ts
++++ b/apps/server/src/provider/Layers/DshHostProtocol.test.ts
+@@ -11,6 +11,25 @@ const events = [
+   { seq: 4, type: "turn/end", data: { turn: 7, reason: { kind: "completed" } } },
+ ];
+ 
++it("maps supervised DSH to read-only with native ask approval and verifies effective knobs", async () => {
++  let preset = "workspace-write", sandbox = preset, approval = "ask";
++  const writes: string[] = [];
++  const host = makeDshHostProtocol({ call: async (method, args) => {
++    if (method === "permissionPresets/catalog") return { options: [{ value: "read-only" }, { value: "workspace-write" }, { value: "danger-full-access" }] };
++    if (method === "session/list") return { items: [{ sessionId: "supervised", running: false, projections: { asOfSeq: 1, values: { permissions: { currentValue: preset } } } }] };
++    if (method === "commands/execute") { const line = (args as { line: string }).line; writes.push(line); preset = line.slice("/permission ".length); sandbox = preset; return { result: { kind: "success" } }; }
++    if (method === "session/page") return { hasMore: false, records: [{ type: "event", event: { seq: 0, type: "sandbox/mode", data: { mode: sandbox } } }, { type: "event", event: { seq: 1, type: "approval/policy", data: { policy: approval } } }] };
++    throw Error("unexpected permission operation");
++  } });
++  await host.permission!("supervised", "approval-required");
++  Assert.deepEqual(writes, ["/permission read-only"]);
++  await host.permission!("supervised", "approval-required");
++  Assert.equal(writes.length, 1);
++  approval = "never";
++  await Assert.rejects(host.permission!("supervised", "approval-required"));
++  Assert.equal(writes.length, 1, "a preset name must not bypass native approval verification");
++});
++
+ it("reads the exact native turn and keeps an old Host model capability closed", async () => {
+   const calls: string[] = [];
+   const rpc: DshSessionRpc = { call: async (method) => {
+diff --git a/apps/server/src/orchestration/decider.ts b/apps/server/src/orchestration/decider.ts
+index c2720254..3c85cb11 100644
+--- a/apps/server/src/orchestration/decider.ts
++++ b/apps/server/src/orchestration/decider.ts
+@@ -110,11 +110,12 @@ function openRequests(thread: Pick<OrchestrationThread, "activities">) {
+ function hasQueuedTurnStartForThread(
+   thread: Pick<OrchestrationThread, "messages" | "latestTurn" | "session">,
+   now: string,
++  adoptedMessageIds: ReadonlySet<string> = new Set(),
+ ): boolean {
+   let latestUserMessageAt: string | null = null;
+   let latestUserMessageAtMs = Number.NEGATIVE_INFINITY;
+   for (const message of thread.messages) {
+-    if (message.role !== "user" || isImportedAgentSessionMessageId(message.id)) continue;
++    if (message.role !== "user" || isImportedAgentSessionMessageId(message.id) || adoptedMessageIds.has(message.id)) continue;
+     const messageAtMs = Date.parse(message.createdAt);
+     latestUserMessageAtMs = Math.max(latestUserMessageAtMs, messageAtMs);
+     if (messageAtMs === latestUserMessageAtMs) {
+@@ -2030,8 +2031,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
+ 
+     case "thread.native-session.sync": {
+       const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
+-      const prior = thread.activities.find(a => a.kind === "native.session.sync")?.payload as { syncVersion?: string; nativeId?: string; instanceId?: string } | undefined;
+-      if (thread.deletedAt !== null || thread.archivedAt !== null || thread.session?.status === "running" || thread.session?.status === "starting" || threadHasQueuedTurnStart({ latestUserMessageAt: thread.messages.filter(m => m.role === "user").at(-1)?.createdAt ?? null, latestTurn: thread.latestTurn, session: thread.session }, command.checkedAt) || (prior?.syncVersion ?? null) !== command.previousVersion || prior && (prior.nativeId !== command.nativeId || prior.instanceId !== command.instanceId)) {
++      const prior = thread.activities.find(a => a.kind === "native.session.sync")?.payload as { syncVersion?: string; nativeId?: string; instanceId?: string; checkpoint?: { aliases?: Record<string, string> } } | undefined;
++      // DSH records turn/start before user/message. A message already adopted by
++      // this native checkpoint is not a new local send, regardless of timestamp.
++      const adoptedMessageIds = new Set(Object.entries(prior?.checkpoint?.aliases ?? {})
++        .filter(([key, value]) => key.startsWith("message:") && typeof value === "string").map(([, value]) => value));
++      if (thread.deletedAt !== null || thread.archivedAt !== null || thread.session?.status === "running" || thread.session?.status === "starting" || hasQueuedTurnStartForThread(thread, command.checkedAt, adoptedMessageIds) || (prior?.syncVersion ?? null) !== command.previousVersion || prior && (prior.nativeId !== command.nativeId || prior.instanceId !== command.instanceId)) {
+         return yield* new OrchestrationCommandInvariantError({ commandType: command.type, detail: "Native sync binding/version changed or local execution is active." });
+       }
+       const { type: _type, commandId: _commandId, ...payload } = command;
+diff --git a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+index 11cb801c..28f653b0 100644
+--- a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
++++ b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+@@ -123,6 +123,41 @@ function now() {
+ }
+ 
+ describe("formal native-session synchronization", () => {
++  it("finishes a native turn whose adopted input follows turn/start, while protecting a new local input", async () => {
++    const system = await createOrchestrationSystem();
++    const threadId = ThreadId.make("native-delayed-input"), projectId = ProjectId.make("native-delayed-project");
++    const turnId = TurnId.make("native:dsh:original:turn:turn:1");
++    const start = new Date().toISOString(), inputAt = new Date(Date.parse(start) + 10).toISOString();
++    const checkedAt = new Date(Date.parse(start) + 30).toISOString();
++    const user = { id: MessageId.make("native:dsh:original:message:turn:1:00000000:dsh:original:2"), role: "user" as const,
++      text: "unique fixture", turnId, streaming: false, createdAt: inputAt, updatedAt: inputAt };
++    const turn = { turnId, state: "running" as const, requestedAt: start, startedAt: start, completedAt: null, assistantMessageId: null };
++    const expectedBinding = JSON.stringify({ provider: "dsh", instanceId: "dsh", nativeId: "original", cwd: "/tmp/native-delay" });
++    const command = { type: "thread.native-session.sync" as const, commandId: CommandId.make("native-delay-running"), threadId,
++      provider: "dsh" as const, instanceId: ProviderInstanceId.make("dsh"), nativeId: "original", previousVersion: null,
++      syncVersion: "delay-v1", expectedBinding, checkedAt, observation: "running" as const,
++      checkpoint: { aliases: { "message:dsh:original:2": user.id }, native: { afterSeq: 2 } },
++      messages: [user], turns: [{ ...turn, userMessageId: user.id }], latestTurn: turn };
++    try {
++      await system.run(system.engine.dispatch({ type: "project.create", commandId: CommandId.make("native-delay-project"), projectId, title: "Native", workspaceRoot: "/tmp/native-delay", createdAt: start }));
++      await system.run(system.engine.dispatch({ type: "thread.create", commandId: CommandId.make("native-delay-thread"), threadId, projectId, title: "Native", modelSelection: { instanceId: ProviderInstanceId.make("dsh"), model: "fixture" }, runtimeMode: "approval-required", interactionMode: "default", branch: null, worktreePath: null, createdAt: start }));
++      await system.run(system.sql`INSERT INTO provider_session_runtime (thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, last_seen_at, resume_cursor_json, runtime_payload_json) VALUES (${threadId}, 'dsh', 'dsh', 'dsh', 'approval-required', 'stopped', ${start}, ${JSON.stringify({ sessionId: "original" })}, ${JSON.stringify({ cwd: "/tmp/native-delay" })})`);
++      await system.run(system.engine.dispatch(command));
++      const assistant = { ...user, id: MessageId.make("native:dsh:original:message:turn:1:00000001:dsh:original:3"), role: "assistant" as const };
++      const complete = { ...turn, state: "completed" as const, completedAt: checkedAt, assistantMessageId: assistant.id };
++      await system.run(system.engine.dispatch({ ...command, commandId: CommandId.make("native-delay-completed"), previousVersion: "delay-v1", syncVersion: "delay-v2", observation: "ready", messages: [assistant], turns: [{ ...complete, userMessageId: user.id }], latestTurn: complete }));
++      const detail = Option.getOrThrow(await system.readThread(threadId));
++      expect(detail.latestTurn?.state).toBe("completed");
++      expect(detail.messages.map(m => m.role)).toEqual(["user", "assistant"]);
++      // A fresh local message has no native alias and must still block synchronization.
++      const localId = MessageId.make("native-delay-new-local");
++      const localAt = new Date(Date.parse(checkedAt) + 10).toISOString();
++      await system.run(system.engine.dispatch({ type: "thread.turn.start", commandId: CommandId.make("native-delay-local-send"), threadId,
++        message: { messageId: localId, role: "user", text: "new local input", attachments: [] }, interactionMode: "default", runtimeMode: "approval-required", createdAt: localAt }));
++      await expect(system.run(system.engine.dispatch({ ...command, commandId: CommandId.make("native-delay-block-local"), previousVersion: "delay-v2", syncVersion: "delay-v3", checkedAt: localAt }))).rejects.toThrow(/local execution/);
++    } finally { await system.dispose(); }
++  });
++
+   it("commits messages/turn/checkpoint together, rejects stale or wrong binding, and retains content after restart", async () => {
+     const folder = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-native-sync-"));
+     const database = NodePath.join(folder, "state.sqlite");
+diff --git a/apps/server/src/orchestration/NativeSessionSync.ts b/apps/server/src/orchestration/NativeSessionSync.ts
+index 2db4d03c..39d0bf50 100644
+--- a/apps/server/src/orchestration/NativeSessionSync.ts
++++ b/apps/server/src/orchestration/NativeSessionSync.ts
+@@ -106,7 +106,10 @@ export const makeNativeSessionSync = Effect.gen(function* () {
+     // Digest represents native content/state, not poll time. Duplicate reads produce no event.
+     const syncVersion = digest({ binding: content.expectedBinding, observation: content.observation, checkpoint: content.checkpoint, nativeTurns: scope.provider === "codex" && history && plan ? history.turns : null });
+     const payload = yield* Schema.decodeUnknownEffect(NativeSessionSyncPayload)({ ...content, checkedAt, previousVersion: prior?.syncVersion ?? null, syncVersion });
+-    if (syncVersion !== prior?.syncVersion) yield* engine.dispatch({ type: "thread.native-session.sync", commandId: CommandId.make(`native-sync:${threadId}:${digest([prior?.syncVersion ?? null, syncVersion])}`), ...payload });
++    // The ledger retains rejected commands too. A new observation must be able
++    // to retry unchanged native content after an earlier local-write conflict;
++    // previousVersion still makes successful projection commits idempotent.
++    if (syncVersion !== prior?.syncVersion) yield* engine.dispatch({ type: "thread.native-session.sync", commandId: CommandId.make(`native-sync:${threadId}:${digest([prior?.syncVersion ?? null, syncVersion, checkedAt])}`), ...payload });
+     if (history && !history.complete && plan) queue.mark(threadId);
+     if (scope.provider === "codex" && binding.status === "running" && payload.observation === "ready" && payload.latestTurn?.state === "completed") {
+       yield* engine.dispatch({ type: "thread.native-session.release", threadId, checkedAt, expectedBinding: payload.expectedBinding, commandId: CommandId.make(`native-release:${threadId}:${payload.latestTurn.turnId}:${syncVersion}`) });
+diff --git a/apps/server/src/orchestration/NativeSessionSync.test.ts b/apps/server/src/orchestration/NativeSessionSync.test.ts
+index 8881a4f3..3484dfce 100644
+--- a/apps/server/src/orchestration/NativeSessionSync.test.ts
++++ b/apps/server/src/orchestration/NativeSessionSync.test.ts
+@@ -121,6 +121,25 @@ describe.each(["codex", "dsh"] as const)("%s notification to durable T3 projecti
+       expect((await read()).messages).toEqual(retained.messages);
+       const binding = await runtime.runPromise(sql`SELECT resume_cursor_json, runtime_payload_json FROM provider_session_runtime WHERE thread_id=${threadId}`);
+       expect(JSON.parse(binding[0]!.resume_cursor_json as string)).toEqual(cursor); expect(JSON.parse(binding[0]!.runtime_payload_json as string)).toEqual(originalRuntime);
++      // A checkpoint rejected during a previous local-write conflict must be
++      // retried after a new source observation, without restarting a model.
++      const originalDispatch = engine.dispatch, attempts: string[] = [];
++      let rejectNextSync = true;
++      Object.assign(engine, { dispatch: (command: Parameters<typeof originalDispatch>[0]) => {
++        if (command.type === "thread.native-session.sync") {
++          attempts.push(command.commandId);
++          if (rejectNextSync) { rejectNextSync = false; return originalDispatch({ ...command, expectedBinding: "obsolete-binding" }); }
++        }
++        return originalDispatch(command);
++      } });
++      try {
++        generation = 4; notify!(); await until(async () => attempts.length === 1); await pause(80);
++        expect((await read()).messages).toHaveLength(6);
++        const rejected = await runtime.runPromise(sql`SELECT status FROM orchestration_command_receipts WHERE command_id=${attempts[0]!}`);
++        expect(rejected[0]!.status).toBe("rejected");
++        notify!(); await until(async () => (await read()).messages.length === 8);
++        expect(attempts).toHaveLength(2); expect(attempts[1]).not.toBe(attempts[0]);
++      } finally { Object.assign(engine, { dispatch: originalDispatch }); }
+     } finally {
+       if (worker) await Effect.runPromise(Fiber.interrupt(worker));
+       await Effect.runPromise(Fiber.interrupt(subscriber)); await runtime.dispose();
+
+--- a/apps/server/src/orchestration/NativeSessionHistory.ts
++++ b/apps/server/src/orchestration/NativeSessionHistory.ts
+@@ -29,7 +29,7 @@
+   if (!Array.isArray(content)) throw Error("Original native content unavailable");
+   return content.map(p => {
+     const part = object(p); if (!part || typeof part.type !== "string") throw Error("Invalid original native content");
+-    if (part.type === "reasoning") return "";
++    if (part.type === "reasoning" || part.type === "tool-call") return "";
+     if (part.type === "text" || part.type === "inputText") {
+       if (typeof part.text !== "string" || part.text.includes("\0")) throw Error("Invalid original native text");
+       return part.text;
+
+--- a/apps/server/src/orchestration/NativeSessionHistory.test.ts
++++ b/apps/server/src/orchestration/NativeSessionHistory.test.ts
+@@ -69,6 +69,24 @@
+     const value = nativeVisibleText([{ type: "text", text: "visible" }, { type: "reasoning", text: "private" }, { type: "image", path: "/secret" }]);
+     expect(value).toContain("visible"); expect(value).toContain("原生附件"); expect(value).not.toContain("private"); expect(value).not.toContain("secret");
+   });
++  it("matches live assistant text after a tool call without losing attachments or weakening content checks", () => {
++    const text = nativeVisibleText([
++      { type: "text", text: "reply" },
++      { type: "tool-call", id: "call", name: "exec", arguments: { command: "private tool arguments" } },
++      { type: "reasoning", text: "private reasoning" },
++    ]);
++    expect(text).toBe("reply");
++    const decoded = structuredClone(history);
++    decoded.turns[0]!.messages[1]!.text = text;
++    const plan = planNativeHistory(decoded, "dsh", saved, first);
++    expect(plan.turns[0]?.assistantMessageId).toBe(first[1]!.id);
++    expect(plan.messages.some(m => m.id === first[1]!.id)).toBe(false);
++    const existing = [...first, ...plan.messages];
++    expect(planNativeHistory(decoded, "dsh", saved, existing, plan.aliases).messages).toEqual([]);
++    expect(nativeVisibleText([{ type: "image", path: "/private/image.png" }])).toContain("原生附件：image");
++    decoded.turns[0]!.messages[1]!.text = "different actual reply";
++    expect(() => planNativeHistory(decoded, "dsh", saved, first)).toThrow(/content conflicts/);
++  });
+   it("preserves an accepted terminal time when a later native read uses a thread-level fallback", () => {
+     const accepted = "2026-10-03T00:00:01.123Z";
+     const next = structuredClone(history);

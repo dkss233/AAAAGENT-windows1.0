@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "source": "accepted B54 renderer, copied byte-for-byte; no rebuild",
+  "acceptedPackageManifestSha256": "ca930628f6ae838b669533734663f1b0627ffe6bd196482cd67f54bf64ff77ae",
+  "rendererFiles": 4419,
+  "rendererBytes": 98930161,
+  "inventorySha256": "3292ec6bcd261af679d5a6ad05ef614b476c7a6f96b086511ab81cfd70af6ccc",
+  "runtimePins": "All files are individually registered in the formal installed configuration."
+}

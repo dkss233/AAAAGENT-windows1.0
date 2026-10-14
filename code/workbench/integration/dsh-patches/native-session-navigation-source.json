@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "capabilityVersion": 1,
+  "package": "@deepseek-ai/dsh-client-ui-workspace",
+  "dshVersion": "0.2.0-rc.2",
+  "sourceFile": "lib/client.js",
+  "sourceSha256": "e784543780fb8ac7c38c853afd26b9b1713c6907eec2b07eff37461e07bd3be9",
+  "sessionClientSha256": "60ec6a006443b40e5ab718f3fa53c301559c5c28427ca650c3851127ce370d43",
+  "patchStatus": "existing-native-SID-candidate",
+  "patchedSha256": "7723bcc4d03969153548c7382cbabc718ed61f7c8677a77d024b979005d74546"
+}

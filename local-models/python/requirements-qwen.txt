@@ -1,0 +1,17 @@
+# Native Windows + NVIDIA RTX 50 series; no vLLM or FlashAttention extension.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+qwen-tts==0.1.1
+transformers==4.57.3
+accelerate==1.12.0
+fastapi==0.128.0
+uvicorn==0.40.0
+soundfile==0.13.1
+# Pin the inference helpers and the official package's UI dependency to the
+# versions used in the real Windows validation, avoiding future API drift.
+huggingface-hub==0.36.2
+numpy==2.5.3
+librosa==1.0.0
+gradio==6.15.1
+onnxruntime==1.30.0

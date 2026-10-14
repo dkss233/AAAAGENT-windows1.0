@@ -1,0 +1,56 @@
+{
+  "sourceCommit": "c13f7d93fff0f578886985a3f673b4b21b7f6ac8",
+  "baseRuntimeManifest": "ca930628f6ae838b669533734663f1b0627ffe6bd196482cd67f54bf64ff77ae",
+  "originalInventorySha256": "bd2627d89afbf994ada4c608f454e633846088c76abd0fd5278a790d144307bd",
+  "originalBundleSha256": "9aee279d22eb7469f41ead34cb0d32b407bbf033c20a31b2c93090fdea75cc77",
+  "before": "exchange.headers.get(\"location\") !== \"/\"",
+  "after": "![\"/\", \"./\"].includes(exchange.headers.get(\"location\"))",
+  "adaptedBundleSha256": "d9d51ba50c9ef896367385cf301634285568d5e935d56802902afebec2973b60",
+  "adaptedInventorySha256": "f3c068a92044b52bdf8adfdbe3d1616b8c89e9b88980b3c0c406d82ce54fb30a",
+  "strictPolicyBefore": "case \"approval-required\": return {\n\t\t\tsandbox: \"read-only\",\n\t\t\tapprovalsReviewer: \"user\"\n\t\t};",
+  "strictPolicyAfter": "case \"approval-required\": return {\n\t\t\tapprovalPolicy: \"untrusted\",\n\t\t\tsandbox: \"read-only\",\n\t\t\tapprovalsReviewer: \"user\"\n\t\t};",
+  "strictResponseGuardSha256": "c3bd3bef8a54daf00d238d1f20931fa90823ab6d77c00c710b6916a5c93f51fd",
+  "strictPolicySourcePatchSha256": "e526499ce011d6be330af385745f131df8c8641be57575a973356e78fbbc35fc",
+  "strictPolicyPreparedSourcePatchSha256": "abe74b23a403ed9940884c07a4b4a9f67b06cc44d7a16590f765230c20582d7b",
+  "nativeSyncRuntime": {
+    "version": 1,
+    "package": "B57-DSH-SUPERVISED-STATE-SYNC",
+    "sourceLockSha256": "8e995f010a7fa08e85b2ed0a039bd15dfc547a3ac2c51ab4cf2c8e517a8cc1d5",
+    "sourceInputsSha256": "99d91c5db6b39c454a622bb65494e5a41a119e563b2f2f5c05e8f89825816c39",
+    "webBasePatchSha256": "d2d753ca5254d2f840d357e1b7b3d1ca6bd53d51210a53469701f93654c8ece3",
+    "webInputSourceSha256": "b93fb50bf5766148b14dd64e1f09b918c71506c509d61304035279014457db3e",
+    "webAssemblySha256": "c0cb30653fbab46f4565febbc5dd50814b288702725147f57954d708ff0284b0",
+    "dependencyInventorySha256": "66c4c3a11d5b28341bd029a2df3b6e59547f3994a6188ccaa9eeb181de30ee3d",
+    "upstreamCommit": "c13f7d93fff0f578886985a3f673b4b21b7f6ac8",
+    "patchSha256": "2d92bec2bf324cd4fd441a4b14638b210e6e0a89217152bfed9004a61c195a0e",
+    "inventorySha256": "bedb363b9b00bcb9f0e3ceecf4e5b99ac3dc0efba59d8e40dfcf06426bed3805",
+    "serverBundleSha256": "d1c0a95dc89af1a367357b0d52886c825b196b31ab93f53a36aefaaf1252f9be",
+    "sourcePatchSha256": "75ba2a71758616110aa876820a655822d3d648de24ca5d2e8601e369c4386584",
+    "forwardedSourcePatchSha256": "620d4b0bb1f81cf3363b5aae07b735161f8d8893014adcd97f3a6eab750eb820",
+    "webExecutionSourcePatchSha256": "0e3a5d55164943ec46d20b9c8527222a743fc0c033ca4869c2fedec7bf786d54",
+    "realtimeSourcePatchSha256": "281276f88e2230924debfdcdd5e97f0fbe2080531f343ed005aa0c7bbacbefe3",
+    "inputRepairSourcePatchSha256": "2fdfa6965622e939d2214ff8ace69b9136f633ed01c227cc22a6cc1dd2702fa2",
+    "supervisedStateSyncSourcePatchSha256": "6be07c3c3808cd1dba75222d36c293fd304fff2bd2d5abd34c8b7274e706bfcf",
+    "webRenewal": {
+      "package": "B57-NATIVE-SESSION-RENEWAL",
+      "previousInventory": "ebb03d75693d07fdfa490e6624b1db0914251be2008cd2ed8bd537b1c5d24260",
+      "indexSha256": "ad15b16feddc34a2085732eba1f58f752ca79e3bf151832064a4a87961720b98"
+    },
+    "webComposerCleanup": {
+      "package": "B57-ENGINEERING-COMPOSER-CLEANUP",
+      "previousInventory": "e61c3653268557e85a97aa66e1b4295ef19650971cc9179149ddd6932eb88373",
+      "indexSha256": "ecaaf397280d1bdea7a0c9569fd011795d6d22b28d246c9c72cd46b7f5b898ad"
+    }
+  },
+  "windowsRuntime": {
+    "version": 1,
+    "package": "AAAAGENT-WINDOWS-T3-20261010",
+    "platform": "win32",
+    "arch": "x64",
+    "sourceCommit": "c13f7d93fff0f578886985a3f673b4b21b7f6ac8",
+    "sourceLockSha256": "32ec19c6ff30d62da3c7b54e2a77f33d4e080d81d50d439ba7536068bd984ddc",
+    "inventorySha256": "5c8c3ca02b7810bdfea9d2c57a46435d8fe92f63e1ae8c62d2861029335da7d2",
+    "serverBundleSha256": "bfc697baee0c6c37d5a0ea17ea40ce4c403c23d7f35afb819b61d68811a11d32",
+    "markerSha256": "574bc18f3d75b294cf2898ea95c47c5398868826e54d9681da834cd9f3b113b3"
+  }
+}

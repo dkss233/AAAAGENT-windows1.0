@@ -1,0 +1,500 @@
+diff --git a/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts b/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
+index 8cf1a2c9..76a78372 100644
+--- a/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
++++ b/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
+@@ -929,6 +929,38 @@ describe("ProviderCommandReactor", () => {
+     expect(thread?.session?.runtimeMode).toBe("approval-required");
+   });
+ 
++  effectIt.effect("freezes exact Skill path with the original command and ignores later same-command edits", () =>
++    Effect.gen(function* () {
++      const harness = yield* Effect.promise(() => createHarness({ initialTitle: "Skill fixture" }));
++      const command = {
++        type: "thread.turn.start" as const,
++        commandId: CommandId.make("cmd-current-skill"),
++        threadId: ThreadId.make("thread-1"),
++        message: {
++          messageId: asMessageId("skill-user"), role: "user" as const,
++          text: "$review inspect the public fixture", attachments: [],
++          context: { version: 1 as const, records: [{
++            version: 1 as const, kind: "skill" as const,
++            contextId: ComposerContextId.make("exact-skill"), label: "Review",
++            name: "review", path: "/skills/review/SKILL.md",
++          }] },
++        },
++        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
++        runtimeMode: "approval-required" as const,
++        createdAt: "2026-01-01T00:00:00.000Z",
++      };
++      yield* harness.engine.dispatch(command);
++      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
++      yield* harness.engine.dispatch({ ...command, message: { ...command.message, text: "changed", context: { version: 1, records: [{ ...command.message.context.records[0]!, path: "/forged/SKILL.md" }] } } });
++      expect(harness.sendTurn.mock.calls).toHaveLength(1);
++      expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({ sourceCommandId: command.commandId, skills: [{ name: "review", path: "/skills/review/SKILL.md" }] });
++      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find((row) => row.id === command.threadId);
++      const stored = thread?.messages.find((message) => message.id === command.message.messageId);
++      expect(stored?.text).toBe(command.message.text);
++      expect(stored?.context?.records).toEqual(command.message.context.records);
++    }),
++  );
++
+   effectIt.effect("projects inline context before sending the provider turn", () =>
+     Effect.gen(function* () {
+       const harness = yield* Effect.promise(() => createHarness());
+@@ -979,7 +1011,7 @@ describe("ProviderCommandReactor", () => {
+       const harness = yield* Effect.promise(() => createHarness());
+       const snapshot = yield* Effect.promise(() => harness.readModel());
+       const durableText = "Inspect [build](t3-context://v1/terminal/terminal-1)";
+-      const projectContext = frozenProjectContext(snapshot.snapshotSequence, {}, durableText);
++      const projectContext = frozenProjectContext(snapshot.snapshotSequence, { text: "Keep the accepted retry limit. $provider-only-skill" }, durableText);
+       const attachments = [{
+         type: "file" as const, id: "attached-notes", name: "notes.txt",
+         mimeType: "text/plain", sizeBytes: 8,
+@@ -1012,6 +1044,7 @@ describe("ProviderCommandReactor", () => {
+       yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
+       const sent = harness.sendTurn.mock.calls[0]?.[0] as { input: string; attachments: unknown };
+       expect(sent.attachments).toEqual(attachments);
++      expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({ skills: [] });
+       expect(sent.input).toContain("[Terminal: build; ref=terminal-1]");
+       expect(sent.input).toContain('<context kind="terminal" id="terminal-1">');
+       expect(sent.input).toContain(`<context kind="project-memory" id="${projectContext.context.records[0]?.contextId}">`);
+diff --git a/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts b/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
+index 8006f79c..fef36f82 100644
+--- a/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
++++ b/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
+@@ -1,3 +1,5 @@
++import { collectCodexSkillReferences } from "@t3tools/shared/codexSkillReferences";
++import type { CodexSkillReference } from "@t3tools/contracts";
+ import { withWorkspaceLease } from "../../workspace/workspaceLease.ts";
+ import {
+   type ChatAttachment,
+@@ -884,6 +886,7 @@ const make = Effect.gen(function* () {
+     readonly threadId: ThreadId;
+     readonly messageText: string;
+     readonly sourceCommandId?: CommandId;
++    readonly skills?: ReadonlyArray<CodexSkillReference>;
+     readonly attachments?: ReadonlyArray<ChatAttachment>;
+     readonly modelSelection?: ModelSelection;
+     readonly interactionMode?: "default" | "plan";
+@@ -935,6 +938,7 @@ const make = Effect.gen(function* () {
+     return {
+       threadId: input.threadId,
+       ...(input.sourceCommandId !== undefined ? { sourceCommandId: input.sourceCommandId } : {}),
++      ...(input.skills !== undefined ? { skills: input.skills } : {}),
+       ...(normalizedInput ? { input: normalizedInput } : {}),
+       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
+       ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
+@@ -1571,6 +1575,7 @@ const make = Effect.gen(function* () {
+     const sendTurnRequest = yield* buildSendTurnRequestForThread({
+       threadId: event.payload.threadId,
+       ...(event.commandId !== null ? { sourceCommandId: event.commandId } : {}),
++      skills: collectCodexSkillReferences(message.text, message.context?.records),
+       messageText: projectComposerContextForProvider({
+         text: projectContext ? `${message.text}\n\n${projectMemoryReferences(projectContext)}` : message.text,
+         records: projectContext
+diff --git a/apps/server/src/provider/Layers/CodexAdapter.ts b/apps/server/src/provider/Layers/CodexAdapter.ts
+index baa8d846..bbb7785d 100644
+--- a/apps/server/src/provider/Layers/CodexAdapter.ts
++++ b/apps/server/src/provider/Layers/CodexAdapter.ts
+@@ -2542,6 +2542,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
+     return yield* session.runtime
+       .sendTurn({
+         ...(input.input !== undefined ? { input: input.input } : {}),
++        ...(input.skills !== undefined ? { skills: input.skills } : {}),
+         ...(input.modelSelection?.instanceId === boundInstanceId
+           ? { model: input.modelSelection.model }
+           : {}),
+diff --git a/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts b/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
+index c3872fe7..219c7e6d 100644
+--- a/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
++++ b/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
+@@ -160,7 +160,7 @@ function makeThreadOpenResponse(
+ }
+ 
+ describe("buildTurnStartParams", () => {
+-  it.effect("sends currency skill aliases in Codex's canonical dollar form", () =>
++  it.effect("preserves user body including currency aliases without textual rewriting", () =>
+     Effect.gen(function* () {
+       for (const symbol of ["€", "£", "¥", "₹", "₩", "₿", "𑿝"]) {
+         const prose = `${symbol}20 ${symbol}20k ${symbol}100M ${symbol}1e6 5${symbol}review`;
+@@ -171,7 +171,7 @@ describe("buildTurnStartParams", () => {
+         });
+ 
+         NodeAssert.deepEqual(params.input, [
+-          { type: "text", text: `$review $2spec $existing ${prose} $last` },
++          { type: "text", text: `${symbol}review ${symbol}2spec $existing ${prose} ${symbol}last` },
+         ]);
+       }
+     }),
+diff --git a/apps/server/src/provider/Layers/CodexSessionRuntime.ts b/apps/server/src/provider/Layers/CodexSessionRuntime.ts
+index 802810f3..3aa946e6 100644
+--- a/apps/server/src/provider/Layers/CodexSessionRuntime.ts
++++ b/apps/server/src/provider/Layers/CodexSessionRuntime.ts
+@@ -1,3 +1,5 @@
++import { discoverCodexSkillInputs } from "./CodexSkillInputs.ts";
++import type { CodexSkillReference } from "@t3tools/contracts";
+ import {
+   ApprovalRequestId,
+   DEFAULT_MODEL,
+@@ -191,6 +193,7 @@ export interface CodexSessionRuntimeOptions {
+ 
+ export interface CodexSessionRuntimeSendTurnInput {
+   readonly input?: string;
++  readonly skills?: ReadonlyArray<CodexSkillReference>;
+   readonly attachments?: ReadonlyArray<{
+     readonly type: "localImage";
+     readonly path: string;
+@@ -615,14 +618,11 @@ function buildCodexTurnInstructions(input: {
+   };
+ }
+ 
+-// Match the skill grammar used by Claude/Cursor, leaving currency amounts as prose.
+-const SKILL_MENTION_PATTERN =
+-  /(^|\s)\p{Sc}(?![0-9][0-9_]*(?:[kKmMbBtT]|[eE][0-9]+)?(?:\s|$))(?=[a-zA-Z0-9:_-]*[a-zA-Z])([a-zA-Z0-9][a-zA-Z0-9:_-]*)(?=\s|$)/gu;
+-
+ export function buildTurnStartParams(input: {
+   readonly threadId: string;
+   readonly runtimeMode: RuntimeMode;
+   readonly prompt?: string;
++  readonly skills?: ReadonlyArray<{ readonly type: "skill"; readonly name: string; readonly path: string }>;
+   readonly attachments?: ReadonlyArray<{
+     readonly type: "localImage";
+     readonly path: string;
+@@ -643,12 +643,13 @@ export function buildTurnStartParams(input: {
+   if (input.prompt) {
+     turnInput.push({
+       type: "text",
+-      text: input.prompt.replace(SKILL_MENTION_PATTERN, "$1$$$2"),
++      text: input.prompt,
+     });
+   }
+   for (const attachment of input.attachments ?? []) {
+     turnInput.push(attachment);
+   }
++  for (const skill of input.skills ?? []) turnInput.push(skill);
+ 
+   const config = runtimeModeToThreadConfig(input.runtimeMode);
+   const turnInstructions = buildCodexTurnInstructions({
+@@ -2592,11 +2593,13 @@ export const makeCodexSessionRuntime = (
+           );
+           const models = options.models ? yield* options.models : [];
+           const modelName = models.find((model) => model.slug === normalizedModel)?.name;
++          const skills = yield* discoverCodexSkillInputs(client, options.cwd, input.skills ?? []);
+           const params = yield* buildTurnStartParams({
+             threadId: providerThreadId,
+             runtimeMode: options.runtimeMode,
+             ...(input.input ? { prompt: input.input } : {}),
+             ...(input.attachments ? { attachments: input.attachments } : {}),
++            ...(skills.length > 0 ? { skills } : {}),
+             ...(normalizedModel ? { model: normalizedModel } : {}),
+             ...(modelName ? { modelName } : {}),
+             ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
+diff --git a/apps/server/src/provider/Layers/CodexSkillInputs.test.ts b/apps/server/src/provider/Layers/CodexSkillInputs.test.ts
+new file mode 100644
+index 00000000..5ea7cac4
+--- /dev/null
++++ b/apps/server/src/provider/Layers/CodexSkillInputs.test.ts
+@@ -0,0 +1,69 @@
++import { describe, it, expect } from "vite-plus/test";
++import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
++import { ComposerContextId, SkillContextRecord, ProviderSendTurnInput, ThreadId } from "@t3tools/contracts";
++import { collectCodexSkillReferences } from "@t3tools/shared/codexSkillReferences";
++import { discoverCodexSkillInputs, resolveCodexSkillInputs } from "./CodexSkillInputs.ts";
++import { buildTurnStartParams } from "./CodexSessionRuntime.ts";
++
++const cwd = "/tmp/public-fixture";
++const skill = { name: "review", path: "/skills/review/SKILL.md", enabled: true };
++const inventory = { data: [{ cwd, skills: [skill], errors: [] }] };
++describe("current-turn Codex Skill input", () => {
++  it("retains exact path through schema encoding and decoding, with old history readable", () => {
++    const record = { version: 1, kind: "skill", contextId: ComposerContextId.make("skill-1"), label: "Review", name: skill.name, path: skill.path };
++    const decoded = Schema.decodeUnknownSync(SkillContextRecord)(JSON.parse(JSON.stringify(record)));
++    expect(decoded).toEqual(record);
++    const { path, ...legacy } = record;
++    expect(Schema.decodeUnknownSync(SkillContextRecord)(legacy)).toEqual(legacy);
++    expect(() => Schema.decodeUnknownSync(SkillContextRecord)({ ...record, path: "" })).toThrow();
++  });
++  it("keeps exact selection and merges its body marker without a name-only override", () => {
++    expect(collectCodexSkillReferences("$review，检查", [{ kind: "skill", ...skill }])).toEqual([{ name: skill.name, path: skill.path }]);
++    expect(collectCodexSkillReferences("$review $other-skill", [])).toEqual([{ name: "review", fromText: true }, { name: "other-skill", fromText: true }]);
++  });
++  for (const text of ["环境变量 $HOME 为什么不对", "比较 $PATH", "价格 $123 与 $20k", "`$review`", "```sh\n$review\n```", "\\$review"]) {
++    it(`does not invoke a Skill for ordinary prose: ${text}`, () => {
++      expect(collectCodexSkillReferences(text)).toEqual([]);
++    });
++  }
++  it("leaves unselected ordinary lowercase variables unchanged while selected unknown references fail", () => {
++    const refs = collectCodexSkillReferences("环境变量 $http_proxy 为什么不对");
++    expect(resolveCodexSkillInputs(inventory, cwd, refs)).toEqual([]);
++    expect(() => resolveCodexSkillInputs(inventory, cwd, [{ name: "http_proxy" }])).toThrow(/unknown/);
++    expect(resolveCodexSkillInputs(inventory, cwd, [{ name: "review", fromText: true }])).toEqual([{ type: "skill", name: skill.name, path: skill.path }]);
++  });
++  it("resolves only the active cwd, never a different directory fallback", () => {
++    expect(() => resolveCodexSkillInputs(inventory, "/tmp/other", [{ name: "review" }])).toThrow(/active session cwd/);
++    expect(() => resolveCodexSkillInputs({ data: [inventory.data[0]!, inventory.data[0]!] }, cwd, [{ name: "review" }])).toThrow();
++  });
++  it("rejects unknown, forged, disabled and failed discovery before any turn start", () => {
++    expect(() => resolveCodexSkillInputs(inventory, cwd, [{ name: "unknown" }])).toThrow(/unknown/);
++    expect(() => resolveCodexSkillInputs(inventory, cwd, [{ name: "review", path: "/forged/SKILL.md" }])).toThrow(/selected path/);
++    expect(() => resolveCodexSkillInputs({ data: [{ ...inventory.data[0]!, errors: [{}] }] }, cwd, [{ name: "review" }])).toThrow(/directory errors/);
++    expect(() => resolveCodexSkillInputs({ data: [{ cwd, skills: [{ ...skill, enabled: false }], errors: [] }] }, cwd, [{ name: "review" }])).toThrow(/disabled/);
++  });
++  it("never chooses the first same-name source, while an exact pick disambiguates", () => {
++    const duplicate = { data: [{ cwd, errors: [], skills: [skill, { ...skill, path: "/repo/review/SKILL.md" }] }] };
++    expect(() => resolveCodexSkillInputs(duplicate, cwd, [{ name: "review" }])).toThrow(/multiple paths/);
++    expect(resolveCodexSkillInputs(duplicate, cwd, [{ name: "review", path: skill.path }])).toEqual([{ type: "skill", name: skill.name, path: skill.path }]);
++  });
++  it("reads fresh metadata and sends structured instructions with original text/images", async () => {
++    const requests: unknown[] = [];
++    const client = { request: (method: string, params: unknown) => { requests.push({ method, params }); return Effect.succeed(inventory); } } as unknown as Parameters<typeof discoverCodexSkillInputs>[0];
++    const refs = collectCodexSkillReferences("$review，检查原文", [{ kind: "skill", ...skill }]);
++    const decoded = Schema.decodeSync(ProviderSendTurnInput)({ threadId: ThreadId.make("test"), input: "$review，检查原文", skills: refs });
++    const skills = await Effect.runPromise(discoverCodexSkillInputs(client, cwd, decoded.skills!));
++    const params = await Effect.runPromise(buildTurnStartParams({ threadId: "native", runtimeMode: "full-access", prompt: decoded.input!, attachments: [{ type: "localImage", path: "/fixture/image.png" }], skills }));
++    expect(requests).toEqual([{ method: "skills/list", params: { cwds: [cwd], forceReload: true } }]);
++    expect(params.input).toEqual([{ type: "text", text: "$review，检查原文" }, { type: "localImage", path: "/fixture/image.png" }, { type: "skill", name: "review", path: skill.path }]);
++  });
++  it("adds no discovery or extra item for ordinary continuation", async () => {
++    const client = { request: () => { throw new Error("No discovery expected"); } } as unknown as Parameters<typeof discoverCodexSkillInputs>[0];
++    for (const prompt of ["环境变量 $HOME 为什么不对", "比较 $PATH", "继续原任务"]) {
++      const skills = await Effect.runPromise(discoverCodexSkillInputs(client, cwd, collectCodexSkillReferences(prompt)));
++      const params = await Effect.runPromise(buildTurnStartParams({ threadId: "native", runtimeMode: "full-access", prompt, skills }));
++      expect(params.input).toEqual([{ type: "text", text: prompt }]);
++    }
++  });
++});
+diff --git a/apps/server/src/provider/Layers/CodexSkillInputs.ts b/apps/server/src/provider/Layers/CodexSkillInputs.ts
+new file mode 100644
+index 00000000..4605dc94
+--- /dev/null
++++ b/apps/server/src/provider/Layers/CodexSkillInputs.ts
+@@ -0,0 +1,61 @@
++import type { CodexSkillReference } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as CodexClient from "effect-codex-app-server/client";
++import * as CodexErrors from "effect-codex-app-server/errors";
++
++type Inventory = {
++  readonly data: ReadonlyArray<{
++    readonly cwd: string;
++    readonly errors: ReadonlyArray<unknown>;
++    readonly skills: ReadonlyArray<{ readonly name: string; readonly path: string; readonly enabled: boolean }>;
++  }>;
++};
++
++/** Resolves exact current-turn references against the active app-server's own cwd. */
++export function resolveCodexSkillInputs(
++  inventory: Inventory,
++  cwd: string,
++  refs: ReadonlyArray<CodexSkillReference>,
++): Array<{ type: "skill"; name: string; path: string }> {
++  const entries = inventory.data.filter((entry) => entry.cwd === cwd);
++  const onlyUnselectedText = refs.every(ref => ref.fromText === true);
++  if (entries.length !== 1) {
++    if (onlyUnselectedText) return [];
++    throw new Error("Skill discovery did not return one directory for the active session cwd.");
++  }
++  const entry = entries[0]!;
++  if (entry.errors.length > 0) {
++    if (onlyUnselectedText) return [];
++    throw new Error("Skill discovery reported directory errors; no Skill turn was started.");
++  }
++  const result: Array<{ type: "skill"; name: string; path: string }> = [];
++  for (const ref of refs) {
++    const matches = entry.skills.filter((skill) => skill.name === ref.name && (ref.path === undefined || skill.path === ref.path));
++    const unique = [...new Map(matches.map((skill) => [skill.path, skill])).values()];
++    if (unique.length === 0) {
++      if (ref.fromText === true) continue;
++      throw new Error(`Skill '${ref.name}' is unknown or its selected path is no longer in this session directory.`);
++    }
++    if (unique.length > 1) throw new Error(`Skill '${ref.name}' has multiple paths; select its exact source before sending.`);
++    const skill = unique[0]!;
++    if (!skill.enabled || matches.some((row) => !row.enabled)) throw new Error(`Skill '${ref.name}' is disabled in this session.`);
++    if (!/^(?:\/|[A-Za-z]:[\\/])/.test(skill.path) || !/[\\/]SKILL\.md$/.test(skill.path)) throw new Error(`Skill '${ref.name}' did not provide an absolute SKILL.md path.`);
++    if (!result.some((item) => item.name === skill.name && item.path === skill.path)) result.push({ type: "skill", name: skill.name, path: skill.path });
++  }
++  return result;
++}
++
++export function discoverCodexSkillInputs(
++  client: Pick<CodexClient.CodexAppServerClient["Service"], "request">,
++  cwd: string,
++  refs: ReadonlyArray<CodexSkillReference>,
++) {
++  if (refs.length === 0) return Effect.succeed([]);
++  return client.request("skills/list", { cwds: [cwd], forceReload: true }).pipe(
++    Effect.catch((cause) => refs.every(ref => ref.fromText === true) ? Effect.succeed({ data: [] }) : Effect.fail(cause)),
++    Effect.flatMap((inventory) => Effect.try({
++      try: () => resolveCodexSkillInputs(inventory, cwd, refs),
++      catch: (cause) => CodexErrors.CodexAppServerRequestError.invalidRequest(cause instanceof Error ? cause.message : "Skill directory validation failed."),
++    })),
++  );
++}
+diff --git a/apps/server/src/provider/Layers/ProviderService.test.ts b/apps/server/src/provider/Layers/ProviderService.test.ts
+index c9e841d7..64a0e0b4 100644
+--- a/apps/server/src/provider/Layers/ProviderService.test.ts
++++ b/apps/server/src/provider/Layers/ProviderService.test.ts
+@@ -5154,6 +5154,16 @@ const dshDurable = makeFakeCodexAdapter(ProviderDriverKind.make("dsh"));
+ const dshInstance = ProviderInstanceId.make("dsh");
+ const dshRouting = makeProviderServiceLayer({ registry: makeStaticInstanceRegistry([[dshInstance, dshDurable.adapter]]) });
+ dshRouting.layer("DSH durable pre-send identity", it => {
++  it.effect("rejects a selected Codex Skill before the non-Codex adapter can send", () => Effect.gen(function* () {
++    const provider = yield* ProviderService.ProviderService;
++    const threadId = asThreadId("dsh-reject-codex-skill");
++    yield* provider.startSession(threadId, { provider: ProviderDriverKind.make("dsh"), providerInstanceId: dshInstance, threadId, cwd: fixtureCwd("dsh-wrong-skill"), runtimeMode: "approval-required" });
++    dshDurable.sendTurn.mockClear();
++    const result = yield* Effect.exit(provider.sendTurn({ threadId, input: "$review", skills: [{ name: "review", path: "/skills/review/SKILL.md" }] }));
++    assert(Exit.isFailure(result));
++    assert.equal(dshDurable.sendTurn.mock.calls.length, 0);
++  }));
++
+   it.effect("persists exact request and text digest before the adapter can send and retains a lost reply", () => Effect.gen(function* () {
+     const provider = yield* ProviderService.ProviderService;
+     const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+diff --git a/apps/server/src/provider/Layers/ProviderService.ts b/apps/server/src/provider/Layers/ProviderService.ts
+index ee85f49e..4cc25e7c 100644
+--- a/apps/server/src/provider/Layers/ProviderService.ts
++++ b/apps/server/src/provider/Layers/ProviderService.ts
+@@ -1,3 +1,4 @@
++import { collectCodexSkillReferences } from "@t3tools/shared/codexSkillReferences";
+ import { dshPendingPromptCursor } from "./DshAdapter.ts";
+ /**
+  * ProviderServiceLive - Cross-provider orchestration layer.
+@@ -1670,8 +1671,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
+       );
+     }
+ 
++    const skillRefs = parsed.skills ?? collectCodexSkillReferences(parsed.input ?? "");
+     const input = {
+       ...parsed,
++      ...(skillRefs.length > 0 ? { skills: skillRefs } : {}),
+       ...(inputTextWithAttachmentContext !== undefined
+         ? { input: inputTextWithAttachmentContext }
+         : {}),
+@@ -1708,6 +1711,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
+           allowRecovery: true,
+         });
+       }
++      if (skillRefs.length > 0 && routed.adapter.provider !== "codex") {
++        return yield* toValidationError("ProviderService.sendTurn", "This exact Skill input requires the Codex provider; switch provider or remove the current-turn Skill invocation.");
++      }
+       metricProvider = routed.adapter.provider;
+       metricModel = input.modelSelection?.model;
+       yield* Effect.annotateCurrentSpan({
+diff --git a/packages/client-runtime/src/providerSkills.ts b/packages/client-runtime/src/providerSkills.ts
+index b80cd580..381c128d 100644
+--- a/packages/client-runtime/src/providerSkills.ts
++++ b/packages/client-runtime/src/providerSkills.ts
+@@ -43,6 +43,19 @@ export function dedupeProviderSkillsByName(
+   });
+ }
+ 
++/** Keep exact selections addressable when multiple roots contain the same Skill name. */
++export function dedupeProviderSkillsByIdentity(
++  skills: ReadonlyArray<ServerProviderSkill>,
++): ServerProviderSkill[] {
++  const seen = new Set<string>();
++  return skills.filter((skill) => {
++    const key = JSON.stringify([skill.name, skill.path]);
++    if (seen.has(key)) return false;
++    seen.add(key);
++    return true;
++  });
++}
++
+ /**
+  * Whether a composer pick can start this skill. A skill switched off in the
+  * provider's settings will not run, and one the provider reserves for the
+diff --git a/packages/contracts/src/composerContext.ts b/packages/contracts/src/composerContext.ts
+index b014279f..635ee7dc 100644
+--- a/packages/contracts/src/composerContext.ts
++++ b/packages/contracts/src/composerContext.ts
+@@ -212,6 +212,8 @@ export const SkillContextRecord = Schema.Struct({
+   ...recordBase,
+   kind: Schema.Literal("skill"),
+   name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
++  /** Exact provider-discovered selection; optional for existing name-only history. */
++  path: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(4096))),
+ });
+ export type SkillContextRecord = typeof SkillContextRecord.Type;
+ 
+diff --git a/packages/contracts/src/provider.ts b/packages/contracts/src/provider.ts
+index 3b33889f..753cfad6 100644
+--- a/packages/contracts/src/provider.ts
++++ b/packages/contracts/src/provider.ts
+@@ -67,10 +67,20 @@ export const ProviderSessionStartInput = Schema.Struct({
+ });
+ export type ProviderSessionStartInput = typeof ProviderSessionStartInput.Type;
+ 
++export const CodexSkillReference = Schema.Struct({
++  name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
++  path: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(4096))),
++  /** Internal distinction: unselected text markers preserve unknown prose. */
++  fromText: Schema.optional(Schema.Boolean),
++});
++export type CodexSkillReference = typeof CodexSkillReference.Type;
++
+ export const ProviderSendTurnInput = Schema.Struct({
+   threadId: ThreadId,
+   /** Stable orchestration command identity for native send deduplication. */
+   sourceCommandId: Schema.optional(CommandId),
++  /** Internal references collected from the frozen current user message, never provider-only data. */
++  skills: Schema.optional(Schema.Array(CodexSkillReference)),
+   /** Internal recovery signal. Allows an empty turn only for adapters that
+       explicitly support promptless continuation. */
+   continuation: Schema.optional(Schema.Boolean),
+diff --git a/packages/shared/package.json b/packages/shared/package.json
+index b810abea..e3690abd 100644
+--- a/packages/shared/package.json
++++ b/packages/shared/package.json
+@@ -346,6 +346,10 @@
+     "./gitPatchPath": {
+       "types": "./src/gitPatchPath.ts",
+       "import": "./src/gitPatchPath.ts"
++    },
++    "./codexSkillReferences": {
++      "types": "./src/codexSkillReferences.ts",
++      "import": "./src/codexSkillReferences.ts"
+     }
+   },
+   "scripts": {
+diff --git a/packages/shared/src/codexSkillReferences.ts b/packages/shared/src/codexSkillReferences.ts
+new file mode 100644
+index 00000000..28af508c
+--- /dev/null
++++ b/packages/shared/src/codexSkillReferences.ts
+@@ -0,0 +1,33 @@
++import type { CodexSkillReference } from "@t3tools/contracts";
++
++/** Only the frozen current user body and its explicit context records are inputs. */
++export function collectCodexSkillReferences(
++  text: string,
++  records: ReadonlyArray<{ readonly kind: string }> = [],
++): CodexSkillReference[] {
++  const selections = records.filter((record) => record.kind === "skill") as unknown as ReadonlyArray<{
++    readonly name: string;
++    readonly path?: string;
++  }>;
++  const refs: CodexSkillReference[] = selections.map(({ name, path }) => ({
++    name,
++    ...(path !== undefined ? { path } : {}),
++  }));
++  // Code examples and escaped dollars are prose, not current-turn invocations.
++  const prose = text.replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`/g, " ");
++  const marker = /(^|[\s([{“"'])\$(?=[A-Za-z0-9:_-]*[A-Za-z])([A-Za-z0-9][A-Za-z0-9:_-]*)(?=$|[\s)\]},.!?;，。！？；”"'])/gu;
++  for (const match of prose.matchAll(marker)) {
++    const name = match[2]!;
++    if (/^[0-9][0-9_]*(?:[kKmMbBtT]|[eE][0-9]+)?$/.test(name)) continue;
++    // Conventional shell environment variables are prose unless selected in the UI.
++    if (/^[A-Z_][A-Z0-9_]*$/.test(name)) continue;
++    if (!refs.some((ref) => ref.name === name)) refs.push({ name, fromText: true });
++  }
++  const seen = new Set<string>();
++  return refs.filter((ref) => {
++    const key = JSON.stringify([ref.name, ref.path ?? null]);
++    if (seen.has(key)) return false;
++    seen.add(key);
++    return true;
++  });
++}

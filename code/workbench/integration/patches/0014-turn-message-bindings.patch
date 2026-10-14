@@ -1,0 +1,121 @@
+diff --git a/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts b/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
+index 1b44054c..ec6169df 100644
+--- a/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
++++ b/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
+@@ -15,6 +15,7 @@ import {
+   OrchestrationShellSnapshot,
+   OrchestrationThread,
+   OrchestrationThreadDetailSnapshot,
++  type OrchestrationTurnMessageBindings,
+   ProjectScript,
+   ProjectIconOverride,
+   TurnId,
+@@ -1768,6 +1769,25 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
+   // the matching turn-anchor time range so they land on the same page as the
+   // turns around them. Proposed plans and checkpoints stay unwindowed: they
+   // are metadata-scale.
++  const listTurnMessageBindings = SqlSchema.findAll({
++    Request: Schema.Struct({ threadId: ThreadId, turnIds: Schema.Array(TurnId) }),
++    Result: Schema.Struct({ turnId: TurnId, userMessageId: Schema.NullOr(MessageId),
++      assistantMessageId: Schema.NullOr(MessageId), state: Schema.String,
++      completedAt: Schema.NullOr(IsoDateTime), messageId: Schema.NullOr(MessageId) }),
++    execute: ({ threadId, turnIds }) => sql`
++      SELECT turns.turn_id AS "turnId", turns.pending_message_id AS "userMessageId",
++        turns.assistant_message_id AS "assistantMessageId", turns.state,
++        turns.completed_at AS "completedAt", messages.message_id AS "messageId"
++      FROM projection_turns AS turns
++      LEFT JOIN projection_thread_messages AS messages
++        ON messages.thread_id = turns.thread_id AND messages.role IN ('user','assistant')
++        AND (messages.turn_id = turns.turn_id OR messages.message_id = turns.pending_message_id)
++      WHERE turns.thread_id = ${threadId} AND ${sql.in("turns.turn_id", turnIds)}
++      ORDER BY turns.requested_at, turns.turn_id, messages.created_at, messages.message_id
++      LIMIT 2001
++    `,
++  });
++
+   const listThreadMessageRowsByThreadWindow = SqlSchema.findAll({
+     Request: ThreadTurnRangeLookupInput,
+     Result: ProjectionThreadMessageDbRowSchema,
+@@ -1806,8 +1826,16 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
+                   )
+                 )
+             )
++            OR message_id IN (
++              SELECT pending_message_id FROM projection_turns
++              WHERE thread_id = ${threadId} AND turn_id IS NOT NULL
++                AND (requested_at > ${minAnchorAt} OR (requested_at = ${minAnchorAt} AND turn_id >= ${minTurnKey}))
++                AND (requested_at < ${beforeAnchorAt} OR (requested_at = ${beforeAnchorAt} AND turn_id < ${beforeTurnKey}))
++            )
+             OR (
+               turn_id IS NULL
++              AND NOT EXISTS (SELECT 1 FROM projection_turns AS owner
++                WHERE owner.thread_id = ${threadId} AND owner.pending_message_id = projection_thread_messages.message_id)
+               AND created_at >= ${minAnchorAt}
+               AND created_at < ${beforeAnchorAt}
+             )
+@@ -3728,6 +3756,26 @@ pending_approval_requests AS (
+           }
+ 
+           const { snapshotSequence } = yield* getSnapshotSequence();
++          const turnIds = windowRows.filter(row => row.turnKey !== "").map(row => TurnId.make(row.turnKey));
++          const bindingRows = turnIds.length === 0 ? [] : yield* listTurnMessageBindings({ threadId, turnIds });
++          if (bindingRows.length > 2000) {
++            return yield* toPersistenceSqlError("ProjectionSnapshotQuery.turnMessageBindings:bounded")(
++              new Error("Turn message window exceeds bound"));
++          }
++          const bindings = new Map<string, { turnId: TurnId; userMessageId: MessageId | null;
++            assistantMessageId: MessageId | null; state: "running" | "completed" | "error" | "interrupted";
++            completedAt: string | null; messageIds: MessageId[] }>();
++          for (const row of bindingRows) {
++            const binding = bindings.get(row.turnId) ?? { turnId: row.turnId,
++              userMessageId: row.userMessageId, assistantMessageId: row.assistantMessageId,
++              state: row.state === "completed" || row.state === "error" || row.state === "interrupted" ? row.state : "running",
++              completedAt: row.completedAt, messageIds: [] };
++            if (row.messageId !== null) binding.messageIds.push(row.messageId);
++            bindings.set(row.turnId, binding);
++          }
++          const turnMessageBindings: OrchestrationTurnMessageBindings = { version: 1,
++            snapshotSequence, threadId, projectId: thread.value.projectId,
++            providerInstanceId: thread.value.modelSelection.instanceId, turns: [...bindings.values()] };
+           const watermarkRow = yield* getThreadEventWatermarkRow({
+             threadId,
+             maxSequence: snapshotSequence,
+@@ -3746,6 +3794,7 @@ pending_approval_requests AS (
+           return Option.some({
+             snapshotSequence,
+             thread: thread.value,
++            turnMessageBindings,
+             page: {
+               beforeCursor:
+                 hasMore && oldest !== undefined
+diff --git a/packages/contracts/src/orchestration.ts b/packages/contracts/src/orchestration.ts
+index 98c605db..1e0de40f 100644
+--- a/packages/contracts/src/orchestration.ts
++++ b/packages/contracts/src/orchestration.ts
+@@ -1072,12 +1072,26 @@ export const OrchestrationThreadDetailPage = Schema.Struct({
+ });
+ export type OrchestrationThreadDetailPage = typeof OrchestrationThreadDetailPage.Type;
+ 
++/** AAA read-only turn/message provenance; same transaction and sequence as this bounded window. */
++export const OrchestrationTurnMessageBindings = Schema.Struct({
++  version: Schema.Literal(1), snapshotSequence: NonNegativeInt,
++  threadId: ThreadId, projectId: ProjectId, providerInstanceId: TrimmedNonEmptyString,
++  turns: Schema.Array(Schema.Struct({
++    turnId: TurnId, userMessageId: Schema.NullOr(MessageId),
++    assistantMessageId: Schema.NullOr(MessageId),
++    state: Schema.Literals(["running", "completed", "error", "interrupted"]),
++    completedAt: Schema.NullOr(IsoDateTime), messageIds: Schema.Array(MessageId),
++  })),
++});
++export type OrchestrationTurnMessageBindings = typeof OrchestrationTurnMessageBindings.Type;
++
+ export const OrchestrationThreadDetailSnapshot = Schema.Struct({
+   snapshotSequence: NonNegativeInt,
+   thread: OrchestrationThread,
+   // Present only on windowed responses. Absent on full snapshots (and from
+   // pre-pagination servers), which clients treat as fully loaded.
+   page: Schema.optional(OrchestrationThreadDetailPage),
++  turnMessageBindings: Schema.optional(OrchestrationTurnMessageBindings),
+ });
+ export type OrchestrationThreadDetailSnapshot = typeof OrchestrationThreadDetailSnapshot.Type;
+ 

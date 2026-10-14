@@ -1,0 +1,191 @@
+diff --git a/apps/server/src/orchestration/decider.ts b/apps/server/src/orchestration/decider.ts
+index 21df39a..369abf9 100644
+--- a/apps/server/src/orchestration/decider.ts
++++ b/apps/server/src/orchestration/decider.ts
+@@ -1399,6 +1399,23 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
+         command,
+         threadId: command.threadId,
+       });
++      const providerContext = command.providerOnlyProjectContext;
++      const selectedModel = command.modelSelection ?? targetThread.modelSelection;
++      if (providerContext && (providerContext.commandId !== command.commandId ||
++          providerContext.messageId !== command.message.messageId ||
++          providerContext.threadId !== command.threadId ||
++          providerContext.t3ProjectId !== targetThread.projectId ||
++          providerContext.providerInstanceId !== selectedModel.instanceId ||
++          providerContext.modelId !== selectedModel.model ||
++          providerContext.branchRef !== targetThread.branch ||
++          providerContext.snapshotSequence !== readModel.snapshotSequence ||
++          providerContext.context.records.length === 0 ||
++          providerContext.context.records.some(record => record.kind !== "project-memory"))) {
++        return yield* new OrchestrationCommandInvariantError({
++          commandType: command.type,
++          detail: "Provider-only project context does not match this exact command and native thread.",
++        });
++      }
+       const sourceProposedPlan = command.sourceProposedPlan;
+       const sourceThread = sourceProposedPlan
+         ? yield* requireThread({
+@@ -1475,6 +1492,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
+           runtimeMode: targetThread.runtimeMode,
+           interactionMode: targetThread.interactionMode,
+           ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
++          ...(providerContext !== undefined ? { providerOnlyProjectContext: providerContext } : {}),
+           createdAt: command.createdAt,
+         },
+       };
+diff --git a/apps/server/src/orchestration/messageContext.test.ts b/apps/server/src/orchestration/messageContext.test.ts
+index 0dcbbab..61d4251 100644
+--- a/apps/server/src/orchestration/messageContext.test.ts
++++ b/apps/server/src/orchestration/messageContext.test.ts
+@@ -1,5 +1,6 @@
+ import {
+   CommandId,
++  ComposerContextId,
+   EventId,
+   MessageId,
+   ProjectId,
+@@ -111,6 +112,44 @@ it.layer(NodeServices.layer)("message context plumbing", (it) => {
+     }),
+   );
+ 
++  it.effect("keeps frozen project context on the provider event without changing the user message", () =>
++    Effect.gen(function* () {
++      const providerOnlyProjectContext = {
++        version: 1 as const, commandId: CommandId.make("cmd-memory"),
++        messageId: MessageId.make("message-memory"), threadId: ThreadId.make("thread-1"),
++        t3ProjectId: ProjectId.make("project-1"),
++        providerInstanceId: ProviderInstanceId.make("codex"), modelId: "gpt-5.4",
++        branchRef: null, snapshotSequence: 0, draftId: "draft-1", draftVersion: 2,
++        fingerprint: "a".repeat(64), context: { version: 1 as const, records: [{
++          version: 1 as const, contextId: ComposerContextId.make("memory-1"),
++          label: "项目记忆", kind: "project-memory", payload: {
++            status: "accepted", id: "memory-1", version: 2, text: "有来源的项目资料",
++          },
++        }] },
++      };
++      const command = {
++        type: "thread.turn.start" as const, commandId: CommandId.make("cmd-memory"),
++        threadId: ThreadId.make("thread-1"),
++        message: { messageId: MessageId.make("message-memory"), role: "user" as const,
++          text: "用户审阅正文", attachments: [] },
++        providerOnlyProjectContext, runtimeMode: "full-access" as const,
++        interactionMode: "default" as const, createdAt: NOW,
++      };
++      const result = yield* decideOrchestrationCommand({ command, readModel: makeReadModel() });
++      const events = Array.isArray(result) ? result : [result];
++      const sent = events.find(event => event.type === "thread.message-sent");
++      const requested = events.find(event => event.type === "thread.turn-start-requested");
++      expect(sent?.type === "thread.message-sent" ? sent.payload.text : undefined).toBe("用户审阅正文");
++      expect(sent?.type === "thread.message-sent" ? sent.payload.context : undefined).toBeUndefined();
++      expect(requested?.type === "thread.turn-start-requested"
++        ? requested.payload.providerOnlyProjectContext : undefined).toEqual(providerOnlyProjectContext);
++      const rejected = yield* decideOrchestrationCommand({ command: {
++        ...command, providerOnlyProjectContext: { ...providerOnlyProjectContext, modelId: "other-model" },
++      }, readModel: makeReadModel() }).pipe(Effect.exit);
++      expect(rejected._tag).toBe("Failure");
++    }),
++  );
++
+   it.effect("projects context records onto the read-model message", () =>
+     Effect.gen(function* () {
+       const afterCreate = yield* projectEvent(
+diff --git a/packages/contracts/src/orchestration.test.ts b/packages/contracts/src/orchestration.test.ts
+index 7c7bade..0d64c14 100644
+--- a/packages/contracts/src/orchestration.test.ts
++++ b/packages/contracts/src/orchestration.test.ts
+@@ -1283,6 +1283,41 @@ it.effect("accepts a source proposed plan reference in thread.turn.start", () =>
+   }),
+ );
+ 
++it.effect("decodes provider-only project context on a turn and its requested event", () =>
++  Effect.gen(function* () {
++    const providerOnlyProjectContext = {
++      version: 1, commandId: "cmd-memory", messageId: "msg-memory", threadId: "thread-1",
++      t3ProjectId: "project-1", providerInstanceId: "codex", modelId: "gpt-5.4",
++      branchRef: null, snapshotSequence: 0, draftId: "draft-1", draftVersion: 2,
++      fingerprint: "a".repeat(64), context: { version: 1, records: [{
++        version: 1, contextId: "memory-1", label: "项目记忆", kind: "project-memory",
++        payload: { status: "accepted", id: "memory-1", version: 2, text: "同项目已确认资料" },
++      }] },
++    };
++    const command = yield* decodeThreadTurnStartCommand({
++      type: "thread.turn.start", commandId: "cmd-memory", threadId: "thread-1",
++      message: { messageId: "msg-memory", role: "user", text: "用户审阅正文", attachments: [] },
++      providerOnlyProjectContext, createdAt: "2026-01-01T00:00:00.000Z",
++    });
++    assert.strictEqual(command.providerOnlyProjectContext?.fingerprint, providerOnlyProjectContext.fingerprint);
++    assert.strictEqual(command.providerOnlyProjectContext?.context.records[0]?.kind, "project-memory");
++    assert.strictEqual(command.message.text, "用户审阅正文");
++    assert.strictEqual(command.message.context, undefined);
++    const event = yield* decodeThreadTurnStartRequestedPayload({
++      threadId: "thread-1", messageId: "msg-memory", providerOnlyProjectContext,
++      createdAt: "2026-01-01T00:00:00.000Z",
++    });
++    assert.strictEqual(event.providerOnlyProjectContext?.fingerprint, providerOnlyProjectContext.fingerprint);
++    const invalid = yield* decodeThreadTurnStartCommand({
++      type: "thread.turn.start", commandId: "cmd-memory", threadId: "thread-1",
++      message: { messageId: "msg-memory", role: "user", text: "用户审阅正文", attachments: [] },
++      providerOnlyProjectContext: { ...providerOnlyProjectContext, fingerprint: "not-a-digest" },
++      createdAt: "2026-01-01T00:00:00.000Z",
++    }).pipe(Effect.exit);
++    assert.strictEqual(invalid._tag, "Failure");
++  }),
++);
++
+ it.effect(
+   "decodes thread.turn-start-requested defaults for provider, runtime mode, and interaction mode",
+   () =>
+diff --git a/packages/contracts/src/orchestration.ts b/packages/contracts/src/orchestration.ts
+index 1ae704d..bcf27c8 100644
+--- a/packages/contracts/src/orchestration.ts
++++ b/packages/contracts/src/orchestration.ts
+@@ -1316,6 +1316,24 @@ const ThreadTurnStartBootstrap = Schema.Struct({
+ 
+ export type ThreadTurnStartBootstrap = typeof ThreadTurnStartBootstrap.Type;
+ 
++/** Private user-level material for one provider send; it is never a thread message. */
++export const ProviderOnlyProjectContext = Schema.Struct({
++  version: Schema.Literal(1),
++  commandId: CommandId,
++  messageId: MessageId,
++  threadId: ThreadId,
++  t3ProjectId: ProjectId,
++  providerInstanceId: ProviderInstanceId,
++  modelId: TrimmedNonEmptyString,
++  branchRef: Schema.NullOr(TrimmedNonEmptyString),
++  snapshotSequence: NonNegativeInt,
++  draftId: TrimmedNonEmptyString,
++  draftVersion: PositiveInt,
++  fingerprint: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
++  context: OrchestrationMessageContext,
++});
++export type ProviderOnlyProjectContext = typeof ProviderOnlyProjectContext.Type;
++
+ export const ThreadTurnStartCommand = Schema.Struct({
+   type: Schema.Literal("thread.turn.start"),
+   commandId: CommandId,
+@@ -1335,6 +1353,7 @@ export const ThreadTurnStartCommand = Schema.Struct({
+   ),
+   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
+   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
++  providerOnlyProjectContext: Schema.optional(ProviderOnlyProjectContext),
+   createdAt: IsoDateTime,
+ });
+ 
+@@ -1355,6 +1374,7 @@ const ClientThreadTurnStartCommand = Schema.Struct({
+   interactionMode: ProviderInteractionMode,
+   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
+   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
++  providerOnlyProjectContext: Schema.optional(ProviderOnlyProjectContext),
+   createdAt: IsoDateTime,
+ });
+ 
+@@ -1933,6 +1953,7 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
+     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
+   ),
+   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
++  providerOnlyProjectContext: Schema.optional(ProviderOnlyProjectContext),
+   createdAt: IsoDateTime,
+ });
+ 

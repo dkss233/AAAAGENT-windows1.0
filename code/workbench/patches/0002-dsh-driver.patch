@@ -1,0 +1,748 @@
+diff --git a/apps/server/src/provider/Drivers/DshDriver.ts b/apps/server/src/provider/Drivers/DshDriver.ts
+new file mode 100644
+index 00000000..9571b597
+--- /dev/null
++++ b/apps/server/src/provider/Drivers/DshDriver.ts
+@@ -0,0 +1,93 @@
++import { ProviderDriverKind, TextGenerationError, type ServerProvider } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
++import * as Stream from "effect/Stream";
++
++import { ProviderDriverError } from "../Errors.ts";
++import { DshHostService, makeDshAdapter } from "../Layers/DshAdapter.ts";
++import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
++import {
++  defaultProviderContinuationIdentity,
++  type ProviderDriver,
++  type ProviderInstance,
++} from "../ProviderDriver.ts";
++
++const DRIVER = ProviderDriverKind.make("dsh");
++const DshSettings = Schema.Struct({ agentPreset: Schema.optional(Schema.String) });
++type DshSettings = typeof DshSettings.Type;
++const maintenance = makeManualOnlyProviderMaintenanceCapabilities({ provider: DRIVER, packageName: null });
++
++export type DshDriverEnv = DshHostService;
++
++/** No automatic model or login assumptions; model choice stays closed pending a session-only native path. */
++export const DshDriver: ProviderDriver<DshSettings, DshDriverEnv> = {
++  driverKind: DRIVER,
++  metadata: { displayName: "DeepSeek Harness", supportsMultipleInstances: false },
++  configSchema: DshSettings,
++  defaultConfig: () => ({}),
++  create: ({ instanceId, displayName, accentColor, enabled, config }) =>
++    Effect.gen(function* () {
++      const host = yield* DshHostService;
++      if (!host.environmentId.trim() || enabled && !config.agentPreset?.trim()) {
++        return yield* new ProviderDriverError({
++          driver: DRIVER, instanceId, detail: "A stable environment ID and explicit DSH agent preset are required",
++        });
++      }
++      const continuationIdentity = defaultProviderContinuationIdentity({ driverKind: DRIVER, instanceId });
++      const adapter = yield* makeDshAdapter({
++        instanceId, environmentId: host.environmentId, preset: config.agentPreset ?? "", host: host.port,
++      });
++      const snapshotValue = Effect.gen(function* () {
++        const checkedAt = yield* Effect.map(DateTime.now, DateTime.formatIso);
++        const native = enabled
++          ? yield* Effect.tryPromise({
++              try: () => host.port.describe(),
++              catch: () => new ProviderDriverError({ driver: DRIVER, instanceId, detail: "DSH status unavailable" }),
++            }).pipe(Effect.orElseSucceed(() => null))
++          : null;
++        const models = native?.installed && native.authenticated ? [...native.models] : [];
++        const ready = enabled && native?.installed === true && native.authenticated && models.length > 0;
++        return {
++          instanceId,
++          driver: DRIVER,
++          displayName: displayName ?? "DeepSeek Harness",
++          ...(accentColor ? { accentColor } : {}),
++          continuation: { groupKey: continuationIdentity.continuationKey },
++          supportsConversationRollback: false,
++          supportsTextGeneration: false,
++          enabled,
++          installed: native?.installed ?? false,
++          version: native?.version ?? null,
++          status: !enabled ? "disabled" : ready ? "ready" : "warning",
++          auth: { status: native ? native.authenticated ? "authenticated" : "unauthenticated" : "unknown" },
++          checkedAt,
++          message: !enabled ? "DSH provider is disabled" : ready ? "DSH native Host is available" :
++            "DSH Host or verified model catalog is unavailable",
++          models,
++          slashCommands: [],
++          skills: [],
++        } satisfies ServerProvider;
++      });
++      const snapshot: ProviderInstance["snapshot"] = {
++        resolveMaintenance: () => Effect.succeed(maintenance),
++        getSnapshot: snapshotValue,
++        refresh: snapshotValue,
++        streamChanges: Stream.empty,
++        applyUsageLimits: () => Effect.void,
++      };
++      const unsupportedText = (operation: string) => Effect.fail(new TextGenerationError({
++        operation, detail: "DSH text generation is not verified through this driver",
++      }));
++      const textGeneration: ProviderInstance["textGeneration"] = {
++        generateCommitMessage: () => unsupportedText("generateCommitMessage"),
++        generatePrContent: () => unsupportedText("generatePrContent"),
++        generateBranchName: () => unsupportedText("generateBranchName"),
++        generateThreadTitle: () => unsupportedText("generateThreadTitle"),
++      };
++      return {
++        instanceId, driverKind: DRIVER, continuationIdentity, displayName, accentColor, enabled,
++        snapshot, adapter, textGeneration,
++      } satisfies ProviderInstance;
++    }),
++};
+diff --git a/apps/server/src/provider/Layers/DshAdapter.test.ts b/apps/server/src/provider/Layers/DshAdapter.test.ts
+new file mode 100644
+index 00000000..d0da3045
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshAdapter.test.ts
+@@ -0,0 +1,123 @@
++import * as Assert from "node:assert/strict";
++import { CommandId, ProviderInstanceId, ThreadId, type ProviderSessionStartInput } from "@t3tools/contracts";
++import { it } from "@effect/vitest";
++import * as Effect from "effect/Effect";
++
++import { DshDriver } from "../Drivers/DshDriver.ts";
++import { DshHostService, makeDshAdapter, type DshHostPort } from "./DshAdapter.ts";
++
++const instanceId = ProviderInstanceId.make("dsh-fixture");
++const threadId = ThreadId.make("fixture-thread");
++const start: ProviderSessionStartInput = { threadId, cwd: "/fixture/project", runtimeMode: "approval-required" };
++
++it("binds one deterministic native session and never sends without a stable command ID", async () => {
++  const created: string[] = [];
++  const prompts: string[] = [];
++  const host: DshHostPort = {
++    describe: async () => ({ installed: true, authenticated: true, version: "fixture", models: [] }),
++    hasSession: async () => false,
++    create: async (sessionId) => { created.push(sessionId); },
++    prompt: async (_sessionId, requestId) => { prompts.push(requestId); },
++    observe: async () => ({ status: "completed", nativeTurn: 1, terminalSeq: 4 }),
++  };
++  const adapter = await Effect.runPromise(makeDshAdapter({ instanceId, environmentId: "fixture-env", preset: "fixture-preset", host }));
++  const session = await Effect.runPromise(adapter.startSession(start));
++  Assert.match(String((session.resumeCursor as { sessionId: string }).sessionId), /^t3_[a-f0-9]{40}$/);
++  Assert.deepEqual(created, [(session.resumeCursor as { sessionId: string }).sessionId]);
++  await Assert.rejects(Effect.runPromise(adapter.sendTurn({ threadId, input: "synthetic" })));
++  Assert.deepEqual(prompts, []);
++  await Assert.rejects(Effect.runPromise(adapter.sendTurn({ threadId, sourceCommandId: CommandId.make("model-command"),
++    input: "synthetic", modelSelection: { instanceId, model: "unverified" } })));
++  Assert.deepEqual(prompts, []);
++
++  const input = { threadId, sourceCommandId: CommandId.make("fixture-command"), input: "synthetic" };
++  const first = await Effect.runPromise(adapter.sendTurn(input));
++  const second = await Effect.runPromise(adapter.sendTurn(input));
++  Assert.equal(first.turnId, second.turnId);
++  Assert.deepEqual(prompts, ["fixture-command"]);
++});
++
++it("rejects a resume cursor from another thread before any Host operation", async () => {
++  let calls = 0;
++  const host: DshHostPort = {
++    describe: async () => ({ installed: false, authenticated: false, version: null, models: [] }),
++    hasSession: async () => { calls++; return true; },
++    create: async () => { calls++; },
++    prompt: async () => { calls++; },
++    observe: async () => ({ status: "unknown" }),
++  };
++  const adapter = await Effect.runPromise(makeDshAdapter({ instanceId, environmentId: "fixture-env", preset: "fixture-preset", host }));
++  await Assert.rejects(Effect.runPromise(adapter.startSession({ ...start, resumeCursor: { sessionId: "t3_other" } })));
++  Assert.equal(calls, 0);
++});
++
++it("keeps a lost prompt response unknown without sending it again", async () => {
++  let prompts = 0;
++  const host: DshHostPort = {
++    describe: async () => ({ installed: true, authenticated: true, version: "fixture", models: [] }),
++    hasSession: async () => false,
++    create: async () => undefined,
++    prompt: async () => { prompts++; throw new Error("response lost"); },
++    observe: async () => ({ status: "unknown" }),
++  };
++  const adapter = await Effect.runPromise(makeDshAdapter({ instanceId, environmentId: "fixture-env", preset: "fixture-preset", host }));
++  await Effect.runPromise(adapter.startSession(start));
++  const input = { threadId, sourceCommandId: CommandId.make("lost-command"), input: "synthetic" };
++  await Assert.rejects(Effect.runPromise(adapter.sendTurn(input)));
++  await Assert.rejects(Effect.runPromise(adapter.sendTurn(input)));
++  Assert.equal(prompts, 1);
++});
++
++it("keeps a restored turn unknown without a second prompt after rebuilding the adapter", async () => {
++  const prompts: Array<{ sessionId: string; requestId: string; text: string }> = [];
++  const created: string[] = [];
++  const host: DshHostPort = {
++    describe: async () => ({ installed: true, authenticated: true, version: "fixture", models: [] }),
++    hasSession: async (sessionId) => created.includes(sessionId),
++    create: async (sessionId) => { created.push(sessionId); },
++    prompt: async (sessionId, requestId, text) => { prompts.push({ sessionId, requestId, text }); },
++    observe: async () => ({ status: "unknown" }),
++  };
++  const options = { instanceId, environmentId: "fixture-env", preset: "fixture-preset", host };
++  const firstAdapter = await Effect.runPromise(makeDshAdapter(options));
++  const firstSession = await Effect.runPromise(firstAdapter.startSession(start));
++  const input = { threadId, sourceCommandId: CommandId.make("restored-command"), input: "synthetic text" };
++  const sent = await Effect.runPromise(firstAdapter.sendTurn(input));
++  const savedCursor = sent.resumeCursor as { sessionId: string; requestId: string };
++  Assert.equal(savedCursor.sessionId, (firstSession.resumeCursor as { sessionId: string }).sessionId);
++  Assert.equal(savedCursor.requestId, input.sourceCommandId);
++  Assert.deepEqual(prompts, [{ sessionId: savedCursor.sessionId, requestId: input.sourceCommandId, text: input.input }]);
++  await Effect.runPromise(firstAdapter.stopAll());
++
++  const restoredAdapter = await Effect.runPromise(makeDshAdapter(options));
++  Assert.notEqual(restoredAdapter, firstAdapter);
++  const restoredSession = await Effect.runPromise(restoredAdapter.startSession({ ...start, resumeCursor: savedCursor }));
++  Assert.deepEqual(restoredSession.resumeCursor, savedCursor);
++  const snapshot = await Effect.runPromise(restoredAdapter.readThread(threadId));
++  Assert.equal(snapshot.turns[0]?.id, sent.turnId);
++  await Assert.rejects(Effect.runPromise(restoredAdapter.sendTurn(input)));
++  await Assert.rejects(Effect.runPromise(restoredAdapter.sendTurn({ ...input, input: "changed text" })));
++  Assert.deepEqual(prompts, [{ sessionId: savedCursor.sessionId, requestId: input.sourceCommandId, text: input.input }]);
++  Assert.deepEqual(created, [savedCursor.sessionId, savedCursor.sessionId]);
++  await Effect.runPromise(restoredAdapter.stopAll());
++});
++
++it("driver exposes only native verified models and keeps text generation disabled", async () => {
++  const host: DshHostPort = {
++    describe: async () => ({ installed: true, authenticated: true, version: "fixture", models: [] }),
++    hasSession: async () => false,
++    create: async () => undefined,
++    prompt: async () => undefined,
++    observe: async () => ({ status: "unknown" }),
++  };
++  const instance = await Effect.runPromise(DshDriver.create({
++    instanceId, displayName: undefined, environment: [], enabled: true, config: { agentPreset: "fixture-preset" },
++  }).pipe(Effect.provideService(DshHostService, { environmentId: "fixture-env", port: host }), Effect.scoped));
++  const snapshot = await Effect.runPromise(instance.snapshot.getSnapshot);
++  Assert.equal(snapshot.status, "warning");
++  Assert.deepEqual(snapshot.models, []);
++  Assert.equal(snapshot.supportsTextGeneration, false);
++  await Assert.rejects(Effect.runPromise(instance.textGeneration.generateThreadTitle({
++    cwd: "/fixture/project", message: "synthetic", modelSelection: { instanceId, model: "none" },
++  })));
++});
+diff --git a/apps/server/src/provider/Layers/DshAdapter.ts b/apps/server/src/provider/Layers/DshAdapter.ts
+new file mode 100644
+index 00000000..3285a17d
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshAdapter.ts
+@@ -0,0 +1,230 @@
++import { createHash } from "node:crypto";
++import {
++  EventId, ProviderDriverKind, ProviderInstanceId, ThreadId, TurnId,
++  type ProviderRuntimeEvent, type ProviderSession, type ServerProviderModel,
++} from "@t3tools/contracts";
++import * as Context from "effect/Context";
++import * as Effect from "effect/Effect";
++import * as DateTime from "effect/DateTime";
++import * as Queue from "effect/Queue";
++import * as Stream from "effect/Stream";
++
++import { ProviderAdapterRequestError, ProviderAdapterValidationError, type ProviderAdapterError } from "../Errors.ts";
++import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
++
++const DRIVER = ProviderDriverKind.make("dsh");
++const nativeId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
++const now = Effect.map(DateTime.now, DateTime.formatIso);
++
++/** Host methods are implemented by DshHostProtocol against the installed 0.1.5-rc.2 Gateway. */
++export interface DshHostPort {
++  /** I supplies this from the protected launcher and native model catalog. */
++  describe(): Promise<{ readonly installed: boolean; readonly authenticated: boolean;
++    readonly version: string | null; readonly models: readonly ServerProviderModel[] }>;
++  create(sessionId: string, cwd: string, preset: string): Promise<void>;
++  /** Cold read only; no Agent activation. */
++  hasSession(sessionId: string, cwd: string): Promise<boolean>;
++  /** Uses exactly the T3 command ID as Host requestId. */
++  prompt(sessionId: string, requestId: string, text: string): Promise<void>;
++  observe(sessionId: string, requestId: string): Promise<{
++    readonly status: "unknown" | "queued" | "running" | "waiting_approval" | "waiting_answer" |
++      "completed" | "failed" | "cancelled";
++    readonly nativeTurn?: number;
++    readonly terminalSeq?: number;
++  }>;
++}
++
++/** I supplies one scoped, authenticated Host implementation. No URL or cookie enters provider settings. */
++export class DshHostService extends Context.Service<DshHostService, {
++  readonly environmentId: string;
++  readonly port: DshHostPort;
++}>()("t3/provider/Layers/DshAdapter/DshHostService") {}
++
++export interface DshAdapterOptions {
++  readonly instanceId: ProviderInstanceId;
++  readonly environmentId: string;
++  readonly preset: string;
++  readonly host: DshHostPort;
++  readonly pollIntervalMs?: number;
++}
++
++const sessionIdFor = (environmentId: string, threadId: ThreadId) => {
++  // A deterministic ID avoids creating another session after a lost create response.
++  return `t3_${createHash("sha256").update(JSON.stringify([environmentId, threadId])).digest("hex").slice(0, 40)}`;
++};
++
++const textDigest = (sessionId: string, requestId: string, text: string): string =>
++  createHash("sha256").update(JSON.stringify([sessionId, requestId, text])).digest("hex");
++
++const cursor = (value: unknown): { sessionId: string; requestId?: string; messageDigest?: string } | null => {
++  if (!value || typeof value !== "object") return null;
++  const candidate = value as { sessionId?: unknown; requestId?: unknown; messageDigest?: unknown };
++  if (typeof candidate.sessionId !== "string" || !nativeId(candidate.sessionId) ||
++      candidate.requestId !== undefined && (typeof candidate.requestId !== "string" || !nativeId(candidate.requestId)) ||
++      candidate.messageDigest !== undefined && (typeof candidate.messageDigest !== "string" ||
++        !/^[a-f0-9]{64}$/.test(candidate.messageDigest) || candidate.requestId === undefined)) return null;
++  return { sessionId: candidate.sessionId,
++    ...(typeof candidate.requestId === "string" ? { requestId: candidate.requestId } : {}),
++    ...(typeof candidate.messageDigest === "string" ? { messageDigest: candidate.messageDigest } : {}) };
++};
++
++export const makeDshAdapter = Effect.fn("makeDshAdapter")(function* (options: DshAdapterOptions) {
++  const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
++  const sessions = new Map<ThreadId, ProviderSession>();
++  const requests = new Map<ThreadId, Map<string, TurnId>>();
++  const attempted = new Map<ThreadId, Set<string>>();
++  const monitoring = new Set<string>();
++  const pollIntervalMs = options.pollIntervalMs ?? 2000;
++
++  const error = (method: string, detail: string): ProviderAdapterError => new ProviderAdapterRequestError({
++    provider: DRIVER, method, detail,
++  });
++  const remote = <A>(method: string, action: () => Promise<A>) => Effect.tryPromise({
++    try: action,
++    catch: () => error(method, "DSH Host operation unavailable; inspect the original session"),
++  });
++  const emit = (event: ProviderRuntimeEvent) => Queue.offer(events, event).pipe(Effect.asVoid);
++  const base = (threadId: ThreadId, eventId: string, createdAt: string, turnId?: TurnId) => ({
++    eventId: EventId.make(eventId), provider: DRIVER, providerInstanceId: options.instanceId,
++    threadId, createdAt, ...(turnId === undefined ? {} : { turnId }),
++  });
++
++  const monitor = (threadId: ThreadId, sessionId: string, requestId: string, turnId: TurnId) =>
++    Effect.gen(function* () {
++      const key = `${threadId}:${requestId}`;
++      if (monitoring.has(key)) return;
++      monitoring.add(key);
++      let started = false;
++      let waiting = "";
++      try {
++        while (sessions.has(threadId)) {
++          const observed = yield* remote("session/page", () => options.host.observe(sessionId, requestId))
++            .pipe(Effect.orElseSucceed(() => ({ status: "unknown" as const })));
++          if (observed.status === "running" || observed.status.startsWith("waiting_") ||
++              observed.status === "completed" || observed.status === "failed" || observed.status === "cancelled") {
++            if (!started) {
++              yield* emit({ ...base(threadId, `dsh:${sessionId}:${requestId}:started`, yield* now, turnId),
++                type: "turn.started", payload: {} });
++              started = true;
++            }
++          }
++          if (observed.status === "waiting_approval" || observed.status === "waiting_answer") {
++            if (waiting !== observed.status) {
++              yield* emit({ ...base(threadId, `dsh:${sessionId}:${requestId}:${observed.status}`, yield* now, turnId),
++                type: "session.state.changed", payload: { state: "waiting",
++                  reason: observed.status === "waiting_approval" ? "Approval pending in original DSH Host" :
++                    "Question pending in original DSH Host" } });
++              waiting = observed.status;
++            }
++          }
++          if (observed.status === "completed" || observed.status === "failed" || observed.status === "cancelled") {
++            if (observed.nativeTurn === undefined || observed.terminalSeq === undefined) return;
++            yield* emit({ ...base(threadId, `dsh:${sessionId}:${observed.terminalSeq}`, yield* now, turnId),
++              type: "turn.completed", payload: { state: observed.status } });
++            const session = sessions.get(threadId);
++            if (session) {
++              const { activeTurnId: _activeTurnId, ...settled } = session;
++              sessions.set(threadId, { ...settled, status: "ready", updatedAt: yield* now });
++            }
++            return;
++          }
++          yield* Effect.sleep(`${pollIntervalMs} millis`);
++        }
++      } finally { monitoring.delete(key); }
++    }).pipe(Effect.forkDetach, Effect.asVoid);
++
++  const startSession: ProviderAdapterShape<ProviderAdapterError>["startSession"] = (input) =>
++    Effect.gen(function* () {
++      if (!input.cwd) return yield* new ProviderAdapterValidationError({ provider: DRIVER,
++        operation: "startSession", issue: "DSH requires an explicit workspace path" });
++      const resumed = input.resumeCursor === undefined ? null : cursor(input.resumeCursor);
++      if (input.resumeCursor !== undefined && !resumed) return yield* error("startSession", "Invalid DSH resume cursor");
++      const expectedSessionId = sessionIdFor(options.environmentId, input.threadId);
++      if (resumed && resumed.sessionId !== expectedSessionId)
++        return yield* error("startSession", "DSH resume cursor belongs to another T3 thread");
++      const sessionId = expectedSessionId;
++      if (!nativeId(sessionId)) return yield* error("startSession", "Invalid DSH session ID");
++      const exists = yield* remote("session/list", () => options.host.hasSession(sessionId, input.cwd!));
++      if (resumed && !exists) return yield* error("startSession", "Original DSH session missing; no new session was created");
++      yield* remote("session/create", () => options.host.create(sessionId, input.cwd!, options.preset));
++      const timestamp = yield* now;
++      const session: ProviderSession = { provider: DRIVER, providerInstanceId: options.instanceId,
++        threadId: input.threadId, status: "ready", runtimeMode: input.runtimeMode, cwd: input.cwd,
++        ...(input.modelSelection ? { model: input.modelSelection.model } : {}),
++        resumeCursor: resumed ?? { sessionId }, createdAt: timestamp, updatedAt: timestamp };
++      sessions.set(input.threadId, session);
++      yield* emit({ ...base(input.threadId, `dsh:${sessionId}:session-started`, yield* now),
++        type: "session.started", payload: { resume: { sessionId } } });
++      if (resumed?.requestId) {
++        const turnId = TurnId.make(`dsh:${resumed.requestId}`);
++        requests.set(input.threadId, new Map([[resumed.requestId, turnId]]));
++        attempted.set(input.threadId, new Set([resumed.requestId]));
++        yield* monitor(input.threadId, sessionId, resumed.requestId, turnId);
++      }
++      return session;
++    });
++
++  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) =>
++    Effect.gen(function* () {
++      const session = sessions.get(input.threadId);
++      const saved = cursor(session?.resumeCursor);
++      if (!saved) return yield* error("sendTurn", "Original DSH session unavailable");
++      if (!options.preset.trim()) return yield* error("sendTurn", "DSH agent preset is not configured");
++      // Installed Host selectModel also persists the global default. Keep this route closed.
++      if (input.modelSelection) return yield* error("sendTurn", "DSH model selection is not verified for this preset");
++      if (!input.sourceCommandId || !nativeId(String(input.sourceCommandId)) || !input.input?.trim() ||
++          input.attachments?.length) return yield* new ProviderAdapterValidationError({ provider: DRIVER,
++            operation: "sendTurn", issue: "Stable command ID and text are required; attachments are not verified" });
++      const requestId = String(input.sourceCommandId);
++      const turnId = TurnId.make(`dsh:${requestId}`);
++      const digest = textDigest(saved.sessionId, requestId, input.input);
++      if (saved.requestId === requestId && saved.messageDigest !== digest) {
++        return yield* error("sendTurn", "Restored command text cannot be verified; no retry was sent");
++      }
++      const readback = () => remote("session/page", () => options.host.observe(saved.sessionId, requestId)).pipe(
++        Effect.map((observed) => observed.status !== "unknown"),
++        Effect.orElseSucceed(() => false),
++      );
++      if (requests.get(input.threadId)?.has(requestId) && !(yield* readback())) {
++        return yield* error("sendTurn", "Prompt receipt unknown; no retry was sent");
++      }
++      if (!requests.get(input.threadId)?.has(requestId)) {
++        const attemptSet = attempted.get(input.threadId) ?? new Set<string>();
++        const priorAttempt = attemptSet.has(requestId);
++        attemptSet.add(requestId);
++        attempted.set(input.threadId, attemptSet);
++        const accepted = priorAttempt ? yield* readback()
++          : yield* remote("session/prompt", () => options.host.prompt(saved.sessionId, requestId, input.input!)).pipe(
++              Effect.matchEffect({ onSuccess: () => Effect.succeed(true), onFailure: readback }),
++            );
++        if (!accepted) return yield* error("sendTurn", "Prompt receipt unknown; no retry was sent");
++      }
++      const nextCursor = { sessionId: saved.sessionId, requestId, messageDigest: digest };
++      sessions.set(input.threadId, { ...session!, status: "running", resumeCursor: nextCursor, updatedAt: yield* now, activeTurnId: turnId });
++      const byRequest = requests.get(input.threadId) ?? new Map<string, TurnId>();
++      byRequest.set(requestId, turnId);
++      requests.set(input.threadId, byRequest);
++      yield* monitor(input.threadId, saved.sessionId, requestId, turnId);
++      return { threadId: input.threadId, turnId, resumeCursor: nextCursor };
++    });
++
++  const unsupported = (method: string) => Effect.fail(error(method, "Native request identity or exact-turn condition unverified; use original DSH Host"));
++  const adapter: ProviderAdapterShape<ProviderAdapterError> = {
++    provider: DRIVER,
++    capabilities: { sessionModelSwitch: "unsupported", supportsConversationRollback: false },
++    startSession,
++    sendTurn,
++    interruptTurn: () => unsupported("interruptTurn"),
++    respondToRequest: () => unsupported("respondToRequest"),
++    respondToUserInput: () => unsupported("respondToUserInput"),
++    stopSession: (threadId) => Effect.sync(() => { sessions.delete(threadId); requests.delete(threadId); attempted.delete(threadId); }),
++    listSessions: () => Effect.sync(() => [...sessions.values()]),
++    hasSession: (threadId) => Effect.sync(() => sessions.has(threadId)),
++    readThread: (threadId) => Effect.sync(() => ({ threadId,
++      turns: [...(requests.get(threadId)?.values() ?? [])].map(id => ({ id, items: [] })) })),
++    rollbackThread: () => unsupported("rollbackThread"),
++    stopAll: () => Effect.sync(() => { sessions.clear(); requests.clear(); attempted.clear(); }),
++    streamEvents: Stream.fromQueue(events),
++  };
++  return adapter;
++});
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.test.ts b/apps/server/src/provider/Layers/DshHostProtocol.test.ts
+new file mode 100644
+index 00000000..17416694
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshHostProtocol.test.ts
+@@ -0,0 +1,74 @@
++import * as Assert from "node:assert/strict";
++import { it } from "@effect/vitest";
++
++import { DshTransportError, HttpDshSessionRpc, makeDshHostProtocol, type DshSessionRpc } from "./DshHostProtocol.ts";
++
++const events = [
++  { seq: 1, type: "turn/start", data: { turn: 7 } },
++  { seq: 2, type: "user/message", data: { source: { kind: "user", rpcId: "request-1" } } },
++  { seq: 3, type: "assistant/message", data: { turn: 7, message: { content: [{ type: "text", text: "private fixture" }] } } },
++  { seq: 4, type: "turn/end", data: { turn: 7, reason: { kind: "completed" } } },
++];
++
++it("reads the exact native turn while keeping model selection closed", async () => {
++  const calls: string[] = [];
++  const rpc: DshSessionRpc = { call: async (method) => {
++    calls.push(method);
++    if (method === "session/list") return { items: [{ sessionId: "session-1", cwd: "/fixture/project", running: false,
++      projections: { asOfSeq: 4, values: {} } }] };
++    if (method === "session/page") return { records: events.map(event => ({ type: "event", event })), hasMore: false };
++    if (method === "session/prompt") return { accepted: true };
++    if (method === "session/create") return { sessionId: "session-1", agentPreset: "preset-1" };
++    throw new Error("unexpected method");
++  } };
++  const host = makeDshHostProtocol(rpc);
++  const description = await host.describe();
++  Assert.equal(description.version, null);
++  Assert.deepEqual(description.models, []);
++  Assert.equal(await host.hasSession("session-1", "/fixture/project"), true);
++  await host.create("session-1", "/fixture/project", "preset-1");
++  await host.prompt("session-1", "request-1", "synthetic text");
++  Assert.deepEqual(await host.observe("session-1", "request-1"), {
++    status: "completed", nativeTurn: 7, terminalSeq: 4,
++  });
++  Assert.ok(!JSON.stringify(description).includes("private fixture"));
++  Assert.equal(calls.filter(call => call === "session/prompt").length, 1);
++});
++
++it("does not promote a broken or foreign native history to completion", async () => {
++  const rpc = (source: typeof events): DshSessionRpc => ({ call: async (method) => {
++    if (method === "session/list") return { items: [{ sessionId: "session-1", cwd: "/fixture/project", running: false,
++      projections: { asOfSeq: 4, values: {} } }] };
++    if (method === "session/page") return { records: source.map(event => ({ type: "event", event })), hasMore: false };
++    throw new Error("read only fixture");
++  } });
++  Assert.equal((await makeDshHostProtocol(rpc([events[0]!, events[2]!, events[3]!])).observe("session-1", "request-1")).status,
++    "unknown");
++  const foreign = [events[0]!, { seq: 2, type: "user/message", data: { source: { kind: "user", rpcId: "other" } } },
++    { ...events[1]!, seq: 3 }, events[3]!];
++  Assert.equal((await makeDshHostProtocol(rpc(foreign)).observe("session-1", "request-1")).status, "unknown");
++});
++
++it("restricts the launcher exchange to loopback and redacts transport errors", async () => {
++  const calls: string[] = [];
++  const fakeFetch = (async (input: URL | Request, init?: RequestInit): Promise<Response> => {
++    if (calls.length === 0) {
++      calls.push("launcher");
++      Assert.equal(init?.redirect, "manual");
++      return new Response(null, { status: 303, headers: { location: "/", "set-cookie": "sid=fixture-cookie; Path=/" } });
++    }
++    calls.push("rpc");
++    Assert.equal(String(input), "http://127.0.0.1:12345/api/session/list");
++    const request = JSON.parse(String(init?.body)) as { rpcId: string; method: string };
++    Assert.equal(request.method, "session/list");
++    return new Response(JSON.stringify({ type: "server-response", rpcId: request.rpcId,
++      result: { ok: true, value: { items: [] } } }), { status: 200 });
++  }) as typeof fetch;
++  const rpc = new HttpDshSessionRpc(async () => "http://127.0.0.1:12345/?token=fixture-secret", fakeFetch);
++  Assert.deepEqual(await rpc.call("session/list", { _request: {} }), { items: [] });
++  Assert.deepEqual(calls, ["launcher", "rpc"]);
++  const hostile = new HttpDshSessionRpc(async () => "https://example.com/?token=fixture-secret", fakeFetch);
++  await Assert.rejects(hostile.call("session/list", {}), (error: unknown) =>
++    error instanceof DshTransportError && error.code === "authentication_required" && !error.message.includes("fixture-secret"));
++  Assert.equal(calls.length, 2);
++});
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.ts b/apps/server/src/provider/Layers/DshHostProtocol.ts
+new file mode 100644
+index 00000000..d7c483c5
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshHostProtocol.ts
+@@ -0,0 +1,198 @@
++// @effect-diagnostics globalTimers:off cryptoRandomUUID:off -- This bounded native HTTP client owns its deadline and wire request IDs.
++import type { DshHostPort } from "./DshAdapter.ts";
++
++type DshMethod = "session/list" | "session/page" | "session/create" | "session/prompt";
++export interface DshSessionRpc { call(method: DshMethod, args: object): Promise<unknown> }
++
++export class DshTransportError extends Error {
++  readonly code: "unavailable" | "authentication_required" | "incompatible";
++  constructor(code: DshTransportError["code"]) { super(code); this.code = code; }
++}
++
++const record = (value: unknown): Record<string, unknown> | null =>
++  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
++const integer = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
++const nativeId = (value: string): boolean => /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
++
++/** I supplies the resolver inside the T3 server; the URL and cookie never leave this transport. */
++export class HttpDshSessionRpc implements DshSessionRpc {
++  private readonly resolveGatewayUrl: () => Promise<string>;
++  private readonly fetcher: typeof fetch;
++  private readonly timeoutMs: number;
++  constructor(resolveGatewayUrl: () => Promise<string>, fetcher: typeof fetch = fetch, timeoutMs = 5000) {
++    this.resolveGatewayUrl = resolveGatewayUrl;
++    this.fetcher = fetcher;
++    this.timeoutMs = timeoutMs;
++    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new DshTransportError("incompatible");
++  }
++
++  private async gateway(): Promise<URL> {
++    try {
++      const url = new URL(await this.resolveGatewayUrl());
++      if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.pathname !== "/" ||
++          url.hash || url.username || url.password || url.searchParams.getAll("token").length !== 1 ||
++          !url.searchParams.get("token") || [...url.searchParams.keys()].some(key => key !== "token")) {
++        throw new DshTransportError("authentication_required");
++      }
++      return url;
++    } catch { throw new DshTransportError("authentication_required"); }
++  }
++
++  async call(method: DshMethod, args: object): Promise<unknown> {
++    if (!["session/list", "session/page", "session/create", "session/prompt"].includes(method)) {
++      throw new DshTransportError("incompatible");
++    }
++    const abort = new AbortController();
++    const timer = setTimeout(() => abort.abort(), this.timeoutMs);
++    try {
++      const gateway = await this.gateway();
++      const exchange = await this.fetcher(gateway, { redirect: "manual", signal: abort.signal });
++      const cookie = exchange.headers.get("set-cookie")?.split(";")[0];
++      await exchange.body?.cancel();
++      if (exchange.status !== 303 || !["/", "./"].includes(exchange.headers.get("location") ?? "") || !cookie ||
++          !/^[A-Za-z0-9_-]+=[A-Za-z0-9_.-]+$/.test(cookie)) throw new DshTransportError("authentication_required");
++      const rpcId = crypto.randomUUID();
++      const response = await this.fetcher(`${gateway.origin}/api/${method}`, {
++        method: "POST", redirect: "manual", signal: abort.signal,
++        headers: { Cookie: cookie, Origin: gateway.origin, "Content-Type": "application/json" },
++        body: JSON.stringify({ type: "client-request", rpcId, method, payload: { args } }),
++      });
++      if (response.status === 401 || response.status === 403) throw new DshTransportError("authentication_required");
++      if (!response.ok || !response.body) throw new DshTransportError("unavailable");
++      const reader = response.body.getReader();
++      const chunks: Uint8Array[] = [];
++      let bytes = 0;
++      while (true) {
++        const part = await reader.read();
++        if (part.done) break;
++        bytes += part.value.byteLength;
++        if (bytes > 4 * 1024 * 1024) { await reader.cancel(); throw new DshTransportError("incompatible"); }
++        chunks.push(part.value);
++      }
++      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
++      const result = record(body);
++      const payload = record(result?.result);
++      if (result?.type !== "server-response" || result.rpcId !== rpcId || payload?.ok !== true) {
++        throw new DshTransportError("incompatible");
++      }
++      return payload.value;
++    } catch (error) {
++      // Native and fetch errors can contain the bearer URL or private task content.
++      if (error instanceof DshTransportError) throw error;
++      throw new DshTransportError("unavailable");
++    } finally { clearTimeout(timer); }
++  }
++}
++
++interface NativeEvent { readonly seq: number; readonly type: string; readonly data: unknown }
++interface SessionRow { readonly sessionId: string; readonly running: boolean; readonly cwd?: string;
++  readonly parentSessionId?: string; readonly origin?: string;
++  readonly projections?: { readonly asOfSeq: number; readonly values?: Record<string, unknown> } }
++
++async function listRows(rpc: DshSessionRpc): Promise<SessionRow[]> {
++  const value = record(await rpc.call("session/list", { _request: {} }));
++  if (!Array.isArray(value?.items)) throw new DshTransportError("incompatible");
++  return value.items as SessionRow[];
++}
++
++/** Matches the installed 0.1.5-rc.2 session controller, with unknown on ambiguous history. */
++export function makeDshHostProtocol(rpc: DshSessionRpc): DshHostPort {
++  return {
++    describe: async () => {
++      await listRows(rpc);
++      // Native selectModel also saves the global default; do not advertise actionable models.
++      return { installed: true, authenticated: true, version: null, models: [] };
++    },
++    hasSession: async (sessionId, cwd) => {
++      if (!nativeId(sessionId) || !cwd.startsWith("/")) throw new DshTransportError("incompatible");
++      const matches = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
++      if (matches.length === 0) return false;
++      if (matches.length !== 1 || matches[0]?.cwd !== cwd || matches[0]?.parentSessionId || matches[0]?.origin === "subagent") {
++        throw new DshTransportError("incompatible");
++      }
++      return true;
++    },
++    create: async (sessionId, cwd, preset) => {
++      if (!nativeId(sessionId) || !cwd.startsWith("/") || /[\0\r\n]/.test(cwd) || !preset.trim()) {
++        throw new DshTransportError("incompatible");
++      }
++      const value = record(await rpc.call("session/create", { request: { sessionId, cwd, agentPreset: preset } }));
++      if (value?.sessionId !== sessionId || value.agentPreset !== preset) throw new DshTransportError("incompatible");
++    },
++    prompt: async (sessionId, requestId, text) => {
++      if (!nativeId(sessionId) || !nativeId(requestId) || !text.trim()) throw new DshTransportError("incompatible");
++      const value = record(await rpc.call("session/prompt", { request: { sessionId, requestId, mode: "queue",
++        content: [{ type: "text", text }] } }));
++      if (value?.accepted !== true) throw new DshTransportError("incompatible");
++    },
++    observe: async (sessionId, requestId) => readExactPrompt(rpc, sessionId, requestId),
++  };
++}
++
++async function readExactPrompt(rpc: DshSessionRpc, sessionId: string, requestId: string): ReturnType<DshHostPort["observe"]> {
++  const unknown = { status: "unknown" as const };
++  if (!nativeId(sessionId) || !nativeId(requestId)) return unknown;
++  try {
++    const matches = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
++    if (matches.length !== 1) return unknown;
++    const row = matches[0]!;
++    const throughSeq = row.projections?.asOfSeq;
++    if (typeof row.running !== "boolean" || row.parentSessionId || row.origin === "subagent" || !integer(throughSeq)) return unknown;
++    const inbox = record(row.projections?.values?.inbox);
++    const queued = ["next-turn", "next-step"].some(key => Array.isArray(inbox?.[key]) &&
++      (inbox[key] as unknown[]).some(item => record(record(item)?.source)?.rpcId === requestId));
++    const events: NativeEvent[] = [];
++    let beforeSeq: number | undefined;
++    let exhausted = false;
++    for (let pageIndex = 0; pageIndex < 16; pageIndex++) {
++      const page = record(await rpc.call("session/page", { request: { address: { kind: "session", sessionId }, throughSeq,
++        maxMessages: 6, ...(beforeSeq === undefined ? {} : { beforeSeq }) } }));
++      const records = page?.records;
++      if (!Array.isArray(records) || typeof page?.hasMore !== "boolean" || records.length === 0) return unknown;
++      const current = records.map(item => record(record(item)?.event)).filter((item): item is Record<string, unknown> => item !== null);
++      if (current.length !== records.length || current.some((item, index) => !integer(item.seq) || (item.seq as number) > throughSeq ||
++          (beforeSeq !== undefined && (item.seq as number) >= beforeSeq) ||
++          (index > 0 && (item.seq as number) !== (current[index - 1]?.seq as number) + 1))) return unknown;
++      if (current.at(-1)?.seq !== (beforeSeq ?? throughSeq + 1) - 1) return unknown;
++      for (const item of current) events.push({ seq: item.seq as number, type: item.type as string, data: item.data });
++      if (!page.hasMore) { exhausted = true; break; }
++      beforeSeq = current[0]?.seq as number;
++    }
++    let activeTurn: number | null = null;
++    let boundTurn: number | null = null;
++    let end: { seq: number; reason: string } | null = null;
++    let duplicate = false;
++    const foreignTurns = new Set<number>();
++    const pending = new Set<string>();
++    for (const event of events.sort((a, b) => a.seq - b.seq)) {
++      const data = record(event.data);
++      const turn = data?.turn;
++      if (event.type === "turn/start" && integer(turn)) activeTurn = turn;
++      if (event.type === "user/message" && activeTurn !== null) {
++        const source = record(data?.source);
++        if (source?.kind === "user" && source.rpcId === requestId) {
++          if (boundTurn !== null) duplicate = true;
++          boundTurn = activeTurn;
++        } else foreignTurns.add(activeTurn);
++      }
++      if (boundTurn !== null && activeTurn === boundTurn) {
++        if (event.type === "approval/asked" && typeof data?.id === "string") pending.add(data.id);
++        if (event.type === "approval/decided" && typeof data?.id === "string") pending.delete(data.id);
++      }
++      if (event.type === "turn/end" && integer(turn)) {
++        if (boundTurn === turn) end = { seq: event.seq, reason: String(record(data?.reason)?.kind ?? "") };
++        if (activeTurn === turn) activeTurn = null;
++      }
++    }
++    if (duplicate || boundTurn !== null && foreignTurns.has(boundTurn) || queued && end) return unknown;
++    if (boundTurn === null) return queued ? { status: "queued" } : unknown;
++    if (end) {
++      const status = end.reason === "completed" && pending.size === 0 ? "completed" :
++        ["aborted", "interrupted"].includes(end.reason) ? "cancelled" :
++        ["error", "blocked", "max-tokens"].includes(end.reason) ? "failed" : "unknown";
++      return status === "unknown" ? unknown : { status, nativeTurn: boundTurn, terminalSeq: end.seq };
++    }
++    if (!row.running || activeTurn !== boundTurn || !exhausted) return unknown;
++    return { status: pending.size ? "waiting_approval" : "running", nativeTurn: boundTurn };
++  } catch { return unknown; }
++}

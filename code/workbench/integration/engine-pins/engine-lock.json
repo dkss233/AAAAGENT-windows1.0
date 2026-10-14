@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "target": "win32-x64",
+  "codex": {
+    "version": "0.160.0",
+    "tag": "rust-v0.160.0",
+    "commit": "a956835d020762cb2b570053af06f643a11c0ecc",
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-package-x86_64-pc-windows-msvc.tar.gz",
+    "sha256": "7f7fbbc8d6fd4ea2f3b13855ef47ea59663ba7e61fb2e9821df37163b8030891"
+  },
+  "node": {
+    "version": "24.13.1",
+    "url": "https://nodejs.org/dist/v24.13.1/node-v24.13.1-win-x64.zip",
+    "sha256": "fba577c4bb87df04d54dd87bbdaa5a2272f1f99a2acbf9152e1a91b8b5f0b279",
+    "npm": "11.8.0"
+  },
+  "dsh": {
+    "package": "@deepseek-ai/dsh",
+    "version": "0.2.0-rc.2",
+    "url": "https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.2.0-rc.2.tgz",
+    "integrity": "sha512-EAJ3gPNcVt/uv8X19PMm9NkVhWgT7xXNMk0UKCVm+IQ5rpSQOcsMUa0HWlnYYVybKMsccjcRB21vVVsaXQ6IdA==",
+    "entrypoint": "node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "packageLockSha256": "d24f0e81149d4f0b39d742cce41d107bb905c92338992ac0056ea998abbc3c4e",
+    "controllerSourceSha256": "a7df0268a2310bd3e182d9b2a50cfffdbbefe26ea395bba53f912684d7e02514"
+  }
+}

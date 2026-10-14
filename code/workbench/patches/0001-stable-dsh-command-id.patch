@@ -1,0 +1,53 @@
+diff --git a/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts b/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
+index bff5a609..a73d44ba 100644
+--- a/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
++++ b/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
+@@ -835,2 +835,3 @@ const make = Effect.gen(function* () {
+     readonly messageText: string;
++    readonly sourceCommandId?: CommandId;
+     readonly attachments?: ReadonlyArray<ChatAttachment>;
+@@ -885,2 +886,3 @@ const make = Effect.gen(function* () {
+       threadId: input.threadId,
++      ...(input.sourceCommandId !== undefined ? { sourceCommandId: input.sourceCommandId } : {}),
+       ...(normalizedInput ? { input: normalizedInput } : {}),
+@@ -1478,2 +1480,3 @@ const make = Effect.gen(function* () {
+       threadId: event.payload.threadId,
++      ...(event.commandId !== null ? { sourceCommandId: event.commandId } : {}),
+       messageText: projectComposerContextForProvider({
+diff --git a/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts b/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
+index e315c9ab..f7bc1cd9 100644
+--- a/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
++++ b/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
+@@ -1031,2 +1031,3 @@ describe("openCodexThread", () => {
+         resumeThreadId: "stale-thread",
++        resumeFailurePolicy: "start-fresh",
+       });
+diff --git a/apps/server/src/provider/Layers/CodexSessionRuntime.ts b/apps/server/src/provider/Layers/CodexSessionRuntime.ts
+index f30baf01..8063cb8a 100644
+--- a/apps/server/src/provider/Layers/CodexSessionRuntime.ts
++++ b/apps/server/src/provider/Layers/CodexSessionRuntime.ts
+@@ -742,2 +742,4 @@ export const openCodexThread = (input: {
+   readonly resumeThreadId: string | undefined;
++  /** Exact resume is the default; a fresh start must be explicit. */
++  readonly resumeFailurePolicy?: "fail" | "start-fresh";
+ }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
+@@ -776,3 +778,5 @@ export const openCodexThread = (input: {
+       ),
+-      Effect.catchIf(isRecoverableThreadResumeError, (error) =>
++      Effect.catchIf(
++        (error) => input.resumeFailurePolicy === "start-fresh" && isRecoverableThreadResumeError(error),
++        (error) =>
+         Effect.logWarning("codex app-server thread resume fell back to fresh start", {
+diff --git a/packages/contracts/src/provider.ts b/packages/contracts/src/provider.ts
+index 8753ac2c..3b33889f 100644
+--- a/packages/contracts/src/provider.ts
++++ b/packages/contracts/src/provider.ts
+@@ -4,2 +4,3 @@ import {
+   ApprovalRequestId,
++  CommandId,
+   EventId,
+@@ -70,2 +71,4 @@ export const ProviderSendTurnInput = Schema.Struct({
+   threadId: ThreadId,
++  /** Stable orchestration command identity for native send deduplication. */
++  sourceCommandId: Schema.optional(CommandId),
+   /** Internal recovery signal. Allows an empty turn only for adapters that

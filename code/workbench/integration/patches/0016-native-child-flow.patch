@@ -1,0 +1,575 @@
+diff --git a/apps/server/src/bin.test.ts b/apps/server/src/bin.test.ts
+index 0883d715..37502aa8 100644
+--- a/apps/server/src/bin.test.ts
++++ b/apps/server/src/bin.test.ts
+@@ -43,6 +43,8 @@ import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+ import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
+ import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
+ import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
++import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
++import { ProviderSessionDirectory } from "./provider/Services/ProviderSessionDirectory.ts";
+ import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+ import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
+ import {
+@@ -380,6 +382,9 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
+           Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({
+             refreshInstance: () => Effect.succeed([]),
+           })),
++          Layer.provide(Layer.mock(ProviderInstanceRegistry)({ getInstance: () => Effect.undefined })),
++          Layer.provide(Layer.mock(ProviderSessionDirectory)({})),
++          Layer.provide(Layer.mock(ServerEnvironment.ServerEnvironment)({})),
+         ),
+       ),
+       Layer.provide(environmentAuthenticatedAuthLayer),
+diff --git a/apps/server/src/orchestration/NativeChildFlow.test.ts b/apps/server/src/orchestration/NativeChildFlow.test.ts
+new file mode 100644
+index 00000000..738a6f17
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeChildFlow.test.ts
+@@ -0,0 +1,64 @@
++import { describe, it, expect } from "vite-plus/test";
++import { ThreadId } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Option from "effect/Option";
++import { foldNativeChildActivities, verifyNativeRelationships, readNativeChildConversation, readNativeChildRelations, type NativeChildFlowDependencies } from "./NativeChildFlow.ts";
++const A = "11111111-1111-7111-8111-111111111111", B = "22222222-2222-7222-8222-222222222222";
++const at = "2026-10-01T07:00:00.000Z";
++const activity = (id: string, kind = "task.started", payload: any = {}) => ({ id: "activity-" + id + kind, kind, turnId: "native-parent-turn", createdAt: at, tone: "info", summary: "", payload: { taskId: id, timelineBypass: true, agentPath: "/root/a", title: "a", ...payload } }) as any;
++const input = { threadId: ThreadId.make("T3-parent"), environmentId: "env", projectId: "project", instanceId: "codex" };
++function harness(changes: { projectId?: string; provider?: string; bindingInstance?: string; activities?: any[]; parent?: string; activeAdapterSession?: boolean } = {}) {
++  const reads: any[] = [];
++  const deps = {
++    environmentId: "env",
++    projection: { getThreadDetailById: () => Effect.succeed(Option.some({ projectId: changes.projectId ?? "project", activities: changes.activities ?? [activity(A), activity(A, "task.progress", { status: "idle", model: "gpt-6-astra", effort: "low" })] })) },
++    directory: { getBinding: () => Effect.succeed(Option.some({ provider: changes.provider ?? "codex", providerInstanceId: changes.bindingInstance ?? "codex", resumeCursor: { threadId: "native-parent" }, runtimePayload: { cwd: "/public-fixture" } })) },
++    registry: { getInstanceInfo: () => Effect.succeed({ driverKind: "codex", enabled: true }), getByInstance: () => Effect.succeed({ provider: "codex", hasSession: () => Effect.succeed(changes.activeAdapterSession ?? false), readNativeThread: (request: any) => Effect.sync(() => {
++      reads.push(request); return { id: request.threadId, parentThreadId: changes.parent ?? "native-parent", status: { type: "notLoaded" }, turns: request.includeTurns ? [{ id: "original-child-turn", status: "completed", items: [{ id: "original-item", type: "agentMessage", text: "whole original child answer" }] }] : [] };
++    }) }) },
++  } as unknown as NativeChildFlowDependencies;
++  return { deps, reads };
++}
++describe("durable parent scoped native child flow", () => {
++  it("deduplicates stable task IDs without title or path attribution", () => {
++    const nodes = foldNativeChildActivities([activity(A), activity(A, "task.updated"), activity(B, "task.updated"), activity("not-a-native-id")]);
++    expect(nodes).toHaveLength(1); expect(nodes[0]?.relationship).toBe("unknown");
++    expect(nodes[0]?.parentNativeThreadId).toBe(null); expect(nodes[0]?.spawnTurnId).toBe("native-parent-turn");
++  });
++  it("verifies multiple layers from explicit native parents; unknown/cycles never get guessed edges", () => {
++    const nodes = foldNativeChildActivities([activity(A), activity(B)]);
++    const verified = verifyNativeRelationships(nodes, new Map([[A, { id: A, parentThreadId: "native-parent" }], [B, { id: B, parentThreadId: A }]]), "native-parent");
++    expect(verified.map(n => n.relationship)).toEqual(["verified", "verified"]);
++    expect(verified[1]?.parentNativeThreadId).toBe(A);
++    const unknown = verifyNativeRelationships(nodes, new Map([[A, { id: A, parentThreadId: B }], [B, { id: B, parentThreadId: A }]]), "native-parent");
++    expect(unknown.map(n => n.relationship)).toEqual(["unknown", "unknown"]);
++  });
++  it.each([{ environmentId: "other" }, { projectId: "other" }, { instanceId: "dsh" }])("scope mismatch never reaches native history %j", async patch => {
++    const { deps, reads } = harness();
++    await expect(Effect.runPromise(readNativeChildConversation(deps, { ...input, ...patch }, A))).rejects.toThrow("identity mismatch");
++    expect(reads).toEqual([]);
++  });
++  it("a forged child ID is rejected before any original child read", async () => {
++    const { deps, reads } = harness();
++    await expect(Effect.runPromise(readNativeChildConversation(deps, input, B))).rejects.toThrow("durable task records"); expect(reads).toEqual([]);
++  });
++  it("DSH parents cannot use the Codex reader", async () => {
++    const { deps, reads } = harness({ provider: "dsh" });
++    await expect(Effect.runPromise(readNativeChildRelations(deps, input))).rejects.toThrow("provider identity mismatch"); expect(reads).toEqual([]);
++  });
++  it("reads complete original child after restart with no adapter session, without resuming", async () => {
++    const { deps, reads } = harness({ activeAdapterSession: false });
++    const result: any = await Effect.runPromise(readNativeChildConversation(deps, input, A));
++    expect(result.complete).toBe(true); expect(result.child.sessionStatus).toBe("idle");
++    expect(result.child.nativeReadStatus).toBe("notLoaded"); expect(result.child.lastTurnStatus).toBe("completed");
++    expect(result.nativeThread.turns[0].items[0].id).toBe("original-item");
++    expect(result.scope.nativeParentThreadId).toBe("native-parent");
++    expect(reads.map(r => r.includeTurns)).toEqual([false, true]);
++  });
++  it("an outside native parent leaves relationship unknown and full history closed", async () => {
++    const { deps, reads } = harness({ parent: "unrelated-private-thread" });
++    const result = await Effect.runPromise(readNativeChildRelations(deps, input)); expect(result.children[0]?.relationship).toBe("unknown");
++    reads.length = 0;
++    await expect(Effect.runPromise(readNativeChildConversation(deps, input, A))).rejects.toThrow("not verified"); expect(reads.every(r => !r.includeTurns)).toBe(true);
++  });
++});
+diff --git a/apps/server/src/orchestration/NativeChildFlow.ts b/apps/server/src/orchestration/NativeChildFlow.ts
+new file mode 100644
+index 00000000..b36e194d
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeChildFlow.ts
+@@ -0,0 +1,125 @@
++import { NativeChildFlowNode, type OrchestrationThreadActivity, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Data from "effect/Data";
++import * as Option from "effect/Option";
++import type { ProjectionSnapshotQueryShape } from "./Services/ProjectionSnapshotQuery.ts";
++import type { ProviderSessionDirectoryShape } from "../provider/Services/ProviderSessionDirectory.ts";
++import type { ProviderAdapterRegistryShape } from "../provider/Services/ProviderAdapterRegistry.ts";
++
++type Child = typeof NativeChildFlowNode.Type;
++export class NativeChildScopeError extends Data.TaggedError("NativeChildScopeError")<{ readonly message: string }> {}
++const record = (value: unknown): Record<string, unknown> | undefined =>
++  typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
++const text = (value: unknown): string | null => typeof value === "string" && value.trim().length > 0 ? value : null;
++const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++
++/** Stable native task IDs only; titles/paths never create ownership edges. */
++export function foldNativeChildActivities(activities: ReadonlyArray<OrchestrationThreadActivity>): Child[] {
++  const children = new Map<string, Child>();
++  for (const a of [...activities].sort((x, y) => x.createdAt.localeCompare(y.createdAt))) {
++    const p = record(a.payload); const id = text(p?.taskId);
++    if (!p || !id || !uuid.test(id) || p.timelineBypass !== true || !a.kind.startsWith("task.")) continue;
++    const previous = children.get(id);
++    if (!previous && a.kind !== "task.started") continue;
++    const node: Child = previous ?? {
++      nativeThreadId: id, parentNativeThreadId: null, relationship: "unknown",
++      spawnTurnId: text(a.turnId), activityId: a.id, agentPath: null, title: id,
++      model: null, effort: null, sessionStatus: null, nativeReadStatus: null,
++      lastTurnStatus: null, createdAt: a.createdAt, updatedAt: a.createdAt,
++    };
++    children.set(id, {
++      ...node, title: text(p.title) ?? text(p.description) ?? node.title,
++      agentPath: text(p.agentPath) ?? node.agentPath,
++      model: text(p.model) ?? node.model, effort: text(p.effort) ?? node.effort,
++      sessionStatus: text(p.status) ?? node.sessionStatus, updatedAt: a.createdAt,
++      parentNativeThreadId: text(p.parentAgentId) ?? node.parentNativeThreadId,
++    });
++  }
++  return [...children.values()];
++}
++
++export function readNativeParentId(native: unknown): string | null {
++  const t = record(native); const source = record(t?.source);
++  const sub = record(source?.subAgent); const spawn = record(sub?.thread_spawn);
++  const fromSource = text(spawn?.parent_thread_id), fromThread = text(t?.parentThreadId);
++  if (fromSource && fromThread && fromSource !== fromThread) throw new NativeChildScopeError({ message: "Conflicting original native parent identity." });
++  return fromSource ?? fromThread;
++}
++
++export function verifyNativeRelationships(children: Child[], metadata: ReadonlyMap<string, unknown>, rootId: string): Child[] {
++  const nodes = new Map(children.map(child => {
++    const meta = record(metadata.get(child.nativeThreadId));
++    if (!meta || meta.id !== child.nativeThreadId) throw new NativeChildScopeError({ message: "Original child identity mismatch." });
++    const parent = readNativeParentId(meta);
++    if (child.parentNativeThreadId && parent && child.parentNativeThreadId !== parent) throw new NativeChildScopeError({ message: "Durable and native parent identity conflict." });
++    return [child.nativeThreadId, { ...child, parentNativeThreadId: parent ?? child.parentNativeThreadId,
++      nativeReadStatus: text(record(meta.status)?.type) }];
++  }));
++  const reachesRoot = (id: string): boolean => {
++    const visited = new Set<string>(); let current: string | null = id;
++    while (current !== rootId) {
++      if (current === null || visited.has(current)) return false;
++      visited.add(current); current = nodes.get(current)?.parentNativeThreadId ?? null;
++    }
++    return true;
++  };
++  return [...nodes.values()].map(child => ({ ...child, relationship: reachesRoot(child.nativeThreadId) ? "verified" : "unknown" }));
++}
++
++export interface NativeChildFlowDependencies {
++  readonly environmentId: string;
++  readonly projection: Pick<ProjectionSnapshotQueryShape, "getThreadDetailById">;
++  readonly directory: Pick<ProviderSessionDirectoryShape, "getBinding">;
++  readonly registry: Pick<ProviderAdapterRegistryShape, "getByInstance" | "getInstanceInfo">;
++}
++export interface NativeChildFlowInput {
++  readonly threadId: ThreadId;
++  readonly environmentId: string;
++  readonly projectId: string;
++  readonly instanceId: string;
++}
++
++const getContext = Effect.fn("nativeChildFlow.getContext")(function* (
++  deps: NativeChildFlowDependencies, input: NativeChildFlowInput, requestedChildId?: string,
++) {
++  const deny = (message: string) => Effect.fail(new NativeChildScopeError({ message: message }));
++  if (input.environmentId !== deps.environmentId) return yield* deny("Environment identity mismatch.");
++  const thread = yield* deps.projection.getThreadDetailById(input.threadId, { activityKinds: ["task.started", "task.updated", "task.progress", "task.completed", "task.failed"] });
++  if (Option.isNone(thread) || thread.value.projectId !== input.projectId) return yield* deny("Parent project/thread identity mismatch.");
++  const binding = yield* deps.directory.getBinding(input.threadId);
++  if (Option.isNone(binding) || binding.value.provider !== "codex" || binding.value.providerInstanceId !== input.instanceId) return yield* deny("Original parent provider identity mismatch.");
++  const nativeParentThreadId = text(record(binding.value.resumeCursor)?.threadId);
++  const cwd = text(record(binding.value.runtimePayload)?.cwd);
++  if (!nativeParentThreadId || !cwd) return yield* deny("Original native parent/cwd is unavailable.");
++  const children = foldNativeChildActivities(thread.value.activities).filter(child => child.nativeThreadId !== nativeParentThreadId);
++  if (requestedChildId !== undefined && !children.some(child => child.nativeThreadId === requestedChildId)) return yield* deny("Child is not in the exact parent's durable task records.");
++  const instance = ProviderInstanceId.make(input.instanceId);
++  const info = yield* deps.registry.getInstanceInfo(instance);
++  if (info.driverKind !== "codex" || !info.enabled) return yield* deny("Original Codex provider instance is unavailable.");
++  const adapter = yield* deps.registry.getByInstance(instance);
++  if (adapter.provider !== "codex" || !adapter.readNativeThread) return yield* deny("Original provider does not expose native readonly history.");
++  const metadata = new Map<string, unknown>();
++  for (const child of children) metadata.set(child.nativeThreadId, yield* adapter.readNativeThread({ threadId: child.nativeThreadId, cwd, includeTurns: false }));
++  const verified = yield* Effect.try({ try: () => verifyNativeRelationships(children, metadata, nativeParentThreadId), catch: cause => cause instanceof NativeChildScopeError ? cause : new NativeChildScopeError({ message: "Invalid native relationship." }) });
++  return { scope: { environmentId: deps.environmentId, projectId: thread.value.projectId,
++    parentThreadId: input.threadId, providerInstanceId: input.instanceId, nativeParentThreadId },
++    children: verified, readNativeThread: adapter.readNativeThread, cwd };
++});
++
++export const readNativeChildRelations = Effect.fn("readNativeChildRelations")(function* (deps: NativeChildFlowDependencies, input: NativeChildFlowInput) {
++  const context = yield* getContext(deps, input);
++  return { apiVersion: "0.1.0" as const, scope: context.scope, children: context.children };
++});
++
++export const readNativeChildConversation = Effect.fn("readNativeChildConversation")(function* (deps: NativeChildFlowDependencies, input: NativeChildFlowInput, childId: string) {
++  const context = yield* getContext(deps, input, childId);
++  const child = context.children.find(child => child.nativeThreadId === childId)!;
++  if (child.relationship !== "verified") return yield* Effect.fail(new NativeChildScopeError({ message: "Native ownership chain is not verified." }));
++  const native = yield* context.readNativeThread({ threadId: childId, cwd: context.cwd, includeTurns: true });
++  const full = record(native);
++  const parentId = yield* Effect.try({ try: () => readNativeParentId(full), catch: () => new NativeChildScopeError({ message: "Invalid original parent identity." }) });
++  if (!full || full.id !== childId || parentId !== child.parentNativeThreadId || !Array.isArray(full.turns)) return yield* Effect.fail(new NativeChildScopeError({ message: "Full native history scope changed." }));
++  const lastTurn = record(full.turns.at(-1));
++  return { apiVersion: "0.1.0" as const, scope: context.scope, child: { ...child, lastTurnStatus: text(lastTurn?.status) },
++    complete: true as const, source: "codex-native-thread-read" as const, nativeThread: native };
++});
+diff --git a/apps/server/src/orchestration/http.ts b/apps/server/src/orchestration/http.ts
+index 3a2ee7b2..519b9d6f 100644
+--- a/apps/server/src/orchestration/http.ts
++++ b/apps/server/src/orchestration/http.ts
+@@ -25,6 +25,11 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers
+ import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+ import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+ import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
++import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
++import { ProviderSessionDirectory } from "../provider/Services/ProviderSessionDirectory.ts";
++import { ProviderAdapterRegistry } from "../provider/Services/ProviderAdapterRegistry.ts";
++import { ProviderAdapterRegistryLive } from "../provider/Layers/ProviderAdapterRegistry.ts";
++import { readNativeChildRelations, readNativeChildConversation, NativeChildScopeError } from "./NativeChildFlow.ts";
+ 
+ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
+   EnvironmentHttpApi,
+@@ -35,8 +40,33 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
+     const orchestrationEngine = yield* OrchestrationEngineService;
+     const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
+     const providerRegistry = yield* ProviderRegistry;
++    const directory = yield* ProviderSessionDirectory;
++    const registry = yield* ProviderAdapterRegistry;
++    const environment = yield* ServerEnvironment;
+ 
+     return handlers
++      .handle("nativeChildRelations", Effect.fn("environment.orchestration.nativeChildRelations")(function* (args) {
++        yield* annotateEnvironmentRequest(args.endpoint.name);
++        yield* requireEnvironmentScope(AuthOrchestrationReadScope);
++        return yield* readNativeChildRelations({ environmentId: yield* environment.getEnvironmentId,
++          projection: projectionSnapshotQuery, directory, registry }, { ...args.payload, threadId: args.params.threadId }).pipe(
++          Effect.catch(Effect.fnUntraced(function* (cause) {
++            if (cause instanceof NativeChildScopeError) return yield* failEnvironmentNotFound("thread_not_found");
++            return yield* failEnvironmentInternal("orchestration_thread_snapshot_failed", cause);
++          })),
++        );
++      }))
++      .handle("nativeChildConversation", Effect.fn("environment.orchestration.nativeChildConversation")(function* (args) {
++        yield* annotateEnvironmentRequest(args.endpoint.name);
++        yield* requireEnvironmentScope(AuthOrchestrationReadScope);
++        return yield* readNativeChildConversation({ environmentId: yield* environment.getEnvironmentId,
++          projection: projectionSnapshotQuery, directory, registry }, { ...args.payload, threadId: args.params.threadId }, args.params.childId).pipe(
++          Effect.catch(Effect.fnUntraced(function* (cause) {
++            if (cause instanceof NativeChildScopeError) return yield* failEnvironmentNotFound("thread_not_found");
++            return yield* failEnvironmentInternal("orchestration_thread_snapshot_failed", cause);
++          })),
++        );
++      }))
+       .handle(
+         "providerModels",
+         Effect.fn("environment.orchestration.providerModels")(function* (args) {
+@@ -210,4 +240,4 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
+         }),
+       );
+   }),
+-).pipe(Layer.provide(OrchestrationCommandReceiptRepositoryLive));
++).pipe(Layer.provide(ProviderAdapterRegistryLive), Layer.provide(OrchestrationCommandReceiptRepositoryLive));
+diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
+index 71b4a3a5..563346f2 100644
+--- a/apps/server/src/provider/Drivers/CodexDriver.ts
++++ b/apps/server/src/provider/Drivers/CodexDriver.ts
+@@ -35,7 +35,8 @@ import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
+ import { ServerConfig } from "../../config.ts";
+ import { expandHomePath } from "../../pathExpansion.ts";
+ import { ServerSettingsService } from "../../serverSettings.ts";
+-import { ProviderDriverError } from "../Errors.ts";
++import { ProviderDriverError, ProviderAdapterRequestError } from "../Errors.ts";
++import { readCompleteNativeThread } from "../Layers/CodexNativeChildRead.ts";
+ import { makeCodexAdapter } from "../Layers/CodexAdapter.ts";
+ import * as ResetCreditCoordinator from "../Layers/resetCreditCoordinator.ts";
+ import {
+@@ -344,7 +345,21 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
+         snapshot,
+         snapshotForCwd,
+         consumeResetCredit,
+-        adapter,
++        adapter: {
++          ...adapter,
++          readNativeThread: (input) => Effect.gen(function* () {
++            const { client } = yield* withCodexAppServerClient({
++              binaryPath: effectiveConfig.binaryPath, homePath: effectiveConfig.homePath,
++              launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
++              cwd: input.cwd, environment: processEnv,
++            });
++            return yield* readCompleteNativeThread(client, input.threadId, input.includeTurns);
++          }).pipe(
++            Effect.scoped, Effect.timeout("20 seconds"),
++            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
++            Effect.mapError((cause) => new ProviderAdapterRequestError({ provider: DRIVER_KIND, method: "thread/read", detail: "Original native readonly history unavailable.", cause })),
++          ),
++        },
+         textGeneration,
+       } satisfies ProviderInstance;
+     }),
+diff --git a/apps/server/src/provider/Layers/CodexNativeChildRead.test.ts b/apps/server/src/provider/Layers/CodexNativeChildRead.test.ts
+new file mode 100644
+index 00000000..cc9ef486
+--- /dev/null
++++ b/apps/server/src/provider/Layers/CodexNativeChildRead.test.ts
+@@ -0,0 +1,40 @@
++import { describe, it, expect } from "vite-plus/test";
++import * as Effect from "effect/Effect";
++import { readCompleteNativeThread } from "./CodexNativeChildRead.ts";
++
++describe("original native readonly history", () => {
++  it("takes every paginated turn and preserves user/tool/output/status fields without resume", async () => {
++    const calls: { method: string; params: any }[] = [];
++    const turns = [{ id: "t1", status: "completed", items: [{ type: "userMessage", id: "u1", content: [{ type: "text", text: "exact original task" }] }, { type: "commandExecution", id: "c1", command: "cat task-a.md", aggregatedOutput: "public fixture" }] }, { id: "t2", status: "interrupted", error: { message: "kept original error" }, items: [{ type: "agentMessage", id: "a2", text: "exact original reply", phase: "final_answer" }] }];
++    const client = { raw: { request: (method: string, params: any) => Effect.sync(() => {
++      calls.push({ method, params });
++      if (method === "thread/read") return { thread: { id: "child", parentThreadId: "parent", historyMode: "paginated", status: { type: "notLoaded" }, turns: [] } };
++      if (method === "thread/turns/list") return params.cursor === null ? { data: [turns[0]], nextCursor: "next" } : { data: [turns[1]], nextCursor: null };
++      throw Error("Mutation invoked");
++    }) } };
++    const result: any = await Effect.runPromise(readCompleteNativeThread(client, "child", true));
++    expect(result.turns).toEqual(turns);
++    expect(result.status.type).toBe("notLoaded");
++    expect(calls.map(c => c.method)).toEqual(["thread/read", "thread/turns/list", "thread/turns/list"]);
++    expect(calls[1]?.params).toEqual({ threadId: "child", cursor: null, limit: 100, sortDirection: "asc", itemsView: "full" });
++  });
++  it("legacy native full read preserves exact items", async () => {
++    const full = { id: "child", source: "cli", turns: [{ id: "t1", status: "completed", items: [{ type: "agentMessage", id: "a", text: "all text" }] }] };
++    const client = { raw: { request: (_: string, p: any) => Effect.succeed({ thread: p.includeTurns ? full : { id: "child", turns: [] } }) } };
++    expect(await Effect.runPromise(readCompleteNativeThread(client, "child", true))).toEqual(full);
++  });
++  it("metadata reading does not fetch or load turns", async () => {
++    const calls: string[] = [];
++    const client = { raw: { request: (m: string) => Effect.sync(() => { calls.push(m); return { thread: { id: "child", turns: [] } }; }) } };
++    await Effect.runPromise(readCompleteNativeThread(client, "child", false));
++    expect(calls).toEqual(["thread/read"]);
++  });
++  it("repeated cursors fail instead of claiming a truncated history is complete", async () => {
++    const client = { raw: { request: (m: string) => Effect.succeed(m === "thread/read" ? { thread: { id: "child", historyMode: "paginated" } } : { data: [], nextCursor: "same" }) } };
++    await expect(Effect.runPromise(readCompleteNativeThread(client, "child", true))).rejects.toThrow("pagination cursor");
++  });
++  it("wrong native child identity is rejected", async () => {
++    const client = { raw: { request: () => Effect.succeed({ thread: { id: "other", turns: [] } }) } };
++    await expect(Effect.runPromise(readCompleteNativeThread(client, "child", true))).rejects.toThrow("identity mismatch");
++  });
++});
+diff --git a/apps/server/src/provider/Layers/CodexNativeChildRead.ts b/apps/server/src/provider/Layers/CodexNativeChildRead.ts
+new file mode 100644
+index 00000000..152ff257
+--- /dev/null
++++ b/apps/server/src/provider/Layers/CodexNativeChildRead.ts
+@@ -0,0 +1,40 @@
++import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
++import * as CodexErrors from "effect-codex-app-server/errors";
++
++type ReadClient = { readonly raw: { readonly request: (method: string, params: unknown) => Effect.Effect<unknown, CodexErrors.CodexAppServerError> } };
++const record = (value: unknown): Record<string, unknown> | undefined =>
++  typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
++
++/** Read the original native fields/items, including every paginated turn. Never loads/resumes a thread. */
++export const readCompleteNativeThread = Effect.fn("readCompleteNativeThread")(function* (
++  client: ReadClient, threadId: string, includeTurns: boolean,
++) {
++  const response = record(yield* client.raw.request("thread/read", { threadId, includeTurns: false }));
++  const thread = record(response?.thread);
++  const fail = (message: string) => CodexErrors.CodexAppServerRequestError.internalError(message, undefined, { method: "thread/read", operation: "decode-payload" });
++  if (!thread || thread.id !== threadId) return yield* fail("Original native thread identity mismatch.");
++  if (!includeTurns) return thread;
++  if (thread.historyMode !== "paginated") {
++    const full = record(yield* client.raw.request("thread/read", { threadId, includeTurns: true }));
++    const native = record(full?.thread);
++    if (!native || native.id !== threadId || !Array.isArray(native.turns)) return yield* fail("Invalid original native history.");
++    return yield* Schema.decodeUnknownEffect(Schema.Json)(native).pipe(Effect.mapError(() => fail("Invalid native JSON history.")));
++  }
++  const turns: unknown[] = []; const cursors = new Set<string | null>();
++  let cursor: string | null = null;
++  do {
++    if (cursors.has(cursor)) return yield* fail("Original native history repeated a pagination cursor.");
++    cursors.add(cursor);
++    const page = record(yield* client.raw.request("thread/turns/list", { threadId, cursor, limit: 100, sortDirection: "asc", itemsView: "full" }));
++    if (!page || !Array.isArray(page.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")) return yield* fail("Invalid original native history page.");
++    for (const turn of page.data) {
++      const value = record(turn);
++      if (!value || typeof value.id !== "string" || !Array.isArray(value.items)) return yield* fail("Invalid original native turn.");
++      turns.push(turn);
++    }
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++  // Preserve native turn status/error and all typed item fields; no summary conversion here.
++  return yield* Schema.decodeUnknownEffect(Schema.Json)({ ...thread, turns }).pipe(Effect.mapError(() => fail("Invalid native JSON history.")));
++});
+diff --git a/apps/server/src/provider/Services/ProviderAdapter.ts b/apps/server/src/provider/Services/ProviderAdapter.ts
+index c9b62fd7..e6273b5a 100644
+--- a/apps/server/src/provider/Services/ProviderAdapter.ts
++++ b/apps/server/src/provider/Services/ProviderAdapter.ts
+@@ -131,6 +131,9 @@ export interface ProviderAdapterShape<TError> {
+    */
+   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
+ 
++  /** Scoped callers validate durable parent/child ownership before invoking this read. */
++  readonly readNativeThread?: (input: { readonly threadId: string; readonly cwd: string; readonly includeTurns: boolean }) => Effect.Effect<unknown, TError>;
++
+   /**
+    * Roll back a provider thread by N turns.
+    */
+diff --git a/apps/server/src/server.test.ts b/apps/server/src/server.test.ts
+index 12f37780..8bd55906 100644
+--- a/apps/server/src/server.test.ts
++++ b/apps/server/src/server.test.ts
+@@ -2158,6 +2158,56 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
+     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+   );
+ 
++  it.effect("native child HTTP reads use exact durable scope with read-only auth and no resume", () =>
++    Effect.gen(function* () {
++      const childId = "11111111-1111-7111-8111-111111111111";
++      const nativeParentId = "native-parent-original";
++      const calls: Array<{ threadId: string; cwd: string; includeTurns: boolean }> = [];
++      const fullText = "original complete child reply\n" + "x".repeat(18000) + "\nORIGINAL-END";
++      const thread = { ...makeDefaultOrchestrationReadModel().threads[0]!, activities: [{
++        id: EventId.make("child-start"), kind: "task.started", tone: "info" as const, summary: "a",
++        turnId: TurnId.make("original-spawn-turn"), createdAt: "2026-10-01T07:00:00.000Z",
++        payload: { taskId: childId, timelineBypass: true, title: "a", status: "idle" },
++      }] };
++      const instance: ProviderInstance = {
++        instanceId: ProviderInstanceId.make("codex"), driverKind: ProviderDriverKind.make("codex"),
++        displayName: "Codex", enabled: true, continuationIdentity: { driverKind: ProviderDriverKind.make("codex"), continuationKey: "test-original" },
++        adapter: { provider: ProviderDriverKind.make("codex"),
++          readNativeThread: (request: { threadId: string; cwd: string; includeTurns: boolean }) => Effect.sync(() => {
++            calls.push(request); return { id: request.threadId, parentThreadId: nativeParentId, status: { type: "notLoaded" }, turns: request.includeTurns ? [{ id: "original-child-turn", status: "completed", items: [{ type: "agentMessage", id: "original-child-item", text: fullText }] }] : [] };
++          }),
++        } as unknown as ProviderInstance["adapter"],
++        get snapshot(): never { throw new Error("Readonly child read must not refresh providers"); },
++        get textGeneration(): never { throw new Error("Readonly child read must not generate text"); },
++      };
++      yield* buildAppUnderTest({ layers: {
++        projectionSnapshotQuery: { getThreadDetailById: () => Effect.succeedSome(thread) },
++        providerSessionDirectory: { getBinding: () => Effect.succeedSome({ threadId: defaultThreadId, provider: ProviderDriverKind.make("codex"), providerInstanceId: ProviderInstanceId.make("codex"), resumeCursor: { threadId: nativeParentId }, runtimePayload: { cwd: "/synthetic-fixture" } }) },
++        providerInstanceRegistry: { getInstance: () => Effect.succeed(instance) },
++      } });
++      const token = yield* exchangeAccessToken(defaultDesktopBootstrapToken, { scope: "orchestration:read" });
++      assert.equal(token.response.status, 200);
++      const headers = { authorization: `Bearer ${token.body.access_token ?? ""}` };
++      const query = `?environmentId=${testEnvironmentDescriptor.environmentId}&projectId=${defaultProjectId}&instanceId=codex`;
++      const base = `/api/orchestration/threads/${defaultThreadId}/native-children`;
++      const unauthorized = yield* fetchEffect(yield* getHttpServerUrl(base + query));
++      assert.equal(unauthorized.status, 401); assert.deepEqual(calls, []);
++      const wrong = yield* fetchEffect(yield* getHttpServerUrl(base + query.replace("instanceId=codex", "instanceId=dsh")), { headers });
++      assert.equal(wrong.status, 404); assert.deepEqual(calls, []);
++      const forged = yield* fetchEffect(yield* getHttpServerUrl(base + "/22222222-2222-7222-8222-222222222222" + query), { headers });
++      assert.equal(forged.status, 404); assert.deepEqual(calls, []);
++      const relations = yield* fetchEffect(yield* getHttpServerUrl(base + query), { headers });
++      const graph = yield* responseJsonEffect<{ children: Array<{ nativeThreadId: string; parentNativeThreadId: string; relationship: string }> }>(relations);
++      assert.equal(relations.status, 200); assert.equal(graph.children[0]?.parentNativeThreadId, nativeParentId); assert.equal(graph.children[0]?.relationship, "verified");
++      const detail = yield* fetchEffect(yield* getHttpServerUrl(base + "/" + childId + query), { headers });
++      const body = yield* responseJsonEffect<{ complete: boolean; nativeThread: { turns: Array<{ id: string; items: Array<{ id: string; text: string }> }> }; child: { sessionStatus: string; nativeReadStatus: string; lastTurnStatus: string } }>(detail);
++      assert.equal(detail.status, 200); assert.equal(body.complete, true); assert.equal(body.nativeThread.turns[0]?.items[0]?.text, fullText);
++      assert.equal(body.child.sessionStatus, "idle"); assert.equal(body.child.nativeReadStatus, "notLoaded"); assert.equal(body.child.lastTurnStatus, "completed");
++      assert.deepEqual(calls.map(call => call.includeTurns), [false, false, true]);
++      assert.isTrue(calls.every(call => call.threadId === childId && call.cwd === "/synthetic-fixture"));
++    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
++  );
++
+   it.effect("serves snapshots for MCP handoff thread IDs above the router default", () =>
+     Effect.gen(function* () {
+       const threadId = ThreadId.make(
+@@ -6603,7 +6653,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
+               streamChanges: Stream.empty,
+               applyUsageLimits: () => Effect.void,
+             },
+-            adapter: {} as ProviderInstance["adapter"],
++            adapter: {} as unknown as ProviderInstance["adapter"],
+             textGeneration: {} as ProviderInstance["textGeneration"],
+           }) satisfies ProviderInstance,
+       );
+diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
+index 80d36759..893abe8d 100644
+--- a/packages/client-runtime/package.json
++++ b/packages/client-runtime/package.json
+@@ -127,6 +127,10 @@
+       "types": "./src/state/connections.ts",
+       "default": "./src/state/connections.ts"
+     },
++    "./state/environment-http-auth": {
++      "types": "./src/state/environmentHttpAuth.ts",
++      "default": "./src/state/environmentHttpAuth.ts"
++    },
+     "./state/entities": {
+       "types": "./src/state/entities.ts",
+       "default": "./src/state/entities.ts"
+diff --git a/packages/client-runtime/src/authorization/index.ts b/packages/client-runtime/src/authorization/index.ts
+index 05acbc18..048bb915 100644
+--- a/packages/client-runtime/src/authorization/index.ts
++++ b/packages/client-runtime/src/authorization/index.ts
+@@ -1,5 +1,6 @@
+ export * from "./remote.ts";
+ export {
++  RemoteEnvironmentAuthorization,
+   type AuthorizedRemoteEnvironment,
+   type AuthorizedRemoteHttpEnvironment,
+ } from "./service.ts";
+diff --git a/packages/contracts/src/environmentHttp.ts b/packages/contracts/src/environmentHttp.ts
+index 6aef261d..8fde0668 100644
+--- a/packages/contracts/src/environmentHttp.ts
++++ b/packages/contracts/src/environmentHttp.ts
+@@ -562,7 +562,51 @@ const EnvironmentProviderModels = Schema.Struct({
+   })),
+ });
+ 
++export const NativeChildFlowScope = Schema.Struct({
++  environmentId: TrimmedNonEmptyString, projectId: ProjectId, parentThreadId: ThreadId,
++  providerInstanceId: TrimmedNonEmptyString, nativeParentThreadId: TrimmedNonEmptyString,
++});
++export const NativeChildFlowNode = Schema.Struct({
++  nativeThreadId: TrimmedNonEmptyString,
++  parentNativeThreadId: Schema.NullOr(TrimmedNonEmptyString),
++  relationship: Schema.Literals(["verified", "unknown"]),
++  spawnTurnId: Schema.NullOr(TrimmedNonEmptyString),
++  activityId: TrimmedNonEmptyString,
++  agentPath: Schema.NullOr(Schema.String), title: Schema.String,
++  model: Schema.NullOr(Schema.String), effort: Schema.NullOr(Schema.String),
++  sessionStatus: Schema.NullOr(Schema.String), nativeReadStatus: Schema.NullOr(Schema.String),
++  lastTurnStatus: Schema.NullOr(Schema.String),
++  createdAt: IsoDateTime, updatedAt: IsoDateTime,
++});
++export const NativeChildFlowRelations = Schema.Struct({
++  apiVersion: Schema.Literal("0.1.0"), scope: NativeChildFlowScope,
++  children: Schema.Array(NativeChildFlowNode),
++});
++export const NativeChildFlowConversation = Schema.Struct({
++  apiVersion: Schema.Literal("0.1.0"), scope: NativeChildFlowScope, child: NativeChildFlowNode,
++  complete: Schema.Literal(true), source: Schema.Literal("codex-native-thread-read"),
++  // Exact native metadata, every turn and item. Display adaptation belongs to the native UI.
++  nativeThread: Schema.Unknown,
++});
++export type NativeChildFlowScope = typeof NativeChildFlowScope.Type;
++export type NativeChildFlowNode = typeof NativeChildFlowNode.Type;
++export type NativeChildFlowRelations = typeof NativeChildFlowRelations.Type;
++export type NativeChildFlowConversation = typeof NativeChildFlowConversation.Type;
++const NativeChildFlowQuery = {
++  environmentId: TrimmedNonEmptyString, projectId: ProjectId, instanceId: TrimmedNonEmptyString,
++};
++
+ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
++  .add(HttpApiEndpoint.get("nativeChildRelations", "/api/orchestration/threads/:threadId/native-children", {
++    headers: OptionalBearerHeaders, params: EnvironmentOrchestrationThreadSnapshotParams,
++    payload: NativeChildFlowQuery, success: NativeChildFlowRelations,
++    error: EnvironmentOrchestrationThreadSnapshotErrors,
++  }).middleware(EnvironmentAuthenticatedAuth))
++  .add(HttpApiEndpoint.get("nativeChildConversation", "/api/orchestration/threads/:threadId/native-children/:childId", {
++    headers: OptionalBearerHeaders, params: Schema.Struct({ threadId: ThreadId, childId: TrimmedNonEmptyString }),
++    payload: NativeChildFlowQuery, success: NativeChildFlowConversation,
++    error: EnvironmentOrchestrationThreadSnapshotErrors,
++  }).middleware(EnvironmentAuthenticatedAuth))
+   .add(
+     HttpApiEndpoint.get("providerModels", "/api/orchestration/provider-models", {
+       headers: OptionalBearerHeaders,

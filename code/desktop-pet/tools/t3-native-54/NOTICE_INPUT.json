@@ -1,0 +1,35 @@
+{
+  "source": "upstream-generated-third-party-licenses/spdx/v3.28.0",
+  "spdx_version": "v3.28.0",
+  "copied_public_license_text_only": true,
+  "files": [
+    {
+      "name": "Unlicense.json",
+      "sha256": "ad418e8c43e6141365568ca0f62964b487d053d89086c8b984772d626c7d5235"
+    },
+    {
+      "name": "BSD-3-Clause.json",
+      "sha256": "56ec0a8a032d6c784eadd02ea2f3386a0d50ad803515020656947e29fb67c964"
+    },
+    {
+      "name": "ISC.json",
+      "sha256": "8152d71c7a0133c1a7c0e709dbb5f6858c3a8a9a7a083b19f2d3e5280884b777"
+    },
+    {
+      "name": "CC0-1.0.json",
+      "sha256": "884a16279879e78d5720da2aa1f7a53eea8a4bf3edb1d5af8f741a1eaa0d389a"
+    },
+    {
+      "name": "Apache-2.0.json",
+      "sha256": "18bd989e711d5c4ec8bcfb3742bfc25f1971881d9524a7c6cf734b1d597ca3de"
+    },
+    {
+      "name": "BSD-2-Clause.json",
+      "sha256": "4409698a552f881e36f9ee693cb1e8cec3cc2ff6ac1471b6c075d085bb6e41a0"
+    },
+    {
+      "name": "MIT.json",
+      "sha256": "6d2a171ec8668904bc30008d372fcd837859b7406c9984771728e016f08b2502"
+    }
+  ]
+}

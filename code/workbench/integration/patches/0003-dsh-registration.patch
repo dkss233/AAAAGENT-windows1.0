@@ -1,0 +1,193 @@
+diff --git a/apps/server/src/provider/Layers/DshGatewayResolver.test.ts b/apps/server/src/provider/Layers/DshGatewayResolver.test.ts
+new file mode 100644
+index 00000000..6496115d
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshGatewayResolver.test.ts
+@@ -0,0 +1,30 @@
++// @effect-diagnostics nodeBuiltinImport:off -- Temporary fixture files exercise native ownership checks.
++import * as Assert from "node:assert/strict";
++import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { it } from "@effect/vitest";
++
++import { resolveDshGatewayUrl } from "./DshGatewayResolver.ts";
++import { DshTransportError } from "./DshHostProtocol.ts";
++
++it("reads only a private, owned launcher file without returning the token in errors", async () => {
++  const dir = await mkdtemp(join(tmpdir(), "t3-dsh-resolver-"));
++  try {
++    const log = join(dir, "web.log");
++    const token = "fixture-secret";
++    const url = `http://127.0.0.1:12345/?token=${token}`;
++    await writeFile(log, `dsh web: ${url}\n`, { mode: 0o600 });
++    Assert.equal(await resolveDshGatewayUrl(log), url);
++    await Assert.rejects(resolveDshGatewayUrl("relative/web.log"), (error: unknown) =>
++      error instanceof DshTransportError && error.code === "unavailable" && !error.message.includes(token));
++    const link = join(dir, "link.log");
++    await symlink(log, link);
++    await Assert.rejects(resolveDshGatewayUrl(link), (error: unknown) =>
++      error instanceof DshTransportError && error.code === "unavailable" && !error.message.includes(token));
++    const publicLog = join(dir, "public.log");
++    await writeFile(publicLog, `dsh web: ${url}\n`, { mode: 0o644 });
++    await Assert.rejects(resolveDshGatewayUrl(publicLog), (error: unknown) =>
++      error instanceof DshTransportError && error.code === "unavailable" && !error.message.includes(token));
++  } finally { await rm(dir, { recursive: true, force: true }); }
++});
+diff --git a/apps/server/src/provider/Layers/DshGatewayResolver.ts b/apps/server/src/provider/Layers/DshGatewayResolver.ts
+new file mode 100644
+index 00000000..45ce157e
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshGatewayResolver.ts
+@@ -0,0 +1,31 @@
++// @effect-diagnostics nodeBuiltinImport:off -- A bounded native read of the private Host launch log.
++import { constants } from "node:fs";
++import { open } from "node:fs/promises";
++import { isAbsolute } from "node:path";
++
++import { DshTransportError } from "./DshHostProtocol.ts";
++
++/** Keep the existing Host launch URL inside the server process. */
++export async function resolveDshGatewayUrl(logPath: string | undefined): Promise<string> {
++  if (!logPath || !isAbsolute(logPath) || logPath.includes("\0") || process.getuid?.() === undefined) {
++    throw new DshTransportError("unavailable");
++  }
++  try {
++    const handle = await open(logPath, constants.O_RDONLY | constants.O_NOFOLLOW);
++    try {
++      const info = await handle.stat();
++      if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o077) !== 0) {
++        throw new DshTransportError("unavailable");
++      }
++      const bytes = Buffer.alloc(8192);
++      const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
++      const match = bytes.subarray(0, bytesRead).toString("utf8")
++        .match(/dsh web:\s+(http:\/\/127\.0\.0\.1:\d+\/\?token=[^\s]+)/);
++      if (!match?.[1]) throw new DshTransportError("unavailable");
++      return match[1];
++    } finally { await handle.close(); }
++  } catch {
++    // Native filesystem errors may include the private path; never return it.
++    throw new DshTransportError("unavailable");
++  }
++}
+diff --git a/apps/server/src/provider/builtInDrivers.ts b/apps/server/src/provider/builtInDrivers.ts
+index 60e3402e..98fcff27 100644
+--- a/apps/server/src/provider/builtInDrivers.ts
++++ b/apps/server/src/provider/builtInDrivers.ts
+@@ -26,6 +26,7 @@ import { CursorDriver, type CursorDriverEnv } from "./Drivers/CursorDriver.ts";
+ import { GrokDriver, type GrokDriverEnv } from "./Drivers/GrokDriver.ts";
+ import { OpenCodeDriver, type OpenCodeDriverEnv } from "./Drivers/OpenCodeDriver.ts";
+ import { AntigravityDriver, type AntigravityDriverEnv } from "./Drivers/AntigravityDriver.ts";
++import { DshDriver, type DshDriverEnv } from "./Drivers/DshDriver.ts";
+ import type { AnyProviderDriver } from "./ProviderDriver.ts";
+ 
+ /**
+@@ -39,7 +40,8 @@ export type BuiltInDriversEnv =
+   | CursorDriverEnv
+   | GrokDriverEnv
+   | OpenCodeDriverEnv
+-  | AntigravityDriverEnv;
++  | AntigravityDriverEnv
++  | DshDriverEnv;
+ 
+ /**
+  * Ordered list of built-in drivers. Order matters only for tie-breaking in
+@@ -53,4 +55,5 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
+   GrokDriver,
+   OpenCodeDriver,
+   AntigravityDriver,
++  DshDriver,
+ ];
+diff --git a/apps/server/src/provider/model-manifest.json b/apps/server/src/provider/model-manifest.json
+index b7531c21..06e898a3 100644
+--- a/apps/server/src/provider/model-manifest.json
++++ b/apps/server/src/provider/model-manifest.json
+@@ -54,6 +54,11 @@
+       "t3CodeRange": ">=0.0.42",
+       "recommendedRange": "=1.1.1",
+       "ranges": [{ "range": "=1.1.1", "status": "supported" }]
++    },
++    {
++      "driver": "dsh",
++      "t3CodeRange": ">=0.0.42",
++      "ranges": [{ "range": ">=0.0.0", "status": "unknown" }]
+     }
+   ],
+   "currentModels": {
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 4f264ae1..5f329d79 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -69,6 +69,9 @@ import * as GitLabCli from "./sourceControl/GitLabCli.ts";
+ import * as ForgejoCli from "./sourceControl/ForgejoCli.ts";
+ import * as TextGeneration from "./textGeneration/TextGeneration.ts";
+ import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
++import { DshHostService } from "./provider/Layers/DshAdapter.ts";
++import { HttpDshSessionRpc, makeDshHostProtocol } from "./provider/Layers/DshHostProtocol.ts";
++import { resolveDshGatewayUrl } from "./provider/Layers/DshGatewayResolver.ts";
+ import * as TerminalManager from "./terminal/Manager.ts";
+ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+ import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+@@ -448,6 +451,18 @@ const ServerEnvironmentLayerLive = ServerEnvironment.layer.pipe(
+   Layer.provide(ServerSecretStore.layer),
+ );
+ 
++const DshHostLayerLive = Layer.effect(
++  DshHostService,
++  Effect.gen(function* () {
++    const environment = yield* ServerEnvironment.ServerEnvironment;
++    const environmentId = yield* environment.getEnvironmentId;
++    return { environmentId,
++      port: makeDshHostProtocol(new HttpDshSessionRpc(() =>
++        resolveDshGatewayUrl(process.env.AAAAGENT_DSH_WEB_LOG))),
++    };
++  }),
++);
++
+ const AuthLayerLive = EnvironmentAuth.layer.pipe(
+   Layer.provideMerge(PersistenceLayerLive),
+   Layer.provide(ServerEnvironmentLayerLive),
+@@ -526,6 +541,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
+   // with explicit `providerInstances` entries on boot.
+   Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+ ).pipe(
++  Layer.provideMerge(DshHostLayerLive),
+   Layer.provideMerge(AntigravityInstallation.layer),
+   // Shared native/canonical NDJSON writers used by both the per-instance
+   // drivers (native stream, written from inside each `<X>Adapter`) and
+diff --git a/apps/server/src/provider/Drivers/DshDriver.ts b/apps/server/src/provider/Drivers/DshDriver.ts
+--- a/apps/server/src/provider/Drivers/DshDriver.ts
++++ b/apps/server/src/provider/Drivers/DshDriver.ts
+@@ -1,6 +1,7 @@
+ import { ProviderDriverKind, TextGenerationError, type ServerProvider } from "@t3tools/contracts";
+ import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
++import * as Option from "effect/Option";
+ import * as Schema from "effect/Schema";
+ import * as Stream from "effect/Stream";
+ 
+@@ -18,7 +19,7 @@
+ type DshSettings = typeof DshSettings.Type;
+ const maintenance = makeManualOnlyProviderMaintenanceCapabilities({ provider: DRIVER, packageName: null });
+ 
+-export type DshDriverEnv = DshHostService;
++export type DshDriverEnv = never;
+ 
+ /** No automatic model or login assumptions; model choice stays closed pending a session-only native path. */
+ export const DshDriver: ProviderDriver<DshSettings, DshDriverEnv> = {
+@@ -28,7 +29,13 @@
+   defaultConfig: () => ({}),
+   create: ({ instanceId, displayName, accentColor, enabled, config }) =>
+     Effect.gen(function* () {
+-      const host = yield* DshHostService;
++      const hostOption = yield* Effect.serviceOption(DshHostService);
++      if (Option.isNone(hostOption)) {
++        return yield* new ProviderDriverError({
++          driver: DRIVER, instanceId, detail: "DSH Host service is unavailable",
++        });
++      }
++      const host = hostOption.value;
+       if (!host.environmentId.trim() || enabled && !config.agentPreset?.trim()) {
+         return yield* new ProviderDriverError({
+           driver: DRIVER, instanceId, detail: "A stable environment ID and explicit DSH agent preset are required",

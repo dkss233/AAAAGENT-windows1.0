@@ -1,0 +1,7 @@
+{
+  "version": "0.160.0",
+  "target": "x86_64-pc-windows-msvc",
+  "url": "https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-package-x86_64-pc-windows-msvc.tar.gz",
+  "archiveSha256": "7f7fbbc8d6fd4ea2f3b13855ef47ea59663ba7e61fb2e9821df37163b8030891",
+  "entrypoint": "bin/codex.exe"
+}

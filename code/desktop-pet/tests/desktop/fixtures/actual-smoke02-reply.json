@@ -1,0 +1,22 @@
+{
+  "source": "artifacts/W0-I/model-evaluation/trial/local-trial-smoke-20260909-02/backend-events.json",
+  "source_sha256": "e0e9c185e7fa8e96716f988f6dde83feafd5329496418619a711ca1cc4a158b3",
+  "event": {
+    "type": "reply",
+    "reply": {
+      "scope": {
+        "characterId": "friend",
+        "sessionId": "f508f076-18cb-4c5d-8379-86693d89ec85",
+        "turnId": "bca975c1-addd-4331-ab2f-016da42dfaad",
+        "generation": 2
+      },
+      "text": "哇，每周五雷打不动练吉他，这习惯太酷了！是自己摸索的，还是有跟老师学呀？",
+      "expression": {
+        "emotion": "欣赏",
+        "intensity": 0.7,
+        "delivery": "语调轻快带笑意，略带一点小崇拜",
+        "gesture": null
+      }
+    }
+  }
+}

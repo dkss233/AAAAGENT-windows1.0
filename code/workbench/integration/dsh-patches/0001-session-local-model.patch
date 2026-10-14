@@ -1,0 +1,110 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -718,6 +718,7 @@
+ 	* @returns the normalized selection installed for the Session, without waiting for default persistence.
+ 	*/
+ 	async selectModel(request) {
++		if (request.scope !== void 0 && request.scope !== "session") throw new RemoteError("gateway/bad-request", "invalid model selection scope", {});
+ 		const agent = await this.resolveAgent(request.sessionId);
+ 		return this.agents.serializeImageAdmission(agent, async () => {
+ 			try {
+@@ -733,10 +734,10 @@
+ 					...resolved.reasoningEffort === void 0 ? {} : { reasoningEffort: resolved.reasoningEffort }
+ 				};
+ 				this.agents.selectForNextRequest(agent, selected);
+-				this.ctx.agentDefaultModel.saveSelection(selected).catch((error) => {
++				if (request.scope !== "session") this.ctx.agentDefaultModel.saveSelection(selected).catch((error) => {
+ 					this.ctx.logger.warn(`session-controller: model selection changed for the Session but the default was not saved: ${String(error)}`);
+ 				});
+-				return { selected: { ...selected } };
++				return { selected: { ...selected }, ...(request.scope === "session" ? { scope: "session" } : {}) };
+ 			} catch (error) {
+ 				if (remoteErrorOf(error) !== void 0) throw error;
+ 				throw new RemoteError("session/model-unavailable", error instanceof Error ? error.message : String(error), {
+@@ -2999,8 +3000,8 @@
+ 		* Describe every currently routable model for Host-generation selectors.
+ 		* @returns provider-grouped models, the deployment default, and isolated provider failures.
+ 		*/
+-		modelCatalog() {
+-			return buildModelCatalog(this.ctx);
++		async modelCatalog() {
++			return { ...await buildModelCatalog(this.ctx), sessionModelSelectionVersion: 1 };
+ 		}
+ 		/**
+ 		* Report whether this deployment can hand a Session workspace path to a native desktop.
+--- a/lib/typert.host.js
++++ b/lib/typert.host.js
+@@ -577,6 +577,7 @@
+ }))
+ let _deepseek_ai_dsh_api_session_controller_session_modelCatalog_result$schema$value
+ const _deepseek_ai_dsh_api_session_controller_session_modelCatalog_result$schema = () => (_deepseek_ai_dsh_api_session_controller_session_modelCatalog_result$schema$value ??= z.object({
++  'sessionModelSelectionVersion': z.literal(1).readonly().optional(),
+   'default': z.object({
+   'provider': z.string().readonly(),
+   'model': z.string().readonly(),
+@@ -827,6 +828,7 @@
+ }))
+ let _deepseek_ai_dsh_api_session_controller_session_selectModel_parameter_0$schema$value
+ const _deepseek_ai_dsh_api_session_controller_session_selectModel_parameter_0$schema = () => (_deepseek_ai_dsh_api_session_controller_session_selectModel_parameter_0$schema$value ??= z.object({
++  'scope': z.literal("session").readonly().optional(),
+   'sessionId': z.intersection(z.string(), z.unknown()).readonly(),
+   'provider': z.string().readonly(),
+   'model': z.string().readonly(),
+@@ -834,6 +836,7 @@
+ }))
+ let _deepseek_ai_dsh_api_session_controller_session_selectModel_result$schema$value
+ const _deepseek_ai_dsh_api_session_controller_session_selectModel_result$schema = () => (_deepseek_ai_dsh_api_session_controller_session_selectModel_result$schema$value ??= z.object({
++  'scope': z.literal("session").readonly().optional(),
+   'selected': z.object({
+   'provider': z.string().readonly(),
+   'model': z.string().readonly(),
+--- a/lib/typert.remote-client.js
++++ b/lib/typert.remote-client.js
+@@ -577,6 +577,7 @@
+ }))
+ let _deepseek_ai_dsh_api_session_controller_session_modelCatalog_result$schema$value
+ const _deepseek_ai_dsh_api_session_controller_session_modelCatalog_result$schema = () => (_deepseek_ai_dsh_api_session_controller_session_modelCatalog_result$schema$value ??= z.object({
++  'sessionModelSelectionVersion': z.literal(1).readonly().optional(),
+   'default': z.object({
+   'provider': z.string().readonly(),
+   'model': z.string().readonly(),
+@@ -827,6 +828,7 @@
+ }))
+ let _deepseek_ai_dsh_api_session_controller_session_selectModel_parameter_0$schema$value
+ const _deepseek_ai_dsh_api_session_controller_session_selectModel_parameter_0$schema = () => (_deepseek_ai_dsh_api_session_controller_session_selectModel_parameter_0$schema$value ??= z.object({
++  'scope': z.literal("session").readonly().optional(),
+   'sessionId': z.intersection(z.string(), z.unknown()).readonly(),
+   'provider': z.string().readonly(),
+   'model': z.string().readonly(),
+@@ -834,6 +836,7 @@
+ }))
+ let _deepseek_ai_dsh_api_session_controller_session_selectModel_result$schema$value
+ const _deepseek_ai_dsh_api_session_controller_session_selectModel_result$schema = () => (_deepseek_ai_dsh_api_session_controller_session_selectModel_result$schema$value ??= z.object({
++  'scope': z.literal("session").readonly().optional(),
+   'selected': z.object({
+   'provider': z.string().readonly(),
+   'model': z.string().readonly(),
+--- a/lib/types/types.d.ts
++++ b/lib/types/types.d.ts
+@@ -139,6 +139,8 @@
+ }
+ /** Host-generation model catalog and the default used by unconfigured Sessions. */
+ export interface ModelCatalog {
++    /** AAAAGENT native extension: selectModel scope session preserves the global default. */
++    readonly sessionModelSelectionVersion?: 1;
+     readonly default: ModelSelection;
+     /** Provider routes with at least one currently available catalog model. */
+     readonly routableProviders: readonly string[];
+@@ -289,10 +291,12 @@
+ }
+ /** Session model-selection request. */
+ export interface SessionSelectModelRequest extends ModelSelection {
++    readonly scope?: 'session';
+     readonly sessionId: SessionId;
+ }
+ /** Accepted model selection after Host resolution. */
+ export interface SessionSelectModelValue {
++    readonly scope?: 'session';
+     readonly selected: ModelSelection;
+ }
+ /** Session rename request. */

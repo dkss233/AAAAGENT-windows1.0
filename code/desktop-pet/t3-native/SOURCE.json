@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "package": "B54-NATIVE-CHILD-FLOW",
+  "mode": "exact-pinned-source-overlays",
+  "upstream_commit": "c13f7d93fff0f578886985a3f673b4b21b7f6ac8",
+  "readonly_source_root": "upstream-pinned-source; supply --source when rebuilding overlays",
+  "patch_sha256": "e4d5ba93069801a3c9ff67e35811dea13892770606c64b2f3c0fdf675957103e",
+  "applied_diff_sha256": "19d6d4e40963e5a6531b393eda7230f43f41067b0fcb34de425fc0d31dc9927a",
+  "runtime": {
+    "node": "24.13.1",
+    "pnpm": "11.10.0",
+    "web_package": "@t3tools/web",
+    "web_version": "0.0.42"
+  },
+  "upstream_package_hashes": {
+    "package.json": "aedc7229c76a4b9ba6afb0ab54994579ec7ee7e500fe94ceda8f853fa829671c",
+    "pnpm-lock.yaml": "7db1be7cfb291cf1e5c22c1645db261872d2512559ec60e5d1e196a5c1cb425d",
+    "pnpm-workspace.yaml": "1cfe943948494f3752380e82a1a05aa4d58a1d746329e3c080112a9b58c4a83d",
+    "apps/web/package.json": "e5aad07780550ae351ac33c55e0e6a284af7fc240c730f0c1506fcac294a0bd6",
+    "apps/web/vite.config.ts": "c4fced55d5ff434ace3ccc89d213c36499d6a9d20e681cab7135cda4732002b1"
+  },
+  "baseline_files": {
+    "LICENSE": "935d8f2af0c703f9c39517ee57cc4930b19d02d533be930b63f0e82f93614b43",
+    "apps/web/src/routes/_chat.tsx": "e6fef20bdda4609341080b755ce9dee61bee0f26aede30f64ed0d8060513302c",
+    "apps/web/src/routes/_chat.index.tsx": "6fe618fc8a109c4ba40f5407fb5a6da4ae1c61ee017a2e17059e27845846696f",
+    "apps/web/src/components/ThreadRouteView.tsx": "9c4ee7155af246cc8e603799a1e2be67dc755910bf0dac96b074e873935ee693",
+    "apps/web/src/components/ChatView.tsx": "1dc85a871e95a9ae3cc45a9f967039fb8e58ba90c4c9f0b705852377119a598e",
+    "apps/web/src/index.css": "247c0655aa48dfb84b951c1f57691e859dbb5ebab902ed915657c8f4ea8c3577",
+    "apps/web/src/hooks/useTheme.ts": "b7c69d9cc2bfb0f5d8de7ac42443a2ef0e5b9db5f7b428ddf5debbb8a114364e",
+    "apps/web/src/themePalette.ts": "7d4babcc2e6e740948ae7568489f4a42fb4352b0c92d787108bd280df157c426",
+    "apps/web/src/main.tsx": "1d6f289a70f552f13ec6d34bc1c6c45e5e3ea5b818f4eba43484c5cdab055fd9",
+    "apps/web/src/routes/__root.tsx": "f595bfa0d32a176eb20fdc5de11bb3a03b1772265e9ea4e4b6ae8872cd50f115"
+  },
+  "assembly": "Copy fixed public source closure to isolated artifacts/runtime, apply code overlays; never modify installed source or copy auth/state/env. Cached dependencies may be linked read-only. I owns assembly and entry; W1 owns registered UI paths."
+}

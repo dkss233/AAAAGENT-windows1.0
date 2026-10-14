@@ -1,0 +1,1617 @@
+diff --git a/apps/server/src/orchestration/NativeRealtimeQueue.ts b/apps/server/src/orchestration/NativeRealtimeQueue.ts
+new file mode 100644
+index 00000000..8d4235e0
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeRealtimeQueue.ts
+@@ -0,0 +1,25 @@
++/** A dirty identity is retained while its read is in flight. There is no timer or idle read. */
++export class NativeRealtimeQueue<Key> {
++  private readonly dirty = new Set<Key>();
++  private wake: (() => void) | undefined;
++  private closed = false;
++  mark(key: Key): void {
++    if (this.closed) return;
++    this.dirty.add(key);
++    this.wake?.();
++  }
++  async take(signal?: AbortSignal): Promise<Key | undefined> {
++    while (!this.closed && !signal?.aborted) {
++      const key = this.dirty.values().next();
++      if (!key.done) { this.dirty.delete(key.value); return key.value; }
++      await new Promise<void>((resolve) => {
++        const finish = () => { signal?.removeEventListener("abort", finish); if (this.wake === finish) this.wake = undefined; resolve(); };
++        this.wake = finish;
++        signal?.addEventListener("abort", finish, { once: true });
++        if (this.closed || signal?.aborted || this.dirty.size) finish();
++      });
++    }
++    return undefined;
++  }
++  close(): void { this.closed = true; this.dirty.clear(); this.wake?.(); }
++}
+diff --git a/apps/server/src/orchestration/NativeSessionHistory.test.ts b/apps/server/src/orchestration/NativeSessionHistory.test.ts
+index a82f8116..c6ee1bdc 100644
+--- a/apps/server/src/orchestration/NativeSessionHistory.test.ts
++++ b/apps/server/src/orchestration/NativeSessionHistory.test.ts
+@@ -37,8 +37,13 @@ describe("native message identity and original records", () => {
+     const existing = [...first.filter(m => !plan.messages.some(u => u.id === m.id)), ...plan.messages];
+     expect(planNativeHistory(history, "dsh", saved, existing, plan.aliases).messages).toEqual([]);
+   });
+-  it("does not overwrite the original input if original native source disagrees", () => {
+-    expect(() => planNativeHistory(history, "dsh", saved, [{ ...first[0]!, text: "different" }, first[1]!])).toThrow(/content conflicts/);
++  it("preserves the exact original input when the native transport includes different provider context", () => {
++    const input = { ...first[0]!, text: "original input with attachment" };
++    const plan = planNativeHistory(history, "dsh", saved, [input, first[1]!]);
++    expect(plan.turns[0]?.userMessageId).toBe(input.id);
++    expect(plan.messages.some(message => message.id === input.id)).toBe(false);
++    expect(input.text).toBe("original input with attachment");
++    expect(input.turnId).toBeNull();
+   });
+   it("rejects a mapped message owned by another turn", () => {
+     expect(() => planNativeHistory(history, "dsh", saved, [first[0]!, { ...first[1]!, turnId: TurnId.make("other") }])).toThrow(/identity conflict/);
+@@ -98,7 +103,7 @@ describe("incremental DSH original history", () => {
+   events[650] = { ...events[650]!, type: "assistant/message", data: { turn: 1, message: { id: "a", role: "assistant", content: [{ type: "text", text: "answer" }] } } };
+   events[699] = { ...events[699]!, type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } };
+   const makeRpc = (all = events): DshSessionRpc => ({ call: async (method, raw) => {
+-    if (method === "session/list") return { items: [{ sessionId: "sid", cwd: "/fixture", running: false, projections: { asOfSeq: all.at(-1)!.seq, values: { agentPreset: "preset" } } }] };
++    if (method === "session/list") return { items: [{ sessionId: "sid", cwd: "/fixture", running: false, projections: { asOfSeq: all.at(-1)!.seq, values: { agentPreset: "preset", userQuestions: { active: [], settled: [] } } } }] };
+     if (method !== "session/page") throw Error("write is forbidden");
+     const q = (raw as any).request, end = Math.min(q.throughSeq, (q.beforeSeq ?? q.throughSeq + 1) - 1);
+     return { records: all.filter(e => e.seq <= end && e.seq > end - 16).map(event => ({ type: "event", event })), hasMore: end >= 16 };
+@@ -115,7 +120,7 @@ describe("incremental DSH original history", () => {
+   });
+   it("rejects scope change and native sequence rollback", async () => {
+     await expect(readDshHistoryChunk(makeRpc(), "sid", "/other", "preset")).rejects.toThrow(/scope/);
+-    await expect(readDshHistoryChunk(makeRpc(), "sid", "/fixture", "preset", { afterSeq: 999 })).rejects.toThrow(/scope/);
++    await expect(readDshHistoryChunk(makeRpc(), "sid", "/fixture", "preset", { version: 2, afterSeq: 999 })).rejects.toThrow(/scope/);
+   });
+   it("rejects a missing event instead of clearing the prior checkpoint", async () => {
+     await expect(readDshHistoryChunk(makeRpc(events.filter(e => e.seq !== 10)), "sid", "/fixture", "preset")).rejects.toThrow(/sequence/);
+diff --git a/apps/server/src/orchestration/NativeSessionHistory.ts b/apps/server/src/orchestration/NativeSessionHistory.ts
+index 75f870c2..c852bb5d 100644
+--- a/apps/server/src/orchestration/NativeSessionHistory.ts
++++ b/apps/server/src/orchestration/NativeSessionHistory.ts
+@@ -15,7 +15,7 @@ export function nativeBindingToken(binding: { provider: string; providerInstance
+   const cursor = object(binding.resumeCursor), runtime = object(binding.runtimePayload);
+   const nativeId = binding.provider === "codex" ? cursor?.threadId : cursor?.sessionId;
+   if (typeof nativeId !== "string" || typeof runtime?.cwd !== "string") throw Error("Original native binding unavailable");
+-  return JSON.stringify({ provider: binding.provider, instanceId: binding.providerInstanceId, nativeId, cwd: runtime.cwd });
++  return JSON.stringify({ provider: binding.provider, instanceId: binding.providerInstanceId, nativeId, cwd: runtime.cwd, ...(binding.provider === "dsh" && runtime.nativeImport?.kind === "dsh" ? { nativePreset: runtime.nativeImport.preset } : {}) });
+ }
+ 
+ const isoSeconds = (v: unknown, fallback?: string) => {
+diff --git a/apps/server/src/orchestration/NativeSessionSync.test.ts b/apps/server/src/orchestration/NativeSessionSync.test.ts
+new file mode 100644
+index 00000000..8881a4f3
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeSessionSync.test.ts
+@@ -0,0 +1,130 @@
++// @effect-diagnostics nodeBuiltinImport:off -- Isolated SQLite integration evidence.
++import { describe, expect, it } from "vite-plus/test";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { CommandId, ProjectId, ProviderInstanceId, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Fiber from "effect/Fiber";
++import * as Layer from "effect/Layer";
++import * as ManagedRuntime from "effect/ManagedRuntime";
++import * as Option from "effect/Option";
++import * as Stream from "effect/Stream";
++import * as SqlClient from "effect/unstable/sql/SqlClient";
++import { ServerConfig } from "../config.ts";
++import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
++import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
++import { ProjectionTurnRepositoryLive } from "../persistence/Layers/ProjectionTurns.ts";
++import { ProjectionThreadMessageRepositoryLive } from "../persistence/Layers/ProjectionThreadMessages.ts";
++import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
++import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
++import { ProviderSessionDirectoryLive } from "../provider/Layers/ProviderSessionDirectory.ts";
++import { ProviderAdapterRegistry } from "../provider/Services/ProviderAdapterRegistry.ts";
++import type { ProviderAdapterShape } from "../provider/Services/ProviderAdapter.ts";
++import { ProviderAdapterValidationError, type ProviderAdapterError } from "../provider/Errors.ts";
++import { makeTestProviderAdapterHarness } from "../../integration/TestProviderAdapter.integration.ts";
++import { makeAdapterRegistryMock } from "../provider/testUtils/providerAdapterRegistryMock.ts";
++import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
++import { OrchestrationEngineLive } from "./Layers/OrchestrationEngine.ts";
++import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline.ts";
++import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
++import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
++import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
++import * as ThreadBackgroundLiveness from "./ThreadBackgroundLiveness.ts";
++import * as ThreadPlanProgress from "./ThreadPlanProgress.ts";
++import { makeNativeSessionSync, requestNativeSessionSync } from "./NativeSessionSync.ts";
++import { object, type NativeHistory } from "./NativeSessionHistory.ts";
++
++const pause = (ms: number) => Effect.runPromise(Effect.sleep(`${ms} millis`));
++async function until(read: () => Promise<boolean>) {
++  for (let attempt = 0; attempt < 150; attempt++) { if (await read()) return; await pause(10); }
++  throw Error("Native history projection did not receive its source notification");
++}
++
++describe.each(["codex", "dsh"] as const)("%s notification to durable T3 projection", provider => {
++  it("stays idle, publishes exact-SID updates, deduplicates, and retains history/checkpoint across read failure", async () => {
++    const threadId = ThreadId.make("realtime-imported-thread"), projectId = ProjectId.make("realtime-project");
++    const nativeId = "11111111-1111-4111-8111-111111111111", cwd = "/tmp/realtime-original";
++    let notify: (() => void) | undefined, reads = 0, watchCloses = 0, generation = 1, unavailable = false, enabled = true;
++    const requests: Array<{ threadId: string; cwd: string; checkpoint?: unknown; nativePreset?: string }> = [];
++    const fixture = await Effect.runPromise(makeTestProviderAdapterHarness({ provider: ProviderDriverKind.make(provider) }));
++    const adapter: ProviderAdapterShape<ProviderAdapterError> = {
++      ...fixture.adapter, watchNativeThread: (input, callback) => Effect.sync(() => {
++        expect(input).toEqual({ threadId: nativeId, cwd }); notify = callback; return () => { watchCloses++; notify = undefined; };
++      }),
++      readNativeThread: input => Effect.suspend<unknown, ProviderAdapterError, never>(() => {
++        reads++; requests.push(input); if (unavailable) return Effect.fail(new ProviderAdapterValidationError({ provider, operation: "controlled-read", issue: "source disconnected" }));
++        if (provider === "dsh") return Effect.succeed<NativeHistory>({ nativeId, cwd, observation: "ready", complete: true, checkpoint: { afterSeq: generation * 2 },
++          turns: Array.from({ length: generation }, (_, index) => ({ id: `original-turn-${index}`, state: "completed", startedAt: "2026-10-05T00:00:02.000Z", completedAt: "2026-10-05T00:00:03.000Z",
++            messages: [{ role: "user", id: `original-user-${index}`, text: `original input ${index}`, createdAt: "2026-10-05T00:00:02.000Z" },
++              { role: "assistant", id: `original-answer-${index}`, text: `original answer ${index}`, createdAt: "2026-10-05T00:00:03.000Z" }] })) });
++        return Effect.succeed({ id: nativeId, cwd, createdAt: 1, updatedAt: 3,
++          turns: Array.from({ length: generation }, (_, index) => ({ id: `original-turn-${index}`, status: "completed", startedAt: 2, completedAt: 3,
++            items: [{ type: "userMessage", id: `original-user-${index}`, content: [{ type: "text", text: `original input ${index}` }] },
++              { type: "agentMessage", id: `original-answer-${index}`, text: `original answer ${index}` }] })) });
++      }),
++    };
++    const registry = makeAdapterRegistryMock({ [ProviderDriverKind.make(provider)]: adapter });
++    const adapterRegistry = { ...registry, getInstanceInfo: (instanceId: ProviderInstanceId) => registry.getInstanceInfo(instanceId).pipe(Effect.map(info => ({ ...info, enabled }))) };
++    const baseLayer = Layer.mergeAll(
++      OrchestrationEngineLive.pipe(Layer.provide(OrchestrationProjectionSnapshotQueryLive), Layer.provide(OrchestrationProjectionPipelineLive)),
++      OrchestrationProjectionSnapshotQueryLive, ProjectionTurnRepositoryLive, ProjectionThreadMessageRepositoryLive,
++      ProviderSessionDirectoryLive.pipe(Layer.provide(ProviderSessionRuntime.layer)),
++      Layer.succeed(ProviderAdapterRegistry, adapterRegistry),
++    ).pipe(
++      Layer.provideMerge(ThreadBackgroundLiveness.layer), Layer.provide(ThreadPlanProgress.layer),
++      Layer.provide(OrchestrationEventStoreLive), Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
++      Layer.provide(RepositoryIdentityResolver.layer), Layer.provideMerge(SqlitePersistenceMemory),
++      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "realtime-native-sync-" })),
++      Layer.provideMerge(NodeServices.layer),
++    );
++    const runtime = ManagedRuntime.make(baseLayer);
++    const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
++    const snapshots = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
++    const sql = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
++    const read = () => runtime.runPromise(snapshots.getThreadDetailById(threadId)).then(Option.getOrThrow);
++    const pushed: string[] = [];
++    const subscriber = runtime.runFork(Stream.runForEach(engine.streamDomainEvents, event => Effect.sync(() => { pushed.push(event.type); })));
++    let worker: ReturnType<typeof runtime.runFork> | undefined;
++    try {
++      const createdAt = "2026-10-05T00:00:00.000Z";
++      await runtime.runPromise(engine.dispatch({ type: "project.create", commandId: CommandId.make("realtime-project"), projectId, title: "Original project", workspaceRoot: cwd, createdAt }));
++      await runtime.runPromise(engine.dispatch({ type: "thread.create", commandId: CommandId.make("realtime-thread"), threadId, projectId, title: "Original history", historyImport: true,
++        modelSelection: { instanceId: ProviderInstanceId.make(provider), model: "fixture" }, runtimeMode: "full-access", interactionMode: "default", branch: null, worktreePath: null, createdAt }));
++      const cursor = provider === "codex" ? { threadId: nativeId } : { sessionId: nativeId };
++      const originalRuntime = provider === "codex" ? { cwd } : { cwd, nativeImport: { kind: "dsh", sessionId: nativeId, preset: "original-native-preset", readonly: true } };
++      await runtime.runPromise(sql`INSERT INTO provider_session_runtime (thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, last_seen_at, resume_cursor_json, runtime_payload_json) VALUES (${threadId}, ${provider}, ${provider}, ${provider}, 'full-access', 'stopped', ${createdAt}, ${JSON.stringify(cursor)}, ${JSON.stringify(originalRuntime)})`);
++      worker = runtime.runFork(Effect.flatMap(makeNativeSessionSync, work => work));
++      await until(async () => (await read()).messages.length === 2);
++      expect(reads).toBe(1); await pause(5200); expect(reads).toBe(1);
++      generation = 2; notify!(); notify!();
++      await until(async () => (await read()).messages.length === 4);
++      expect(reads).toBe(2);
++      const before = await read(), beforePayload = object(before.activities.find(a => a.kind === "native.session.sync")!.payload)!;
++      notify!(); await until(async () => reads === 3); await pause(80);
++      expect((await read()).messages).toEqual(before.messages);
++      expect(pushed.filter(type => type === "thread.native-session-synced")).toHaveLength(2);
++      unavailable = true; notify!();
++      await until(async () => object((await read()).activities.find(a => a.kind === "native.session.sync")?.payload)?.observation === "unknown");
++      const failed = await read(); expect(failed.messages).toEqual(before.messages);
++      expect(object(failed.activities.find(a => a.kind === "native.session.sync")!.payload)?.checkpoint).toEqual(beforePayload.checkpoint);
++      unavailable = false; generation = 3; notify!();
++      await until(async () => (await read()).messages.length === 6);
++      requestNativeSessionSync(threadId); await until(async () => reads === 6); await pause(80);
++      expect((await read()).messages).toHaveLength(6);
++      expect(requests.every(request => request.threadId === nativeId && request.cwd === cwd)).toBe(true);
++      if (provider === "dsh") expect(requests.every(request => request.nativePreset === "original-native-preset")).toBe(true);
++      expect(pushed.some(type => type === "thread.turn-start-requested")).toBe(false);
++      expect(Option.getOrThrow(await runtime.runPromise(snapshots.getThreadShellById(threadId))).nativeSessionObservation?.nativeId).toBe(nativeId);
++      enabled = false; requestNativeSessionSync(threadId); await until(async () => watchCloses === 1);
++      const retained = await read(), disabledReads = reads; requestNativeSessionSync(threadId); await pause(80);
++      expect(reads).toBe(disabledReads); expect(notify).toBeUndefined(); expect((await read()).messages).toEqual(retained.messages);
++      enabled = true; requestNativeSessionSync(threadId); await until(async () => reads === disabledReads + 1); await pause(80);
++      expect((await read()).messages).toEqual(retained.messages);
++      const binding = await runtime.runPromise(sql`SELECT resume_cursor_json, runtime_payload_json FROM provider_session_runtime WHERE thread_id=${threadId}`);
++      expect(JSON.parse(binding[0]!.resume_cursor_json as string)).toEqual(cursor); expect(JSON.parse(binding[0]!.runtime_payload_json as string)).toEqual(originalRuntime);
++    } finally {
++      if (worker) await Effect.runPromise(Fiber.interrupt(worker));
++      await Effect.runPromise(Fiber.interrupt(subscriber)); await runtime.dispose();
++    }
++    expect(watchCloses).toBe(2);
++  }, 15000);
++});
+diff --git a/apps/server/src/orchestration/NativeSessionSync.ts b/apps/server/src/orchestration/NativeSessionSync.ts
+index 3abb8db5..2db4d03c 100644
+--- a/apps/server/src/orchestration/NativeSessionSync.ts
++++ b/apps/server/src/orchestration/NativeSessionSync.ts
+@@ -5,7 +5,8 @@ import * as Result from "effect/Result";
+ import * as Data from "effect/Data";
+ import * as Option from "effect/Option";
+ import * as Schema from "effect/Schema";
+-import * as Clock from "effect/Clock";
++import * as Stream from "effect/Stream";
++import { NativeRealtimeQueue } from "./NativeRealtimeQueue.ts";
+ import * as DateTime from "effect/DateTime";
+ import { ProviderSessionDirectory } from "../provider/Services/ProviderSessionDirectory.ts";
+ import { ProviderAdapterRegistry } from "../provider/Services/ProviderAdapterRegistry.ts";
+@@ -16,9 +17,10 @@ import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+ import { object, digest, nativeMessageKey, nativeBindingToken, decodeCodexHistory, planNativeHistory, type NativeHistory } from "./NativeSessionHistory.ts";
+ 
+ class NativeSyncReadError extends Data.TaggedError("NativeSyncReadError")<{ readonly message: string }> {}
++const registrations = new Set<(threadId: ThreadId) => void>();
+ const viewed = new Map<ThreadId, { lastView: number; subscribers: number }>();
+ /** Advisory watch registration. It conveys no native ID, provider setting, write authorization or model request. */
+-export function requestNativeSessionSync(threadId: ThreadId) { const current = viewed.get(threadId); viewed.set(threadId, { lastView: Date.now(), subscribers: current?.subscribers ?? 0 }); }
++export function requestNativeSessionSync(threadId: ThreadId) { const current = viewed.get(threadId); viewed.set(threadId, { lastView: Date.now(), subscribers: current?.subscribers ?? 0 }); for (const notify of registrations) notify(threadId); }
+ 
+ export function attachNativeSessionSyncWatch(threadId: ThreadId) {
+   requestNativeSessionSync(threadId); viewed.get(threadId)!.subscribers++;
+@@ -35,22 +37,37 @@ export const makeNativeSessionSync = Effect.gen(function* () {
+   const messageRepository = yield* ProjectionThreadMessageRepository;
+   if (Option.isNone(directoryOption) || Option.isNone(registryOption)) return Effect.void;
+   const directory = directoryOption.value, registry = registryOption.value;
++  const queue = new NativeRealtimeQueue<ThreadId>();
++  const watches = new Map<ThreadId, { token: string; adapter: unknown; close: () => void }>();
++  const closeWatch = (threadId: ThreadId) => { watches.get(threadId)?.close(); watches.delete(threadId); };
+   const syncOne = Effect.fn("NativeSessionSync.syncOne")(function* (threadId: ThreadId) {
+     const bindingOption = yield* directory.getBinding(threadId);
+-    if (Option.isNone(bindingOption)) return;
++    if (Option.isNone(bindingOption)) { closeWatch(threadId); return; }
+     const binding = bindingOption.value;
+-    if (!["codex", "dsh"].includes(binding.provider) || !binding.providerInstanceId || binding.status === "starting") return;
++    if (!["codex", "dsh"].includes(binding.provider) || !binding.providerInstanceId || binding.status === "starting") { closeWatch(threadId); return; }
+     const scope = object(yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(nativeBindingToken(binding)))!;
+     const detail = yield* snapshots.getThreadDetailById(threadId, { activityKinds: ["native.session.sync"] });
+-    if (Option.isNone(detail) || detail.value.archivedAt !== null || detail.value.deletedAt !== null || detail.value.session?.status === "running" || detail.value.session?.status === "starting") return;
++    if (Option.isNone(detail) || detail.value.archivedAt !== null || detail.value.deletedAt !== null) { closeWatch(threadId); return; }
+     const thread = detail.value;
+     const prior = object(thread.activities.find(a => a.kind === "native.session.sync")?.payload);
+     if (prior && (prior.nativeId !== scope.nativeId || prior.instanceId !== scope.instanceId)) throw Error("Original native sync scope changed");
+     const info = yield* registry.getInstanceInfo(ProviderInstanceId.make(scope.instanceId));
++    if (!info.enabled || info.driverKind !== scope.provider) { closeWatch(threadId); return; }
+     const adapter = yield* registry.getByInstance(ProviderInstanceId.make(scope.instanceId));
+-    if (!info.enabled || info.driverKind !== scope.provider || adapter.provider !== scope.provider || !adapter.readNativeThread) return;
++    if (adapter.provider !== scope.provider || !adapter.readNativeThread) { closeWatch(threadId); return; }
++    const token = nativeBindingToken(binding), watched = watches.get(threadId);
++    if (!watched || watched.token !== token || watched.adapter !== adapter) {
++      closeWatch(threadId);
++      if (adapter.watchNativeThread) {
++        const close = yield* adapter.watchNativeThread({ threadId: scope.nativeId, cwd: scope.cwd }, () => queue.mark(threadId))
++          .pipe(Effect.orElseSucceed(() => undefined));
++        if (close) watches.set(threadId, { token, adapter, close });
++      }
++    }
++    // Local execution already enters the same projection through ProviderRuntimeIngestion.
++    if (thread.session?.status === "running" || thread.session?.status === "starting") return;
+     const checkpoint = object(prior?.checkpoint) ?? {};
+-    const read = adapter.readNativeThread({ threadId: scope.nativeId, cwd: scope.cwd, includeTurns: true, checkpoint: checkpoint.native });
++    const read = adapter.readNativeThread({ threadId: scope.nativeId, cwd: scope.cwd, includeTurns: true, ...(scope.nativePreset ? { nativePreset: scope.nativePreset } : {}), checkpoint: checkpoint.native });
+     const checkedAt = DateTime.formatIso(yield* DateTime.now);
+     const attempt = yield* Effect.result(read.pipe(Effect.timeout("25 seconds")));
+     let history: NativeHistory | null = null;
+@@ -90,18 +107,34 @@ export const makeNativeSessionSync = Effect.gen(function* () {
+     const syncVersion = digest({ binding: content.expectedBinding, observation: content.observation, checkpoint: content.checkpoint, nativeTurns: scope.provider === "codex" && history && plan ? history.turns : null });
+     const payload = yield* Schema.decodeUnknownEffect(NativeSessionSyncPayload)({ ...content, checkedAt, previousVersion: prior?.syncVersion ?? null, syncVersion });
+     if (syncVersion !== prior?.syncVersion) yield* engine.dispatch({ type: "thread.native-session.sync", commandId: CommandId.make(`native-sync:${threadId}:${digest([prior?.syncVersion ?? null, syncVersion])}`), ...payload });
++    if (history && !history.complete && plan) queue.mark(threadId);
+     if (scope.provider === "codex" && binding.status === "running" && payload.observation === "ready" && payload.latestTurn?.state === "completed") {
+       yield* engine.dispatch({ type: "thread.native-session.release", threadId, checkedAt, expectedBinding: payload.expectedBinding, commandId: CommandId.make(`native-release:${threadId}:${payload.latestTurn.turnId}:${syncVersion}`) });
+     }
+   });
+-  // Reads are serialized and scoped to viewed conversations. No thread load/resume, engine graph scan or model action.
+-  return Effect.gen(function* () {
+-    while (true) {
+-      for (const [threadId, watch] of [...viewed]) {
+-        if (watch.subscribers === 0 && (yield* Clock.currentTimeMillis) - watch.lastView > 120_000) { viewed.delete(threadId); continue; }
+-        yield* syncOne(threadId).pipe(Effect.catchCause(() => Effect.logDebug("Original native session sync unavailable", { threadId })));
++  // Subscribe before reconciliation; queued identities survive in-flight reads and reconnects.
++  return Effect.scoped(Effect.gen(function* () {
++    const notify = (threadId: ThreadId) => queue.mark(threadId);
++    registrations.add(notify);
++    yield* Effect.addFinalizer(() => Effect.sync(() => {
++      registrations.delete(notify); queue.close(); for (const id of [...watches.keys()]) closeWatch(id);
++    }));
++    const changes = yield* registry.subscribeChanges;
++    const reconcile = Effect.gen(function* () {
++      for (const binding of yield* directory.listBindings()) queue.mark(binding.threadId);
++      for (const id of viewed.keys()) queue.mark(id);
++    });
++    yield* Stream.runForEach(Stream.fromSubscription(changes), () => reconcile).pipe(Effect.forkScoped);
++    yield* Stream.runForEach(engine.streamDomainEvents, event => Effect.sync(() => {
++      if (["thread.created", "thread.session-set", "thread.history-imported", "thread.archived", "thread.unarchived", "thread.deleted"].includes(event.type)) {
++        const payload = object(event.payload); if (typeof payload?.threadId === "string") queue.mark(payload.threadId as ThreadId);
+       }
+-      yield* Effect.sleep("5 seconds");
++    })).pipe(Effect.forkScoped);
++    yield* reconcile;
++    while (true) {
++      const threadId = yield* Effect.promise(signal => queue.take(signal));
++      if (threadId === undefined) return;
++      yield* syncOne(threadId).pipe(Effect.catchCause(() => Effect.logDebug("Original native session sync unavailable", { threadId })));
+     }
+-  });
++  }));
+ });
+diff --git a/apps/server/src/project/AgentSessionImporter.test.ts b/apps/server/src/project/AgentSessionImporter.test.ts
+index 7d623c91..59dddb7f 100644
+--- a/apps/server/src/project/AgentSessionImporter.test.ts
++++ b/apps/server/src/project/AgentSessionImporter.test.ts
+@@ -581,6 +581,33 @@ const integrationLayer = Layer.mergeAll(
+ );
+ 
+ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
++  it.effect("binds an existing cold DSH SID and original preset without a prompt, replacement SID, or fabricated history", () =>
++    Effect.gen(function* () {
++      const engine = yield* OrchestrationEngine.OrchestrationEngineService;
++      const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
++      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
++      const projectId = ProjectId.make("original-dsh-project");
++      const workspaceRoot = "/tmp/original-dsh-project";
++      const original: AgentSessionScanner.AgentSessionThread = {
++        source: "dsh", providerInstanceId: ProviderInstanceId.make("dsh"), providerSessionId: "original-existing-native-id",
++        nativePreset: "original-native-preset", title: "Original DSH dialogue", model: "original-provider/model",
++        createdAt: "2026-08-24T10:00:00.000Z", updatedAt: "2026-08-24T10:01:00.000Z", messages: [],
++      };
++      const scanner = AgentSessionScanner.AgentSessionScanner.of({ scan: Effect.die("unused"), recentThreads: () => Stream.succeed(makeThreadOutcome(original)) });
++      yield* engine.dispatch({ type: "project.create", commandId: CommandId.make("original-dsh-project"), projectId,
++        title: "Original DSH project", workspaceRoot, defaultModelSelection: null, createdAt: original.createdAt });
++      expect(yield* importRecentAgentThreads({ projectId }).pipe(Effect.provideService(AgentSessionScanner.AgentSessionScanner, scanner)))
++        .toEqual({ importedCount: 1, skippedCount: 0 });
++      const threadId = ThreadId.make("import:dsh:original-existing-native-id");
++      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
++      expect(binding).toMatchObject({ provider: "dsh", providerInstanceId: "dsh", status: "stopped",
++        resumeCursor: { sessionId: original.providerSessionId }, runtimePayload: { cwd: workspaceRoot,
++          nativeImport: { kind: "dsh", sessionId: original.providerSessionId, preset: original.nativePreset, readonly: true } } });
++      const thread = Option.getOrThrow(yield* snapshots.getThreadDetailById(threadId));
++      expect(thread.title).toBe(original.title); expect(thread.messages).toEqual([]); expect(thread.session).toBeNull(); expect(thread.latestTurn).toBeNull();
++      expect(thread.modelSelection).toEqual({ instanceId: "dsh", model: original.model });
++    }),
++  );
+   it.effect("imports once after the real engine persists an old rejected receipt", () =>
+     Effect.gen(function* () {
+       const engine = yield* OrchestrationEngine.OrchestrationEngineService;
+diff --git a/apps/server/src/project/AgentSessionImporter.ts b/apps/server/src/project/AgentSessionImporter.ts
+index bf9eb702..e246f428 100644
+--- a/apps/server/src/project/AgentSessionImporter.ts
++++ b/apps/server/src/project/AgentSessionImporter.ts
+@@ -28,6 +28,7 @@ import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEng
+ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+ import * as ProviderSessionDirectory from "../provider/Services/ProviderSessionDirectory.ts";
+ import * as AgentSessionScanner from "./AgentSessionScanner.ts";
++import { requestNativeSessionSync } from "../orchestration/NativeSessionSync.ts";
+ 
+ const CLAUDE_SESSION_ID_PATTERN =
+   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+@@ -183,6 +184,10 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
+             providerSessionId: thread.providerSessionId,
+           });
+         }
++        if (thread.source === "dsh" && (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(thread.providerSessionId) ||
++          typeof thread.nativePreset !== "string" || !thread.nativePreset.trim() || thread.nativePreset.length > 256 || /[\0\r\n]/.test(thread.nativePreset))) {
++          return yield* new AgentSessionUnresumableSessionError({ source: thread.source, providerSessionId: thread.providerSessionId });
++        }
+ 
+         if (Option.isSome(existingThread) && existingThread.value.projectId !== input.projectId) {
+           return yield* new AgentSessionThreadProjectConflictError({
+@@ -192,6 +197,21 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
+           });
+         }
+ 
++        // DSH compressed history is imported by the SID/checkpoint observer. Re-discovery records
++        // file identity without replacing messages, titles, turns, or the existing readonly binding.
++        if (thread.source === "dsh" && Option.isSome(existingThread) && Option.isSome(existingBinding)) {
++          const binding = existingBinding.value;
++          const cursor = binding.resumeCursor as { sessionId?: unknown } | null;
++          const runtime = binding.runtimePayload as { cwd?: unknown; nativeImport?: { kind?: unknown; sessionId?: unknown; preset?: unknown; readonly?: unknown } } | null;
++          if (binding.provider !== "dsh" || binding.providerInstanceId !== thread.providerInstanceId || binding.status !== "stopped" ||
++            cursor?.sessionId !== thread.providerSessionId || runtime?.cwd !== workspaceRoot || runtime.nativeImport?.kind !== "dsh" ||
++            runtime.nativeImport.sessionId !== thread.providerSessionId || runtime.nativeImport.preset !== thread.nativePreset || runtime.nativeImport.readonly !== true ||
++            existingThread.value.archivedAt !== null || existingThread.value.deletedAt !== null) return yield* new AgentSessionThreadModifiedError({ threadId });
++          yield* directory.recordImportedTranscript({ threadId, source: outcome.source });
++          requestNativeSessionSync(threadId);
++          return true;
++        }
++
+         const importedHistoryPresent = Option.isSome(existingThread)
+           ? hasImportedHistory(existingThread.value)
+           : false;
+@@ -234,8 +254,8 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
+               resumeCursor:
+                 thread.source === "codex"
+                   ? { threadId: thread.providerSessionId }
+-                  : { threadId, resume: thread.providerSessionId },
+-              runtimePayload: { cwd: workspaceRoot },
++                  : thread.source === "dsh" ? { sessionId: thread.providerSessionId } : { threadId, resume: thread.providerSessionId },
++              runtimePayload: { cwd: workspaceRoot, ...(thread.source === "dsh" ? { nativeImport: { kind: "dsh", sessionId: thread.providerSessionId, preset: thread.nativePreset, readonly: true } } : {}) },
+             },
+             { onConflict: "ignore" },
+           );
+@@ -258,7 +278,7 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
+           });
+         }
+ 
+-        if (!importedHistoryPresent) {
++        if (!importedHistoryPresent && thread.source !== "dsh") {
+           yield* engine.dispatch({
+             type: "thread.history.import",
+             commandId: CommandId.make(yield* crypto.randomUUIDv4),
+@@ -273,6 +293,7 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
+         }
+ 
+         yield* directory.recordImportedTranscript({ threadId, source: outcome.source });
++        if (thread.source === "dsh") requestNativeSessionSync(threadId);
+ 
+         return true;
+       }).pipe(
+diff --git a/apps/server/src/project/AgentSessionScanner.test.ts b/apps/server/src/project/AgentSessionScanner.test.ts
+index 792ef923..59e4cc1a 100644
+--- a/apps/server/src/project/AgentSessionScanner.test.ts
++++ b/apps/server/src/project/AgentSessionScanner.test.ts
+@@ -22,6 +22,8 @@ import * as ServerConfig from "../config.ts";
+ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+ import * as AgentSessionScanner from "./AgentSessionScanner.ts";
++import { DshHostService, type DshHostPort } from "../provider/Layers/DshAdapter.ts";
++import type { DshHistorySource } from "../provider/Layers/DshHistoryDiscovery.ts";
+ 
+ const makeProjectShell = (workspaceRoot: string): OrchestrationProjectShell => ({
+   id: ProjectId.make("project-1"),
+@@ -78,6 +80,7 @@ interface ScannerTestInput {
+   /** Base dir for the test ServerConfig; worktreesDir derives from it. */
+   readonly configBaseDir?: string;
+   readonly providerInstances?: ContractServerSettings["providerInstances"];
++  readonly dshSources?: readonly DshHistorySource[];
+ }
+ 
+ const makeScannerTestLayer = (input: ScannerTestInput) =>
+@@ -98,6 +101,14 @@ const makeScannerTestLayer = (input: ScannerTestInput) =>
+           input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
+         ),
+         makeProjectionSnapshotQueryLayer(input.importedWorkspaceRoots ?? []),
++        ...(input.dshSources === undefined ? [] : [Layer.succeed(DshHostService, {
++          environmentId: "isolated-scanner", port: {
++            discoverHistory: async () => input.dshSources!, describe: async () => { throw Error("unused"); },
++            create: async () => { throw Error("forbidden"); }, hasSession: async () => { throw Error("unused"); },
++            selectModel: async () => { throw Error("forbidden"); }, pinTitle: async () => { throw Error("forbidden"); },
++            prompt: async () => { throw Error("forbidden"); }, observe: async () => { throw Error("unused"); },
++          } satisfies DshHostPort,
++        })]),
+       ),
+     ),
+   );
+@@ -181,6 +192,30 @@ function makeRecordLimitTranscript(cwd: string, overflow: boolean): string {
+ 
+ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+   describe("scan", () => {
++    it.effect("discovers and imports older DSH history in the selected workspace without parsing compressed text or activation", () =>
++      Effect.gen(function* () {
++        yield* TestClock.setTime(Date.parse("2026-08-24T00:00:00.000Z"));
++        const claudeHomePath = yield* makeTempDir("scanner-empty-claude-");
++        const codexHomePath = yield* makeTempDir("scanner-empty-codex-");
++        const cwd = yield* makeTempDir("scanner-original-dsh-project-");
++        const historyHome = yield* makeTempDir("scanner-original-dsh-history-");
++        const path = yield* Path.Path;
++        const filePath = path.join(historyHome, "native-existing", "session.v4.jsonl.zstd");
++        yield* writeTranscript({ filePath, contents: "opaque original compressed bytes", mtimeMs: Date.parse("2026-01-01T00:00:00.000Z") });
++        const source: DshHistorySource = { sessionId: "native-existing", cwd, title: "Original DSH dialogue", preset: "original-preset", model: "provider/model",
++          createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", filePath, mtimeMs: Date.parse("2026-01-01T00:00:00.000Z") };
++        const dshInstance = { driver: ProviderDriverKind.make("dsh"), enabled: true, config: { agentPreset: "original-preset" } };
++        const input = { claudeHomePath, codexHomePath, dshSources: [source],
++          providerInstances: { [ProviderInstanceId.make("dsh")]: dshInstance } };
++        const scan = yield* runScan(input);
++        expect(scan.candidates).toMatchObject([{ path: cwd, sources: ["dsh"], threadCount: 1 }]);
++        const outcomes = yield* runRecentThreadOutcomes({ ...input, workspaceRoot: cwd });
++        expect(outcomes).toMatchObject([{ _tag: "Importable", thread: { source: "dsh", providerSessionId: source.sessionId, nativePreset: source.preset, messages: [] },
++          source: { provider: "dsh", filePath, size: 32 } }]);
++        const disabled = yield* runScan({ ...input, providerInstances: { [ProviderInstanceId.make("dsh")]: { ...dshInstance, enabled: false } } });
++        expect(disabled.candidates).toEqual([]);
++      }),
++    );
+     it.effect("reads Claude project cwds from transcripts, newest first", () =>
+       Effect.gen(function* () {
+         const path = yield* Path.Path;
+@@ -1422,7 +1457,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+         }),
+     );
+ 
+-    it.effect("imports recent Claude and Codex sessions for the selected project only", () =>
++    it.effect("imports older and recent Claude and Codex histories only for the selected project", () =>
+       Effect.gen(function* () {
+         const path = yield* Path.Path;
+         const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+@@ -1493,6 +1528,15 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+           mtimeMs: nowMs - 60 * 60 * 1000,
+         });
+ 
++        yield* writeTranscript({
++          filePath: path.join(codexHomePath, "sessions", "2026", "06", "01", "rollout-codex-old.jsonl"),
++          contents: [
++            encodeTranscriptRecord({type: "session_meta", timestamp: "2026-06-01T10:00:00.000Z", payload: {id: "codex-old", cwd: workspace}}),
++            encodeTranscriptRecord({type: "event_msg", timestamp: "2026-06-01T10:01:00.000Z", payload: {type: "user_message", message: "Older original prompt"}}),
++          ].join("\n"),
++          mtimeMs: nowMs - 84 * 24 * 60 * 60 * 1000,
++        });
++
+         const threads = yield* runRecentThreads({
+           claudeHomePath,
+           codexHomePath,
+@@ -1502,10 +1546,14 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+         expect(threads.map((thread) => thread.providerSessionId)).toEqual([
+           "codex-recent",
+           "claude-recent",
++          "claude-old",
++          "codex-old",
+         ]);
+         expect(threads.map((thread) => thread.messages.map((message) => message.text))).toEqual([
+           ["Review this code", "Looks good"],
+           ["Fix the project", "Done"],
++          ["Fix the project", "Done"],
++          ["Older original prompt"],
+         ]);
+       }),
+     );
+diff --git a/apps/server/src/project/AgentSessionScanner.ts b/apps/server/src/project/AgentSessionScanner.ts
+index 8a8f3b31..9a582995 100644
+--- a/apps/server/src/project/AgentSessionScanner.ts
++++ b/apps/server/src/project/AgentSessionScanner.ts
+@@ -1,3 +1,4 @@
++import { DshHostService } from "../provider/Layers/DshAdapter.ts";
+ /**
+  * AgentSessionScanner - discovery of projects a user already works on.
+  *
+@@ -82,7 +83,6 @@ const MAX_METADATA_BYTES_PER_SOURCE = 64 * 1024 * 1024;
+ const MAX_METADATA_OPERATIONS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
+ const MAX_METADATA_RECORDS_PER_SOURCE = 100_000;
+ const MAX_METADATA_RECORDS_PER_TRANSCRIPT = 1_000;
+-const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+ /**
+  * Large tool results (especially screenshots) can make an otherwise ordinary
+  * Codex transcript several GiB. Streaming field selection avoids allocating
+@@ -163,6 +163,7 @@ export interface AgentSessionThread {
+   readonly providerSessionId: string;
+   readonly title: string;
+   readonly model: string | null;
++  readonly nativePreset?: string;
+   readonly createdAt: string;
+   readonly updatedAt: string;
+   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
+@@ -185,7 +186,7 @@ export class AgentSessionScanner extends Context.Service<
+     /**
+      * Discover every directory the configured Claude and Codex homes have run
+      * a session in. Candidates are returned newest-first; the client decides
+-     * which ones to import and how far back to look. Fails with the contract
++     * which ones to import. Selected history has no age cutoff and retains bounded reads. Fails with the contract
+      * error directly — there is no server-local context worth wrapping.
+      */
+     readonly scan: Effect.Effect<AgentSessionScanResult, AgentSessionScanError>;
+@@ -205,6 +206,7 @@ interface RawCandidate {
+   readonly providerInstanceId: ProviderInstanceId;
+   readonly threadCount: number;
+   readonly lastActiveAtMs: number | null;
++  readonly nativeThreads?: ReadonlyMap<string, AgentSessionThread>;
+   readonly transcripts: ReadonlyArray<{
+     readonly filePath: string;
+     readonly mtimeMs: number | null;
+@@ -625,8 +627,11 @@ export const make = Effect.gen(function* () {
+   const serverConfig = yield* ServerConfig.ServerConfig;
+   const serverSettings = yield* ServerSettings.ServerSettingsService;
+   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+-  const baseDir = path.resolve(serverConfig.baseDir);
+-  const worktreesDir = path.resolve(serverConfig.worktreesDir);
++  const dsh = yield* Effect.serviceOption(DshHostService);
++  const baseDir = yield* fileSystem.realPath(path.resolve(serverConfig.baseDir))
++    .pipe(Effect.orElseSucceed(() => path.resolve(serverConfig.baseDir)));
++  const worktreesDir = yield* fileSystem.realPath(path.resolve(serverConfig.worktreesDir))
++    .pipe(Effect.orElseSucceed(() => path.resolve(serverConfig.worktreesDir)));
+   // Windows filesystems are case-insensitive, so path prefix checks there
+   // must case fold.
+   const foldWorktreeCase = (yield* HostProcessPlatform) === "win32";
+@@ -1193,6 +1198,24 @@ export const make = Effect.gen(function* () {
+       truncated ||= metadataBudget.truncated;
+     }
+ 
++    const dshInstance = settings.providerInstances[ProviderInstanceId.make("dsh")];
++    if (dshInstance?.driver === "dsh" && resolveProviderInstanceEnabled(dshInstance) && Option.isSome(dsh) && dsh.value.port.discoverHistory) {
++      const sources = yield* Effect.tryPromise({ try: () => dsh.value.port.discoverHistory!(), catch: () => new AgentSessionScanError({ operation: "read-projects", cause: "Original DSH discovery unavailable" }) }).pipe(Effect.orElseSucceed(() => []));
++      const groups = new Map<string, RawCandidate>();
++      for (const source of sources) {
++        const nativeThreads = new Map<string, AgentSessionThread>();
++        nativeThreads.set(source.filePath, { source: "dsh", providerInstanceId: ProviderInstanceId.make("dsh"), providerSessionId: source.sessionId,
++          title: source.title, model: source.model, nativePreset: source.preset, createdAt: source.createdAt, updatedAt: source.updatedAt, messages: [] });
++        const existing = groups.get(source.cwd);
++        if (existing) {
++          const threads = new Map(existing.nativeThreads); for (const [key, value] of nativeThreads) threads.set(key, value);
++          groups.set(source.cwd, { ...existing, threadCount: existing.threadCount + 1, lastActiveAtMs: Math.max(existing.lastActiveAtMs ?? 0, Date.parse(source.updatedAt)),
++            nativeThreads: threads, transcripts: [...existing.transcripts, { filePath: source.filePath, mtimeMs: source.mtimeMs }] });
++        } else groups.set(source.cwd, { cwd: source.cwd, source: "dsh", providerInstanceId: ProviderInstanceId.make("dsh"), threadCount: 1,
++          lastActiveAtMs: Date.parse(source.updatedAt), nativeThreads, transcripts: [{ filePath: source.filePath, mtimeMs: source.mtimeMs }] });
++      }
++      raw.push(...groups.values());
++    }
+     return { candidates: raw, truncated };
+   });
+ 
+@@ -1334,7 +1357,6 @@ export const make = Effect.gen(function* () {
+     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
+     const rootIdentity = yield* directoryIdentity(root);
+     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
+ 
+     const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
+     cachedCandidates = candidates;
+@@ -1352,7 +1374,6 @@ export const make = Effect.gen(function* () {
+       for (const transcript of candidate.transcripts) {
+         if (
+           transcript.mtimeMs === null ||
+-          transcript.mtimeMs < cutoffMs ||
+           transcript.mtimeMs > nowMs
+         ) {
+           continue;
+@@ -1417,6 +1438,15 @@ export const make = Effect.gen(function* () {
+           ) {
+             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+           }
++          if (candidate.source === "dsh") {
++            const thread = candidate.nativeThreads?.get(transcript.filePath);
++            if (!thread) return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
++            const source: AgentSessionImportSource = { ...identity, provider: "dsh", providerInstanceId: thread.providerInstanceId, providerSessionId: thread.providerSessionId };
++            const key = `${thread.providerInstanceId}\0${thread.providerSessionId}`;
++            if (importedSessions.has(key)) return Option.some<AgentSessionRecentThread>({ _tag: "Duplicate", source });
++            importedSessions.add(key); transcriptsRemaining--;
++            return Option.some<AgentSessionRecentThread>({ _tag: "Importable", thread, source });
++          }
+           // Reserve the whole file even if its read or parse fails.
+           transcriptsRemaining -= 1;
+           bytesRemaining -= identity.size;
+diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
+index e38e23f3..31c4912f 100644
+--- a/apps/server/src/provider/Drivers/CodexDriver.ts
++++ b/apps/server/src/provider/Drivers/CodexDriver.ts
+@@ -36,6 +36,7 @@ import { ServerConfig } from "../../config.ts";
+ import { expandHomePath } from "../../pathExpansion.ts";
+ import { ServerSettingsService } from "../../serverSettings.ts";
+ import { ProviderDriverError, ProviderAdapterRequestError } from "../Errors.ts";
++import { CodexNativeNotifications } from "../Layers/CodexNativeNotifications.ts";
+ import { readCompleteNativeThread } from "../Layers/CodexNativeChildRead.ts";
+ import { makeCodexAdapter } from "../Layers/CodexAdapter.ts";
+ import * as ResetCreditCoordinator from "../Layers/resetCreditCoordinator.ts";
+@@ -335,6 +336,8 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
+             ),
+           );
+ 
++      let notifications: CodexNativeNotifications | undefined;
++      yield* Effect.addFinalizer(() => Effect.sync(() => notifications?.close()));
+       return {
+         instanceId,
+         driverKind: DRIVER_KIND,
+@@ -347,6 +350,10 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
+         consumeResetCredit,
+         adapter: {
+           ...adapter,
++          watchNativeThread: (input, changed) => Effect.try({
++            try: () => { notifications ??= new CodexNativeNotifications(homeLayout.sharedHomePath); return notifications.watch(input, changed); },
++            catch: (cause) => new ProviderAdapterRequestError({ provider: DRIVER_KIND, method: "native/watch", detail: "Original Codex notifications unavailable.", cause }),
++          }),
+           readNativeThread: (input) => Effect.gen(function* () {
+             const { client } = yield* withCodexAppServerClient({
+               binaryPath: processEnv.AAAAGENT_CODEX_READONLY_BINARY ?? effectiveConfig.binaryPath, homePath: effectiveConfig.homePath,
+diff --git a/apps/server/src/provider/Drivers/DshDriver.ts b/apps/server/src/provider/Drivers/DshDriver.ts
+index 8c7d270e..72690dd3 100644
+--- a/apps/server/src/provider/Drivers/DshDriver.ts
++++ b/apps/server/src/provider/Drivers/DshDriver.ts
+@@ -94,8 +94,11 @@ export const DshDriver: ProviderDriver<DshSettings, DshDriverEnv> = {
+       };
+       return {
+         instanceId, driverKind: DRIVER, continuationIdentity, displayName, accentColor, enabled,
+-        snapshot, adapter: { ...adapter, readNativeThread: input => Effect.tryPromise({
+-          try: () => { if (!host.port.readHistory) throw Error("Original DSH reader unavailable"); return host.port.readHistory(input.threadId, input.cwd, config.agentPreset ?? "", input.checkpoint); },
++        snapshot, adapter: { ...adapter, watchNativeThread: (input, changed) => Effect.tryPromise({
++          try: () => { if (!host.port.watchHistory) throw Error("Original DSH notifications unavailable"); return host.port.watchHistory(input.threadId, input.cwd, changed); },
++          catch: () => new ProviderAdapterRequestError({ provider: DRIVER, method: "session/watch", detail: "Original DSH notifications unavailable" }),
++        }), readNativeThread: input => Effect.tryPromise({
++          try: () => { if (!host.port.readHistory) throw Error("Original DSH reader unavailable"); return host.port.readHistory(input.threadId, input.cwd, input.nativePreset ?? config.agentPreset ?? "", input.checkpoint); },
+           catch: () => new ProviderAdapterRequestError({ provider: DRIVER, method: "session/page", detail: "Original DSH readonly history unavailable" }),
+         }) }, textGeneration,
+       } satisfies ProviderInstance;
+diff --git a/apps/server/src/provider/Layers/CodexNativeNotifications.ts b/apps/server/src/provider/Layers/CodexNativeNotifications.ts
+new file mode 100644
+index 00000000..580fdeee
+--- /dev/null
++++ b/apps/server/src/provider/Layers/CodexNativeNotifications.ts
+@@ -0,0 +1,116 @@
++// @effect-diagnostics nodeBuiltinImport:off -- Filesystem subscriptions belong to this imperative original-source transport.
++// @effect-diagnostics globalTimers:off -- One event burst is coalesced; there is no periodic scan.
++import { watch, existsSync, lstatSync, realpathSync, type FSWatcher } from "node:fs";
++import { join, relative, resolve, isAbsolute } from "node:path";
++import { DatabaseSync } from "node:sqlite";
++
++export interface CodexNativeWatchInput { readonly threadId: string; readonly cwd: string }
++interface Entry { input: CodexNativeWatchInput; listeners: Set<() => void>; file: string | null; signature: string | null }
++const id = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
++
++/** One configured original home, one filesystem subscription, exact indexed SID queries. */
++export class CodexNativeNotifications {
++  private readonly entries = new Map<string, Entry>();
++  private readonly watchers: FSWatcher[] = [];
++  private readonly pending = new Set<string>();
++  private readonly indexes = new Map<string, { identity: string; watcher: FSWatcher }>();
++  private databaseIdentity: string | undefined;
++  private burst: ReturnType<typeof setTimeout> | undefined;
++  private database: DatabaseSync | undefined;
++  private disposed = false;
++  readonly home: string;
++  constructor(home: string) {
++    if (!isAbsolute(home) || realpathSync(home) !== resolve(home)) throw Error("Original Codex home identity unavailable");
++    this.home = resolve(home);
++  }
++  watch(input: CodexNativeWatchInput, changed: () => void): () => void {
++    if (this.disposed || !id(input.threadId) || !isAbsolute(input.cwd)) throw Error("Original Codex watch scope unavailable");
++    let entry = this.entries.get(input.threadId);
++    if (entry && entry.input.cwd !== input.cwd) throw Error("Original Codex watch workspace conflict");
++    if (!entry) {
++      entry = { input, listeners: new Set(), file: null, signature: null };
++      this.entries.set(input.threadId, entry);
++      try { this.ensure(); this.refresh(input.threadId, false); }
++      catch (error) { this.entries.delete(input.threadId); if (!this.entries.size) this.release(); throw error; }
++    }
++    entry.listeners.add(changed);
++    let closed = false;
++    return () => { if (closed) return; closed = true; entry!.listeners.delete(changed); if (!entry!.listeners.size) this.entries.delete(input.threadId); if (!this.entries.size) this.release(); };
++  }
++  close(): void { this.disposed = true; this.entries.clear(); this.release(); }
++  private ensure(): void {
++    if (this.watchers.length) return;
++    const databaseFile = join(this.home, "state_5.sqlite");
++    const stat = lstatSync(databaseFile);
++    if (!stat.isFile() || stat.isSymbolicLink()) throw Error("Original Codex index unavailable");
++    this.openDatabase(); this.watchIndexes();
++    const root = watch(this.home, (_kind, name) => {
++      if (name === null || /^state_5\.sqlite(?:-wal|-shm)?$/.test(String(name))) {
++        this.watchIndexes(); for (const key of this.entries.keys()) this.schedule(key);
++      }
++    });
++    root.on("error", () => { for (const entry of this.entries.values()) for (const listener of entry.listeners) listener(); });
++    this.watchers.push(root);
++    for (const folder of ["sessions", "archived_sessions"]) {
++      const path = join(this.home, folder); if (!existsSync(path)) continue;
++      const watcher = watch(path, { recursive: true }, (_kind, name) => {
++        if (name === null) { for (const key of this.entries.keys()) this.schedule(key); return; }
++        const file = resolve(path, String(name));
++        for (const [key, entry] of this.entries) if (file === entry.file || String(name).includes(key)) this.schedule(key);
++      });
++      watcher.on("error", () => { for (const entry of this.entries.values()) for (const listener of entry.listeners) listener(); });
++      this.watchers.push(watcher);
++    }
++  }
++  private openDatabase(): void {
++    const file = join(this.home, "state_5.sqlite"), stat = lstatSync(file);
++    if (!stat.isFile() || stat.isSymbolicLink()) throw Error("Original Codex index unavailable");
++    const identity = JSON.stringify([stat.dev, stat.ino]);
++    if (this.database && this.databaseIdentity === identity) return;
++    this.database?.close(); this.database = new DatabaseSync(file, { readOnly: true }); this.databaseIdentity = identity;
++  }
++  private watchIndexes(): void {
++    for (const name of ["state_5.sqlite", "state_5.sqlite-wal"]) {
++      const path = join(this.home, name);
++      try {
++        const stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) continue;
++        const identity = JSON.stringify([stat.dev, stat.ino]), current = this.indexes.get(name);
++        if (current?.identity === identity) continue;
++        current?.watcher.close();
++        const watcher = watch(path, () => { for (const key of this.entries.keys()) this.schedule(key); });
++        watcher.on("error", () => { watcher.close(); this.indexes.delete(name); });
++        this.indexes.set(name, { identity, watcher });
++      } catch { /* New WAL files are attached when the home directory reports their creation. */ }
++    }
++  }
++  private schedule(key: string): void {
++    this.pending.add(key);
++    if (this.burst !== undefined) return;
++    this.burst = setTimeout(() => { this.burst = undefined; const batch = [...this.pending]; this.pending.clear(); for (const id of batch) this.refresh(id, true); }, 60);
++    this.burst.unref();
++  }
++  private refresh(key: string, emit: boolean): void {
++    const entry = this.entries.get(key); if (!entry) return;
++    let signature = "unavailable", file: string | null = null;
++    try {
++      this.openDatabase();
++      const row = this.database!.prepare("SELECT id,cwd,rollout_path,archived FROM threads WHERE id=?").get(key);
++      if (!row || row.id !== key || row.cwd !== entry.input.cwd || row.archived !== 0 || typeof row.rollout_path !== "string") throw Error("Original Codex index scope changed");
++      const selected = resolve(row.rollout_path), part = relative(this.home, selected);
++      if (part.startsWith("../") || isAbsolute(part) || !/^(sessions|archived_sessions)\//.test(part) || realpathSync(selected) !== selected) throw Error("Original Codex rollout scope changed");
++      const stat = lstatSync(selected);
++      if (!stat.isFile() || stat.isSymbolicLink()) throw Error("Original Codex rollout unavailable");
++      file = selected; signature = JSON.stringify([selected, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
++    } catch { /* A transient/missing original never advances a history checkpoint. */ }
++    entry.file = file;
++    if (signature === entry.signature) return;
++    entry.signature = signature;
++    if (emit) for (const listener of entry.listeners) listener();
++  }
++  private release(): void {
++    for (const watcher of this.watchers.splice(0)) watcher.close();
++    for (const { watcher } of this.indexes.values()) watcher.close(); this.indexes.clear();
++    if (this.burst !== undefined) clearTimeout(this.burst);
++    this.burst = undefined; this.pending.clear(); this.database?.close(); this.database = undefined; this.databaseIdentity = undefined;
++  }
++}
+diff --git a/apps/server/src/provider/Layers/DshAdapter.test.ts b/apps/server/src/provider/Layers/DshAdapter.test.ts
+index 943e4238..e5a2762d 100644
+--- a/apps/server/src/provider/Layers/DshAdapter.test.ts
++++ b/apps/server/src/provider/Layers/DshAdapter.test.ts
+@@ -25,7 +25,7 @@ function fixture() {
+     prompt: async (_id, requestId) => { prompts.push(requestId); },
+     observe: async () => ({ status: "completed", nativeTurn: 7, terminalSeq: 4, messages: [{ seq: 3, text: "FIXTURE_OK" }] }),
+   };
+-  const adapter = () => Effect.runPromise(makeDshAdapter({ instanceId, environmentId: "fixture-env", preset: "fixture-preset", host, pollIntervalMs: 5 }));
++  const adapter = () => Effect.runPromise(makeDshAdapter({ instanceId, environmentId: "fixture-env", preset: "fixture-preset", host }));
+   return { host, adapter, created, prompts, selected, titles };
+ }
+ 
+@@ -127,3 +127,24 @@ it("driver exposes only native verified models and keeps auxiliary generation di
+   Assert.equal(snapshot.supportsTextGeneration, false);
+   await Assert.rejects(Effect.runPromise(instance.textGeneration.generateThreadTitle({ cwd: start.cwd!, message: "synthetic", modelSelection })));
+ });
++
++it("reads an owned native turn once at opening and only again on its original notification", async () => {
++  const f = fixture(); let reads = 0, completed = false, changed: (() => void) | undefined, closed = 0;
++  f.host.watchTurn = async (sessionId, cwd, notify) => {
++    Assert.equal(sessionId, f.created[0]); Assert.equal(cwd, start.cwd); changed = notify;
++    return () => { closed++; changed = undefined; };
++  };
++  f.host.observe = async () => { reads++; return completed ? { status: "completed", nativeTurn: 7, terminalSeq: 4, messages: [{ seq: 3, text: "FIXTURE_OK" }] } : { status: "running", nativeTurn: 7, messages: [] }; };
++  const adapter = await f.adapter(), received: ProviderRuntimeEvent[] = [];
++  await Effect.runPromise(adapter.startSession(start));
++  const reader = Effect.runPromise(Stream.runForEach(adapter.streamEvents.pipe(Stream.takeUntil(event => event.type === "turn.completed")), event => Effect.sync(() => { received.push(event); })).pipe(Effect.timeout("6 seconds")));
++  try {
++    await Effect.runPromise(adapter.sendTurn(input));
++    await Effect.runPromise(Effect.sleep("2300 millis"));
++    Assert.equal(reads, 1, "an idle live source must not be polled every two seconds");
++    Assert.ok(changed); completed = true; changed(); changed();
++    await reader;
++    Assert.equal(reads, 2); Assert.equal(received.filter(event => event.type === "item.completed").length, 1);
++    Assert.equal(received.filter(event => event.type === "turn.completed").length, 1); Assert.equal(closed, 1);
++  } finally { await Effect.runPromise(adapter.stopAll()); }
++});
+diff --git a/apps/server/src/provider/Layers/DshAdapter.ts b/apps/server/src/provider/Layers/DshAdapter.ts
+index a9a3726a..0292ca3e 100644
+--- a/apps/server/src/provider/Layers/DshAdapter.ts
++++ b/apps/server/src/provider/Layers/DshAdapter.ts
+@@ -12,6 +12,7 @@ import * as Stream from "effect/Stream";
+ 
+ import { ProviderAdapterRequestError, ProviderAdapterValidationError, type ProviderAdapterError } from "../Errors.ts";
+ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
++import { NativeRealtimeQueue } from "../../orchestration/NativeRealtimeQueue.ts";
+ import { readDshAttachments, dshInputDigest } from "./DshWebInput.ts";
+ 
+ const DRIVER = ProviderDriverKind.make("dsh");
+@@ -32,6 +33,9 @@ export interface DshTurnObservation {
+ export interface DshHostPort {
+   /** I supplies this from the protected launcher and native model catalog. */
+   readonly attachmentsDir?: string;
++  discoverHistory?(): Promise<readonly import("./DshHistoryDiscovery.ts").DshHistorySource[]>;
++  watchHistory?(sessionId: string, cwd: string, changed: () => void): Promise<() => void>;
++  watchTurn?(sessionId: string, cwd: string, changed: () => void): Promise<() => void>;
+   retain?(sessionId: string): Promise<void>;
+   release?(sessionId: string): void;
+   permission?(sessionId: string, mode: RuntimeMode): Promise<void>;
+@@ -65,7 +69,6 @@ export interface DshAdapterOptions {
+   readonly environmentId: string;
+   readonly preset: string;
+   readonly host: DshHostPort;
+-  readonly pollIntervalMs?: number;
+ }
+ 
+ const sessionIdFor = (environmentId: string, threadId: ThreadId) => {
+@@ -105,7 +108,7 @@ export const makeDshAdapter = Effect.fn("makeDshAdapter")(function* (options: Ds
+   // Re-observing an older terminal must never consume the next pending source input.
+   const monitorStates = new Map<string, { started: Set<TurnId>; terminalEmitted: Set<TurnId>; waiting: Map<TurnId, string>; emittedMessages: Set<number>; opened: Set<string>; resolved: Set<string> }>();
+   const pendingResponses = new Map<string, { sessionId: string; requestId: string; turnId: TurnId; nativeId: string; kind: "approval" | "question" }>();
+-  const pollIntervalMs = options.pollIntervalMs ?? 2000;
++  const monitorStops = new Map<string, () => void>();
+ 
+   const error = (method: string, detail: string): ProviderAdapterError => new ProviderAdapterRequestError({
+     provider: DRIVER, method, detail,
+@@ -128,8 +131,16 @@ export const makeDshAdapter = Effect.fn("makeDshAdapter")(function* (options: Ds
+       const state = monitorStates.get(key) ?? { started: new Set<TurnId>(), terminalEmitted: new Set<TurnId>(), waiting: new Map<TurnId, string>(), emittedMessages: new Set<number>(), opened: new Set<string>(), resolved: new Set<string>() };
+       monitorStates.set(key, state);
+       const { started, terminalEmitted, waiting, emittedMessages, opened, resolved } = state;
++      const notifications = new NativeRealtimeQueue<number>();
++      let closeWatch: (() => void) | undefined;
++      const stop = () => { notifications.close(); closeWatch?.(); };
++      monitorStops.set(key, stop);
+       try {
++        const cwd = sessions.get(threadId)?.cwd;
++        if (options.host.watchTurn && cwd) closeWatch = yield* remote("session/watch", () => options.host.watchTurn!(sessionId, cwd, () => notifications.mark(0)));
++        notifications.mark(0); // One opening reconciliation, then original notifications only.
+         while (sessions.has(threadId)) {
++          if ((yield* Effect.promise(signal => notifications.take(signal))) === undefined) return;
+           const snapshot = yield* remote("session/page", () => options.host.observe(sessionId, requestId))
+             .pipe(Effect.orElseSucceed((): Awaited<ReturnType<DshHostPort["observe"]>> => ({ status: "unknown" })));
+           if (!sessions.has(threadId)) return;
+@@ -219,9 +230,8 @@ export const makeDshAdapter = Effect.fn("makeDshAdapter")(function* (options: Ds
+             }
+           }
+           if (turns.every(turn => ["completed", "failed", "cancelled"].includes(turn.status) && turn.terminalSeq !== undefined) && !liveQuestions.size) return;
+-          yield* Effect.sleep(`${pollIntervalMs} millis`);
+         }
+-      } finally { monitoring.delete(key); }
++      } finally { stop(); monitorStops.delete(key); monitoring.delete(key); }
+     }).pipe(Effect.forkDetach, Effect.asVoid);
+ 
+   const startSession: ProviderAdapterShape<ProviderAdapterError>["startSession"] = (input) =>
+@@ -358,6 +368,7 @@ export const makeDshAdapter = Effect.fn("makeDshAdapter")(function* (options: Ds
+         if (!confirmed) return yield* error("stopSession", "Native cancellation unknown; original session retained");
+       }
+       if (saved) options.host.release?.(saved.sessionId);
++      for (const [key, stop] of monitorStops) if (key.startsWith(`${threadId}:`)) stop();
+       sessions.delete(threadId); requests.delete(threadId); attempted.delete(threadId);
+       for (const [key, pending] of pendingResponses) if (pending.sessionId === saved?.sessionId) pendingResponses.delete(key);
+     }),
+@@ -366,7 +377,7 @@ export const makeDshAdapter = Effect.fn("makeDshAdapter")(function* (options: Ds
+     readThread: (threadId) => Effect.sync(() => ({ threadId,
+       turns: [...(requests.get(threadId)?.values() ?? [])].map(id => ({ id, items: [] })) })),
+     rollbackThread: () => unsupported("rollbackThread"),
+-    stopAll: () => Effect.sync(() => { for (const session of sessions.values()) { const saved = cursor(session.resumeCursor); if (saved) options.host.release?.(saved.sessionId); } sessions.clear(); requests.clear(); attempted.clear(); pendingResponses.clear(); monitorStates.clear(); }),
++    stopAll: () => Effect.sync(() => { for (const stop of monitorStops.values()) stop(); monitorStops.clear(); for (const session of sessions.values()) { const saved = cursor(session.resumeCursor); if (saved) options.host.release?.(saved.sessionId); } sessions.clear(); requests.clear(); attempted.clear(); pendingResponses.clear(); monitorStates.clear(); }),
+     streamEvents: Stream.fromQueue(events),
+   };
+   return adapter;
+diff --git a/apps/server/src/provider/Layers/DshHistoryDiscovery.ts b/apps/server/src/provider/Layers/DshHistoryDiscovery.ts
+new file mode 100644
+index 00000000..8f77372a
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshHistoryDiscovery.ts
+@@ -0,0 +1,62 @@
++// @effect-diagnostics globalDate:off -- Pure conversion of original native event timestamps.
++// @effect-diagnostics nodeBuiltinImport:off -- Original native-file identity is part of this imperative provider transport.
++import { readdirSync, lstatSync, realpathSync } from "node:fs";
++import { join, isAbsolute, resolve } from "node:path";
++import type { DshSessionRpc } from "./DshHostProtocol.ts";
++
++export interface DshHistorySource {
++  readonly sessionId: string; readonly cwd: string; readonly title: string;
++  readonly preset: string; readonly model: string | null; readonly createdAt: string; readonly updatedAt: string;
++  readonly filePath: string; readonly mtimeMs: number;
++}
++const object = (v: unknown): Record<string, any> | null => v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : null;
++const id = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(v);
++const iso = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? new Date(value).toISOString() : null;
++
++/** One initial/user-requested metadata reconciliation. Detailed history stays in the original Session. */
++export async function discoverDshHistory(rpc: DshSessionRpc, home: string): Promise<readonly DshHistorySource[]> {
++  if (!isAbsolute(home) || realpathSync(home) !== resolve(home)) throw Error("Original DSH data home unavailable");
++  const listed = object(await rpc.call("session/list", { _request: {} }));
++  if (!Array.isArray(listed?.items)) throw Error("Original DSH metadata unavailable");
++  const candidates: Record<string, any>[] = [];
++  for (const row of listed.items) {
++    if (!id(row?.sessionId) || typeof row.cwd !== "string" || !isAbsolute(row.cwd) || row.parentSessionId || row.origin === "subagent") continue;
++    // The real Host omits projections for some cold v3 metadata rows. The exact-SID
++    // readonly endpoint observes their original history without promoting an Agent.
++    const projections = object(row.projections)?.values ? row.projections :
++      object(await rpc.call("session/projections", { request: { sessionId: row.sessionId } }));
++    const preset = projections?.values?.agentPreset;
++    if (typeof preset !== "string" || !preset.trim() || preset.length > 256 || /[\0\r\n]/.test(preset)) continue;
++    candidates.push({ ...row, projections });
++  }
++  const selected = new Set(candidates.map(row => row.sessionId)), files = new Map<string, string[]>();
++  const directory = join(home, "sessions");
++  for (const folder of readdirSync(directory, { withFileTypes: true })) {
++    if (!folder.isDirectory() || folder.isSymbolicLink()) continue;
++    for (const session of readdirSync(join(directory, folder.name), { withFileTypes: true })) {
++      if (!session.isDirectory() || session.isSymbolicLink() || !selected.has(session.name)) continue;
++      const root = join(directory, folder.name, session.name);
++      for (const name of ["session.v4.jsonl.zstd", "session.v3.jsonl.zstd"]) {
++        const file = join(root, name); let stat;
++        try { stat = lstatSync(file); } catch { continue; }
++        if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(file) !== file) continue;
++        const paths = files.get(session.name) ?? []; paths.push(file); files.set(session.name, paths); break;
++      }
++    }
++  }
++  const result: DshHistorySource[] = [], seen = new Set<string>();
++  for (const row of candidates) {
++    if (seen.has(row.sessionId)) throw Error("Original DSH session identity is duplicated"); seen.add(row.sessionId);
++    const paths = files.get(row.sessionId); if (paths?.length !== 1 || !iso(row.updatedAt)) continue;
++    const first = object(await rpc.call("session/page", { request: { address: { kind: "session", sessionId: row.sessionId }, throughSeq: 0, maxMessages: 1 } }));
++    const event = Array.isArray(first?.records) && first.records.length === 1 ? object(first.records[0]?.event) : null;
++    const createdAt = event?.seq === 0 ? iso(event.time) : null; if (!createdAt) continue;
++    const selection = object(row.projections.values.modelSelection?.next ?? row.projections.values.modelSelection?.lastUsed);
++    const model = typeof selection?.provider === "string" && typeof selection.model === "string" ? `${encodeURIComponent(selection.provider)}/${encodeURIComponent(selection.model)}` : null;
++    const filePath = paths[0]!, stat = lstatSync(filePath);
++    result.push({ sessionId: row.sessionId, cwd: row.cwd, preset: row.projections.values.agentPreset,
++      title: typeof row.projections.values.title === "string" && row.projections.values.title.trim() ? row.projections.values.title : row.sessionId,
++      model, createdAt, updatedAt: iso(row.updatedAt)!, filePath, mtimeMs: stat.mtimeMs });
++  }
++  return result;
++}
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.test.ts b/apps/server/src/provider/Layers/DshHostProtocol.test.ts
+index d611d9e7..c398e66a 100644
+--- a/apps/server/src/provider/Layers/DshHostProtocol.test.ts
++++ b/apps/server/src/provider/Layers/DshHostProtocol.test.ts
+@@ -16,7 +16,7 @@ it("reads the exact native turn and keeps an old Host model capability closed",
+   const rpc: DshSessionRpc = { call: async (method) => {
+     calls.push(method);
+     if (method === "session/list") return { items: [{ sessionId: "session-1", cwd: "/fixture/project", running: false,
+-      projections: { asOfSeq: 4, values: { agentPreset: "preset-1" } } }] };
++      projections: { asOfSeq: 4, values: { agentPreset: "preset-1", userQuestions: { active: [], settled: [] } } } }] };
+     if (method === "session/modelCatalog") return { groups: [], failures: [], routableProviders: [] };
+     if (method === "session/page") return { records: events.map(event => ({ type: "event", event })), hasMore: false };
+     if (method === "session/prompt") return { accepted: true };
+@@ -31,7 +31,7 @@ it("reads the exact native turn and keeps an old Host model capability closed",
+   await host.create("session-1", "/fixture/project", "preset-1");
+   await host.prompt("session-1", "request-1", "synthetic text");
+   Assert.deepEqual(await host.observe("session-1", "request-1"), {
+-    status: "completed", nativeTurn: 7, terminalSeq: 4, messages: [{ seq: 3, text: "private fixture" }],
++    status: "completed", nativeTurn: 7, terminalSeq: 4, messages: [{ seq: 3, text: "private fixture" }], approvals: [], questions: [], followUps: [],
+   });
+   Assert.ok(!JSON.stringify(description).includes("private fixture"));
+   Assert.equal(calls.filter(call => call === "session/prompt").length, 1);
+@@ -40,7 +40,7 @@ it("reads the exact native turn and keeps an old Host model capability closed",
+ it("does not promote a broken or foreign native history to completion", async () => {
+   const rpc = (source: typeof events): DshSessionRpc => ({ call: async (method) => {
+     if (method === "session/list") return { items: [{ sessionId: "session-1", cwd: "/fixture/project", running: false,
+-      projections: { asOfSeq: 4, values: { agentPreset: "preset-1" } } }] };
++      projections: { asOfSeq: 4, values: { agentPreset: "preset-1", userQuestions: { active: [], settled: [] } } } }] };
+     if (method === "session/page") return { records: source.map(event => ({ type: "event", event })), hasMore: false };
+     throw new Error("read only fixture");
+   } });
+@@ -135,9 +135,9 @@ it("excludes reasoning and other native turns from the visible reply", async ()
+     { seq: 8, type: "turn/end", data: { turn: 8, reason: { kind: "completed" } } },
+   ];
+   const host = makeDshHostProtocol({ call: async method => {
+-    if (method === "session/list") return { items: [{ sessionId: "session-1", running: false, projections: { asOfSeq: 8 } }] };
++    if (method === "session/list") return { items: [{ sessionId: "session-1", running: false, projections: { asOfSeq: 8, values: { userQuestions: { active: [], settled: [] } } } }] };
+     if (method === "session/page") return { records: native.map(event => ({ type: "event", event })), hasMore: false };
+     throw Error("read only");
+   } });
+-  Assert.deepEqual(await host.observe("session-1", "request-1"), { status: "completed", nativeTurn: 7, terminalSeq: 4, messages: [{ seq: 3, text: "visible" }] });
++  Assert.deepEqual(await host.observe("session-1", "request-1"), { status: "completed", nativeTurn: 7, terminalSeq: 4, messages: [{ seq: 3, text: "visible" }], approvals: [], questions: [], followUps: [] });
+ });
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.ts b/apps/server/src/provider/Layers/DshHostProtocol.ts
+index b4fa62eb..92daafd0 100644
+--- a/apps/server/src/provider/Layers/DshHostProtocol.ts
++++ b/apps/server/src/provider/Layers/DshHostProtocol.ts
+@@ -2,12 +2,14 @@
+ import type { ModelSelection, ServerProviderModel } from "@t3tools/contracts";
+ import type { DshHostPort, DshTurnObservation } from "./DshAdapter.ts";
+ import { readDshHistoryChunk } from "./DshNativeHistory.ts";
++import { discoverDshHistory } from "./DshHistoryDiscovery.ts";
++import { DshNativeNotifications } from "./DshNativeNotifications.ts";
+ import { DshRemoteEvents } from "./DshRemoteEvents.ts";
+ 
+ import type { ChatAttachment, RuntimeMode } from "@t3tools/contracts";
+ 
+-type DshMethod = "session/list" | "session/page" | "session/create" | "session/prompt" | "session/modelCatalog" | "session/selectModel" | "session/rename" | "permissionPresets/catalog" | "commands/execute" | "session/cancel" | "userQuestions/answer" | "$events/result";
+-export interface DshSessionRpc { call(method: DshMethod, args: object): Promise<unknown>; readonly events?: DshRemoteEvents; uploadFile?(sessionId: string, name: string, bytes: Uint8Array): Promise<unknown> }
++type DshMethod = "session/projections" | "session/list" | "session/page" | "session/create" | "session/prompt" | "session/modelCatalog" | "session/selectModel" | "session/rename" | "permissionPresets/catalog" | "commands/execute" | "session/cancel" | "userQuestions/answer" | "$events/result";
++export interface DshSessionRpc { call(method: DshMethod, args: object): Promise<unknown>; readonly events?: DshRemoteEvents; readonly notifications?: DshNativeNotifications; nativeSummary?(sessionId: string): Promise<unknown>; uploadFile?(sessionId: string, name: string, bytes: Uint8Array): Promise<unknown> }
+ 
+ export class DshTransportError extends Error {
+   readonly code: "unavailable" | "authentication_required" | "incompatible";
+@@ -25,11 +27,42 @@ export class HttpDshSessionRpc implements DshSessionRpc {
+   private readonly fetcher: typeof fetch;
+   private readonly timeoutMs: number;
+   readonly events: DshRemoteEvents;
++  readonly notifications: DshNativeNotifications;
++  private readonly summaries = new Map<string, SessionRow>();
++  private summarySubscribed: Promise<void> | undefined;
++  private closeSummary: (() => void) | undefined;
++  private summaryInitialized = false;
++  private summaryOpening: Promise<unknown> | undefined;
++  close(): void { this.closeSummary?.(); this.events.close(); this.notifications.close(); this.summaries.clear(); }
++  async nativeSummary(sessionId: string): Promise<unknown> {
++    if (!nativeId(sessionId)) throw new DshTransportError("incompatible");
++    this.summarySubscribed ??= this.events.watchHost((type, args) => {
++      if (type === "ready") { this.summaryInitialized = false; return; }
++      const first = args[0];
++      if (type === "api-session/added" && record(first) && typeof record(first)!.sessionId === "string") { const row = first as SessionRow; this.summaries.set(row.sessionId, row); }
++      if (typeof first !== "string" || !this.summaries.has(first)) return;
++      const row = this.summaries.get(first)!;
++      if (type === "api-session/status" && typeof args[1] === "boolean") this.summaries.set(first, { ...row, running: args[1], agentAvailable: true });
++      if (type === "api-session/removed") this.summaries.set(first, { ...row, running: false, agentAvailable: false });
++    }).then(close => { this.closeSummary = close; }).catch(error => { this.summarySubscribed = undefined; throw error; });
++    await this.summarySubscribed;
++    await this.events.refreshHost();
++    if (!this.summaryInitialized) {
++      this.summaryOpening ??= this.call("session/list", { _request: {} });
++      try { await this.summaryOpening; } finally { this.summaryOpening = undefined; }
++    }
++    const row = this.summaries.get(sessionId); if (!row) throw new DshTransportError("incompatible");
++    const projections = record(await this.call("session/projections", { request: { sessionId } }));
++    if (!projections || !integer(projections.asOfSeq) || !record(projections.values)) throw new DshTransportError("incompatible");
++    return { ...this.summaries.get(sessionId), projections };
++  }
++
+   constructor(resolveGatewayUrl: () => Promise<string>, fetcher: typeof fetch = fetch, timeoutMs = 5000) {
+     this.resolveGatewayUrl = resolveGatewayUrl;
+     this.fetcher = fetcher;
+     this.timeoutMs = timeoutMs;
+     this.events = new DshRemoteEvents(() => this.authenticate(), args => this.call("$events/result", args));
++    this.notifications = new DshNativeNotifications(() => this.authenticate(), process.env.DSH_HOME);
+     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new DshTransportError("incompatible");
+   }
+ 
+@@ -79,7 +112,7 @@ export class HttpDshSessionRpc implements DshSessionRpc {
+   }
+ 
+   async call(method: DshMethod, args: object): Promise<unknown> {
+-    if (!["session/list", "session/page", "session/create", "session/prompt", "session/modelCatalog", "session/selectModel", "session/rename", "permissionPresets/catalog", "commands/execute", "session/cancel", "userQuestions/answer", "$events/result"].includes(method)) {
++    if (!["session/projections", "session/list", "session/page", "session/create", "session/prompt", "session/modelCatalog", "session/selectModel", "session/rename", "permissionPresets/catalog", "commands/execute", "session/cancel", "userQuestions/answer", "$events/result"].includes(method)) {
+       throw new DshTransportError("incompatible");
+     }
+     const abort = new AbortController();
+@@ -110,6 +143,12 @@ export class HttpDshSessionRpc implements DshSessionRpc {
+       if (result?.type !== "server-response" || result.rpcId !== rpcId || payload?.ok !== true) {
+         throw new DshTransportError("incompatible");
+       }
++      if (method === "session/list") {
++        const listed = record(payload.value);
++        if (!Array.isArray(listed?.items)) throw new DshTransportError("incompatible");
++        this.summaries.clear(); for (const candidate of listed.items) { const row = record(candidate); if (row && typeof row.sessionId === "string") this.summaries.set(row.sessionId, candidate as SessionRow); }
++        this.summaryInitialized = true;
++      }
+       return payload.value;
+     } catch (error) {
+       // Native and fetch errors can contain the bearer URL or private task content.
+@@ -120,10 +159,15 @@ export class HttpDshSessionRpc implements DshSessionRpc {
+ }
+ 
+ interface NativeEvent { readonly seq: number; readonly type: string; readonly data: unknown }
+-interface SessionRow { readonly sessionId: string; readonly running: boolean; readonly cwd?: string;
++interface SessionRow { readonly sessionId: string; readonly running: boolean; readonly agentAvailable?: boolean; readonly cwd?: string;
+   readonly parentSessionId?: string; readonly origin?: string;
+   readonly projections?: { readonly asOfSeq: number; readonly values?: Record<string, unknown> } }
+ 
++async function exactRow(rpc: DshSessionRpc, sessionId: string): Promise<SessionRow | undefined> {
++  if (rpc.nativeSummary) return await rpc.nativeSummary(sessionId) as SessionRow;
++  const rows = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
++  if (rows.length !== 1) throw new DshTransportError("incompatible"); return rows[0];
++}
+ async function listRows(rpc: DshSessionRpc): Promise<SessionRow[]> {
+   const value = record(await rpc.call("session/list", { _request: {} }));
+   if (!Array.isArray(value?.items)) throw new DshTransportError("incompatible");
+@@ -179,6 +223,23 @@ async function readCatalog(rpc: DshSessionRpc) {
+ export function makeDshHostProtocol(rpc: DshSessionRpc, options: { attachmentsDir?: string } = {}): DshHostPort {
+   return {
+     ...(options.attachmentsDir ? { attachmentsDir: options.attachmentsDir } : {}),
++    discoverHistory: () => { if (!process.env.DSH_HOME) throw new DshTransportError("incompatible"); return discoverDshHistory(rpc, process.env.DSH_HOME); },
++    watchHistory: async (sessionId, cwd, changed) => {
++      if (!rpc.notifications) throw new DshTransportError("incompatible");
++      const matches = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
++      if (matches.length !== 1 || matches[0]?.cwd !== cwd || matches[0]?.parentSessionId || matches[0]?.origin === "subagent") throw new DshTransportError("incompatible");
++      const close = await rpc.notifications.watch(sessionId, cwd, changed); // No cold-session follow/promotion.
++      const closeRequests = rpc.events?.subscribe(sessionId, changed);
++      return () => { close(); closeRequests?.(); };
++    },
++    watchTurn: async (sessionId, cwd, changed) => {
++      if (!rpc.notifications) throw new DshTransportError("incompatible");
++      const matches = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
++      if (matches.length !== 1 || matches[0]?.cwd !== cwd || matches[0]?.parentSessionId || matches[0]?.origin === "subagent") throw new DshTransportError("incompatible");
++      const close = await rpc.notifications.watch(sessionId, cwd, changed, matches[0]?.agentAvailable === true);
++      const closeRequests = rpc.events?.subscribe(sessionId, changed);
++      return () => { close(); closeRequests?.(); };
++    },
+     retain: async sessionId => { if (!rpc.events) throw new DshTransportError("incompatible"); await rpc.events.retain(sessionId); },
+     release: sessionId => rpc.events?.release(sessionId),
+     permission: async (sessionId: string, mode: RuntimeMode) => {
+@@ -342,9 +403,8 @@ async function readExactPrompt(rpc: DshSessionRpc, sessionId: string, requestId:
+   const unknown = { status: "unknown" as const };
+   if (!nativeId(sessionId) || !nativeId(requestId)) return unknown;
+   try {
+-    const matches = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
+-    if (matches.length !== 1) return unknown;
+-    const row = matches[0]!;
++    const row = await exactRow(rpc, sessionId);
++    if (!row) return unknown;
+     const throughSeq = row.projections?.asOfSeq;
+     if (typeof row.running !== "boolean" || row.parentSessionId || row.origin === "subagent" || !integer(throughSeq)) return unknown;
+     const inbox = record(row.projections?.values?.inbox);
+diff --git a/apps/server/src/provider/Layers/DshNativeHistory.ts b/apps/server/src/provider/Layers/DshNativeHistory.ts
+index 816b1191..21ef5c89 100644
+--- a/apps/server/src/provider/Layers/DshNativeHistory.ts
++++ b/apps/server/src/provider/Layers/DshNativeHistory.ts
+@@ -6,7 +6,7 @@ import { nativeVisibleText, object, type NativeHistory, type NativeTurn } from "
+ export async function readDshHistoryChunk(rpc: DshSessionRpc, sessionId: string, cwd: string, preset: string, checkpoint?: unknown): Promise<NativeHistory> {
+   const saved = object(checkpoint);
+   const afterSeq = saved?.version === 2 && Number.isSafeInteger(saved?.afterSeq) && saved!.afterSeq >= -1 ? saved!.afterSeq as number : -1;
+-  const listed = object(await rpc.call("session/list", { _request: {} }));
++  const listed = rpc.nativeSummary ? { items: [await rpc.nativeSummary(sessionId)] } : object(await rpc.call("session/list", { _request: {} }));
+   const matches = Array.isArray(listed?.items) ? listed.items.filter(r => r.sessionId === sessionId) : [];
+   const row = matches[0], head = row?.projections?.asOfSeq;
+   if (matches.length !== 1 || row.cwd !== cwd || row.projections?.values?.agentPreset !== preset || row.parentSessionId || row.origin === "subagent" || !Number.isSafeInteger(head) || head < afterSeq || typeof row.running !== "boolean") throw Error("Original DSH history scope changed");
+diff --git a/apps/server/src/provider/Layers/DshNativeNotifications.ts b/apps/server/src/provider/Layers/DshNativeNotifications.ts
+new file mode 100644
+index 00000000..b7e96605
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshNativeNotifications.ts
+@@ -0,0 +1,192 @@
++// @effect-diagnostics nodeBuiltinImport:off -- Filesystem subscriptions belong to this imperative original-source transport.
++// @effect-diagnostics globalTimers:off -- Filesystem event coalescing and disconnected-carrier backoff only.
++import { watch, existsSync, realpathSync, readdirSync, lstatSync, type FSWatcher } from "node:fs";
++import { join, resolve, isAbsolute } from "node:path";
++import { randomUUID } from "node:crypto";
++import { NodeWS } from "@effect/platform-node/NodeSocket";
++const WebSocket = NodeWS.WebSocket;
++const object = (value: unknown): Record<string, any> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : null;
++const nativeId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
++const seq = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= -1;
++
++/** Notification cursor is separate from the durable history checkpoint. Opening snapshots repair gaps. */
++export class DshFollowCursor {
++  private next: number | null = null;
++  private maximum = -1;
++  readonly sessionId: string;
++  readonly cwd: string;
++  constructor(sessionId: string, cwd: string) { this.sessionId = sessionId; this.cwd = cwd; }
++  accept(value: unknown): boolean {
++    const frame = object(value); if (!frame) throw Error("Invalid original DSH follow frame");
++    if (frame.type === "snapshot") {
++      if (this.next !== null || frame.header?.id !== this.sessionId || frame.header?.cwd !== this.cwd ||
++          frame.header?.parentSession != null || frame.header?.origin === "subagent" || !seq(frame.cursor) || frame.cursor < this.maximum)
++        throw Error("Original DSH follow scope changed");
++      this.next = frame.cursor + 1; const changed = frame.cursor > this.maximum; this.maximum = frame.cursor; return changed;
++    }
++    if (this.next === null || frame.type !== "event" || !seq(frame.event?.seq)) throw Error("Original DSH follow opening unavailable");
++    const cursor = frame.event.seq;
++    if (cursor < this.next) return false;
++    if (cursor !== this.next) throw Error("Original DSH follow sequence gap");
++    this.next++; this.maximum = cursor; return true;
++  }
++  reconnect(): void { this.next = null; }
++}
++interface Entry { cwd: string; listeners: Set<() => void>; ownedFollowers: number; cursor: DshFollowCursor; files: Map<string, string>; filesInitialized: boolean }
++const historyFiles = ["session.v4.jsonl.zstd", "session.v3.jsonl.zstd"];
++
++/** Cold native history uses file notifications and control; follow is limited to an already-live owned turn. */
++export class DshNativeNotifications {
++  private readonly entries = new Map<string, Entry>();
++  private readonly streams = new Map<string, { sessionId?: string; control?: true }>();
++  private readonly projections = new Map<string, string>();
++  private socket: InstanceType<typeof WebSocket> | null = null;
++  private fileWatch: FSWatcher | undefined;
++  private connecting: Promise<void> | undefined;
++  private retry: ReturnType<typeof setTimeout> | undefined;
++  private burst: ReturnType<typeof setTimeout> | undefined;
++  private readonly pending = new Set<string>();
++  private generation = 0;
++  private retryMs = 1000;
++  private closed = false;
++  private readonly authenticate: () => Promise<{ origin: string; cookie: string }>;
++  private readonly home: string | undefined;
++  constructor(authenticate: () => Promise<{ origin: string; cookie: string }>, home?: string) { this.authenticate = authenticate; this.home = home; }
++  async watch(sessionId: string, cwd: string, changed: () => void, ownedFollow = false): Promise<() => void> {
++    if (this.closed || !nativeId(sessionId) || !isAbsolute(cwd)) throw Error("Original DSH watch scope unavailable");
++    let entry = this.entries.get(sessionId);
++    if (entry && entry.cwd !== cwd) throw Error("Original DSH watch workspace conflict");
++    if (!entry) { entry = { cwd, listeners: new Set(), ownedFollowers: 0, cursor: new DshFollowCursor(sessionId, cwd), files: new Map(), filesInitialized: false }; this.entries.set(sessionId, entry); }
++    entry.listeners.add(changed); if (ownedFollow) entry.ownedFollowers++;
++    try { this.ensureFiles(sessionId, entry); }
++    catch (error) { entry.listeners.delete(changed); if (ownedFollow) entry.ownedFollowers--; if (!entry.listeners.size) this.entries.delete(sessionId); if (!this.entries.size) this.release(); throw error; }
++    // A temporary carrier/authentication outage keeps the exact file subscription alive.
++    await this.ensure().catch(() => this.reconnectLater()); this.openFollow(sessionId, entry);
++    let disposed = false;
++    return () => {
++      if (disposed) return; disposed = true; entry!.listeners.delete(changed); if (ownedFollow) entry!.ownedFollowers--;
++      if (!entry!.ownedFollowers) for (const [streamId, stream] of this.streams) if (stream.sessionId === sessionId) { this.send({ type: "cancel", streamId }); this.streams.delete(streamId); }
++      if (!entry!.listeners.size) { this.entries.delete(sessionId); for (const [streamId, stream] of this.streams) if (stream.sessionId === sessionId) { this.send({ type: "cancel", streamId }); this.streams.delete(streamId); } }
++      if (!this.entries.size) this.release();
++    };
++  }
++  close(): void { this.closed = true; this.entries.clear(); this.release(); }
++  private fileSignature(file: string): string {
++    try {
++      const stat = lstatSync(file);
++      if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(file) !== file) return "unavailable";
++      return JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
++    } catch { return "unavailable"; }
++  }
++  private refreshFiles(id: string, workspace?: string): void {
++    const entry = this.entries.get(id); if (!entry || !this.home) return;
++    if (workspace) for (const name of historyFiles) {
++      const file = join(this.home, "sessions", workspace, id, name);
++      if (!entry.files.has(file)) entry.files.set(file, "unavailable");
++    }
++    let changed = false;
++    for (const [file, prior] of entry.files) {
++      const next = this.fileSignature(file);
++      if (next !== prior) { entry.files.set(file, next); changed = true; }
++    }
++    if (changed) this.schedule(id);
++  }
++  private ensureFiles(id: string, entry: Entry): void {
++    if (!this.home) return;
++    if (!isAbsolute(this.home) || realpathSync(this.home) !== resolve(this.home)) throw Error("Original DSH data home unavailable");
++    const directory = join(this.home, "sessions"); if (!existsSync(directory)) throw Error("Original DSH history directory unavailable");
++    if (!this.fileWatch) {
++      this.fileWatch = watch(directory, { recursive: true }, (_kind, name) => {
++        if (name === null) { for (const key of this.entries.keys()) this.refreshFiles(key); return; }
++        const parts = String(name).split(/[\\/]/);
++        if (parts.some(part => !part || part === "." || part === "..") || parts.length < 2) return;
++        if (parts.length === 2 || (parts.length === 3 && historyFiles.includes(parts[2]!))) this.refreshFiles(parts[1]!, parts[0]);
++      });
++      this.fileWatch.on("error", () => { for (const key of this.entries.keys()) this.schedule(key); });
++    }
++    if (entry.filesInitialized) return;
++    // One opening metadata reconciliation; subsequent callbacks stat only the exact SID files.
++    for (const folder of readdirSync(directory, { withFileTypes: true })) {
++      if (!folder.isDirectory() || folder.isSymbolicLink()) continue;
++      for (const name of historyFiles) {
++        const file = join(directory, folder.name, id, name); entry.files.set(file, this.fileSignature(file));
++      }
++    }
++    entry.filesInitialized = true;
++  }
++  private schedule(id: string): void {
++    this.pending.add(id); if (this.burst !== undefined) return;
++    this.burst = setTimeout(() => { this.burst = undefined; const ids = [...this.pending]; this.pending.clear(); for (const id of ids) this.notify(id); }, 60); this.burst.unref();
++  }
++  private notify(id: string): void { for (const listener of this.entries.get(id)?.listeners ?? []) listener(); }
++  private send(value: object): void { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(value)); }
++  private reconnectLater(): void {
++    if (!this.entries.size || this.closed || this.retry !== undefined) return;
++    const generation = this.generation, delay = this.retryMs; this.retryMs = Math.min(30000, delay * 2);
++    this.retry = setTimeout(() => {
++      this.retry = undefined;
++      if (generation === this.generation) void this.ensure().catch(() => this.reconnectLater());
++    }, delay); this.retry.unref();
++  }
++  private openFollow(id: string, entry: Entry): void {
++    if (!entry.ownedFollowers || this.socket?.readyState !== WebSocket.OPEN || [...this.streams.values()].some(s => s.sessionId === id)) return;
++    const streamId = randomUUID(); this.streams.set(streamId, { sessionId: id }); entry.cursor.reconnect();
++    this.send({ type: "open", streamId, endpoint: "session/follow", payload: { args: { request: { address: { kind: "session", sessionId: id }, maxMessages: 1 } } } });
++  }
++  private async ensure(): Promise<void> {
++    if (this.socket?.readyState === WebSocket.OPEN) return;
++    if (this.connecting) return this.connecting;
++    this.connecting = this.connect(); try { await this.connecting; } finally { this.connecting = undefined; }
++  }
++  private async connect(): Promise<void> {
++    const generation = this.generation, auth = await this.authenticate();
++    if (generation !== this.generation || !this.entries.size) throw Error("Original DSH watch expired");
++    await new Promise<void>((ready, reject) => {
++      const socket = new WebSocket(auth.origin.replace(/^http:/, "ws:") + "/api/remote.mux", {
++        headers: { Cookie: auth.cookie, Origin: auth.origin }, maxPayload: 4 * 1024 * 1024, handshakeTimeout: 5000,
++      });
++      this.socket = socket; this.streams.clear(); let opened = false, revoked = false;
++      const deadline = setTimeout(() => { socket.close(); reject(Error("Original DSH control opening unavailable")); }, 5000);
++      const revoke = () => {
++        if (revoked) return; revoked = true; clearTimeout(deadline);
++        if (this.socket === socket) { this.socket = null; this.streams.clear(); }
++        if (!opened) reject(Error("Original DSH event carrier unavailable"));
++        if (generation === this.generation && this.entries.size && !this.closed && this.retry === undefined) {
++          for (const id of this.entries.keys()) this.notify(id);
++          this.reconnectLater();
++        }
++      };
++      socket.on("error", revoke); socket.on("close", revoke);
++      socket.on("open", () => {
++        if (generation !== this.generation || !this.entries.size) { socket.close(); return; }
++        const streamId = randomUUID(); this.streams.set(streamId, { control: true });
++        this.send({ type: "open", streamId, endpoint: "session/control", payload: { args: {} } });
++      });
++      socket.on("message", (bytes, binary) => {
++        try {
++          if (binary || this.socket !== socket || generation !== this.generation) throw Error("Invalid original DSH carrier");
++          const frame = object(JSON.parse(bytes.toString())), stream = this.streams.get(frame?.streamId);
++          if (!stream) return;
++          if (frame?.type !== "item") throw Error("Original DSH event stream ended");
++          const value = object(frame.value); if (!value) throw Error("Invalid original DSH notification");
++          if (stream.control) {
++            if (value.type === "baseline" && !opened && object(value.value?.projections)) {
++              opened = true; this.retryMs = 1000; clearTimeout(deadline);
++              for (const [id, entry] of this.entries) { this.notify(id); this.openFollow(id, entry); }
++              ready(); return;
++            }
++            if (!opened || value.type !== "projection" || !nativeId(value.sessionId) || !seq(value.seq) || typeof value.key !== "string") throw Error("Invalid original DSH control frame");
++            const key = JSON.stringify([value.sessionId, value.key]), signature = JSON.stringify([value.seq, value.value]);
++            if (this.projections.get(key) !== signature) { this.projections.set(key, signature); this.schedule(value.sessionId); }
++          } else if (stream.sessionId && this.entries.get(stream.sessionId)?.cursor.accept(value)) this.schedule(stream.sessionId);
++        } catch { socket.close(); revoke(); }
++      });
++    });
++  }
++  private release(): void {
++    this.generation++; const socket = this.socket; this.socket = null; socket?.close(); this.streams.clear(); this.projections.clear();
++    this.fileWatch?.close(); this.fileWatch = undefined;
++    if (this.retry !== undefined) clearTimeout(this.retry); this.retry = undefined;
++    if (this.burst !== undefined) clearTimeout(this.burst); this.burst = undefined; this.pending.clear();
++  }
++}
+diff --git a/apps/server/src/provider/Layers/DshRemoteEvents.ts b/apps/server/src/provider/Layers/DshRemoteEvents.ts
+index 4e9bd32e..4e23ae1f 100644
+--- a/apps/server/src/provider/Layers/DshRemoteEvents.ts
++++ b/apps/server/src/provider/Layers/DshRemoteEvents.ts
+@@ -21,6 +21,16 @@ const id = (value: unknown): value is string => typeof value === "string" && val
+  */
+ export class DshRemoteEvents {
+   private readonly owned = new Set<string>();
++  private readonly hostListeners = new Set<(type: string, args: readonly unknown[]) => void>();
++  async watchHost(changed: (type: string, args: readonly unknown[]) => void): Promise<() => void> {
++    this.hostListeners.add(changed); try { await this.ensure(); } catch (error) { this.hostListeners.delete(changed); throw error; }
++    return () => { this.hostListeners.delete(changed); if (!this.alive() && !this.hostListeners.size) this.close(); };
++  }
++  private alive(): boolean { return this.owned.size > 0 || this.hostListeners.size > 0; }
++
++  private readonly listeners = new Map<string, Set<() => void>>();
++  subscribe(sessionId: string, changed: () => void): () => void { const listeners = this.listeners.get(sessionId) ?? new Set(); this.listeners.set(sessionId, listeners); listeners.add(changed); return () => { listeners.delete(changed); if (!listeners.size) this.listeners.delete(sessionId); }; }
++  private notify(sessionId: string): void { for (const changed of this.listeners.get(sessionId) ?? []) changed(); }
+   private readonly submitted = new Set<string>();
+   private readonly pending = new Map<string, DshRemoteEvent>();
+   private socket: InstanceType<typeof WebSocket> | null = null;
+@@ -40,7 +50,7 @@ export class DshRemoteEvents {
+   release(sessionId: string): void {
+     this.owned.delete(sessionId);
+     for (const [key, frame] of this.pending) if (frame.agentId === sessionId) this.pending.delete(key);
+-    if (!this.owned.size) this.close();
++    if (!this.alive()) this.close();
+   }
+   close(): void {
+     this.generation++;
+@@ -52,6 +62,7 @@ export class DshRemoteEvents {
+     if (!this.owned.has(sessionId) || !this.clientId || this.socket?.readyState !== WebSocket.OPEN) return [];
+     return [...this.pending.values()].filter(frame => frame.agentId === sessionId && frame.clientId === this.clientId);
+   }
++  async refreshHost(): Promise<void> { if (!this.hostListeners.size) throw Error("dsh_request_expired"); await this.ensure(); }
+   async refresh(sessionId: string): Promise<void> {
+     if (!this.owned.has(sessionId)) throw Error("dsh_request_expired");
+     await this.ensure();
+@@ -73,7 +84,7 @@ export class DshRemoteEvents {
+   private async connect(): Promise<void> {
+     const generation = this.generation;
+     const { origin, cookie } = await this.authenticate();
+-    if (generation !== this.generation || !this.owned.size) throw Error("dsh_request_expired");
++    if (generation !== this.generation || !this.alive()) throw Error("dsh_request_expired");
+     const streamId = randomUUID();
+     await new Promise<void>((resolve, reject) => {
+       const socket = new WebSocket(origin.replace(/^http:/, "ws:") + "/api/remote.mux", {
+@@ -89,22 +100,26 @@ export class DshRemoteEvents {
+       };
+       socket.on("error", revoke); socket.on("close", revoke);
+       socket.on("open", () => {
+-        if (generation !== this.generation || !this.owned.size) { socket.close(); revoke(); return; }
++        if (generation !== this.generation || !this.alive()) { socket.close(); revoke(); return; }
+         socket.send(JSON.stringify({ type: "open", streamId, endpoint: "$events", payload: { args: {} } }));
+       });
+       socket.on("message", (bytes, binary) => {
+         try {
+-          if (binary || this.socket !== socket || generation !== this.generation || !this.owned.size) throw Error("dsh_events_invalid");
++          if (binary || this.socket !== socket || generation !== this.generation || !this.alive()) throw Error("dsh_events_invalid");
+           const frame = object(JSON.parse(bytes.toString()));
+           if (frame?.streamId !== streamId || frame.type !== "item") throw Error("dsh_events_invalid");
+           const value = object(frame.value);
+           if (!value) throw Error("dsh_events_invalid");
+           if (value.type === "ready" && id(value.clientId) && !ready) {
+-            this.clientId = value.clientId; ready = true; clearTimeout(timer); resolve(); return;
++            this.clientId = value.clientId; ready = true; clearTimeout(timer); for (const id of this.owned) this.notify(id); for (const listener of this.hostListeners) listener("ready", []); resolve(); return;
+           }
+           if (!ready || !this.clientId) throw Error("dsh_events_invalid");
+-          if (value.type === "cancel" && id(value.eventId)) { this.pending.delete(value.eventId); return; }
+-          if (value.type === "emit") return;
++          if (value.type === "cancel" && id(value.eventId)) { const old = this.pending.get(value.eventId); this.pending.delete(value.eventId); if (old) this.notify(old.agentId); return; }
++          if (value.type === "emit") {
++            if (typeof value.event !== "string" || !Array.isArray(value.args)) throw Error("dsh_events_invalid");
++            for (const listener of this.hostListeners) listener(value.event, value.args);
++            if (typeof value.args[0] === "string") this.notify(value.args[0]); return;
++          }
+           const request = object(value.request);
+           if (value.type !== "waterfall" || !id(value.eventId) || !id(value.agentId) || !id(value.event) || !request)
+             throw Error("dsh_events_invalid");
+@@ -116,6 +131,7 @@ export class DshRemoteEvents {
+           if (this.pending.size >= 128 || this.pending.has(value.eventId)) throw Error("dsh_events_invalid");
+           this.pending.set(value.eventId, { clientId: this.clientId, eventId: value.eventId,
+             agentId: value.agentId, event: value.event as DshRemoteEvent["event"], request, submitted: this.submitted.has(value.eventId) });
++          this.notify(value.agentId);
+         } catch { socket.close(); revoke(); }
+       });
+     });
+diff --git a/apps/server/src/provider/Services/ProviderAdapter.ts b/apps/server/src/provider/Services/ProviderAdapter.ts
+index 94ffcd7d..2846c423 100644
+--- a/apps/server/src/provider/Services/ProviderAdapter.ts
++++ b/apps/server/src/provider/Services/ProviderAdapter.ts
+@@ -132,7 +132,9 @@ export interface ProviderAdapterShape<TError> {
+   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
+ 
+   /** Scoped callers validate durable parent/child ownership before invoking this read. */
+-  readonly readNativeThread?: (input: { readonly threadId: string; readonly cwd: string; readonly includeTurns: boolean; readonly checkpoint?: unknown }) => Effect.Effect<unknown, TError>;
++  /** Original-source notifications only; never loads a thread or acquires its writer. */
++  readonly watchNativeThread?: (input: { readonly threadId: string; readonly cwd: string }, changed: () => void) => Effect.Effect<() => void, TError>;
++  readonly readNativeThread?: (input: { readonly threadId: string; readonly cwd: string; readonly includeTurns: boolean; readonly nativePreset?: string; readonly checkpoint?: unknown }) => Effect.Effect<unknown, TError>;
+ 
+   /**
+    * Roll back a provider thread by N turns.
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 571af5fa..65378199 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -457,10 +457,9 @@ const DshHostLayerLive = Layer.effect(
+     const environment = yield* ServerEnvironment.ServerEnvironment;
+     const environmentId = yield* environment.getEnvironmentId;
+     const config = yield* ServerConfig.ServerConfig;
+-    return { environmentId,
+-      port: makeDshHostProtocol(new HttpDshSessionRpc(() =>
+-        resolveDshGatewayUrl(process.env.AAAAGENT_DSH_WEB_LOG)), { attachmentsDir: config.attachmentsDir }),
+-    };
++    const rpc = new HttpDshSessionRpc(() => resolveDshGatewayUrl(process.env.AAAAGENT_DSH_WEB_LOG));
++    yield* Effect.addFinalizer(() => Effect.sync(() => rpc.close()));
++    return { environmentId, port: makeDshHostProtocol(rpc, { attachmentsDir: config.attachmentsDir }) };
+   }),
+ );
+ 
+diff --git a/apps/web/src/components/onboarding/WelcomeWizard.tsx b/apps/web/src/components/onboarding/WelcomeWizard.tsx
+index 66e99359..d6ceec4f 100644
+--- a/apps/web/src/components/onboarding/WelcomeWizard.tsx
++++ b/apps/web/src/components/onboarding/WelcomeWizard.tsx
+@@ -1008,7 +1008,7 @@ function ImportStep({
+     [scans],
+   );
+   const selectedKeys = useMemo(
+-    () => selectedPaths ?? new Set(recent.map((candidate) => candidate.key)),
++    () => selectedPaths ?? new Set<string>(),
+     [selectedPaths, recent],
+   );
+   const selected = candidates.filter((candidate) => selectedKeys.has(candidate.key));
+@@ -1158,7 +1158,7 @@ function ImportStep({
+         <div className="flex flex-1 flex-col items-center justify-center gap-3 py-6">
+           <Spinner size="lg" tone="muted" />
+           <p className="text-center text-sm text-muted-foreground">
+-            Looking for projects from Claude Code and Codex…
++            Looking for projects from Codex, DeepSeek Harness and Claude Code…
+           </p>
+         </div>
+         <div className="flex justify-end">
+@@ -1173,7 +1173,7 @@ function ImportStep({
+   return (
+     <StepShell
+       title="Choose your projects"
+-      description="Import projects and conversations from your selected computers."
++      description="Choose which projects to import, including older conversations. Imported conversations stay synchronized."
+     >
+       {candidates.length > 0 ? (
+         <div className="mt-5 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+@@ -1235,7 +1235,7 @@ function ImportStep({
+                   </div>
+                 ) : scanCandidates.length === 0 ? (
+                   <p className="py-2 text-sm text-muted-foreground">
+-                    No existing Claude Code or Codex projects found.
++                    No existing Codex, DeepSeek Harness or Claude Code projects found.
+                   </p>
+                 ) : null}
+                 {scan.data?.truncated ? (
+@@ -1469,7 +1469,7 @@ function ImportRowMeta({
+   threadCount,
+   lastActiveAt,
+ }: {
+-  readonly sources: ReadonlyArray<"claudeAgent" | "codex"> | null;
++  readonly sources: ReadonlyArray<"claudeAgent" | "codex" | "dsh"> | null;
+   readonly threadCount: number;
+   readonly lastActiveAt: string | null;
+ }) {
+@@ -1477,7 +1477,7 @@ function ImportRowMeta({
+   // "just now" does not fit the fixed column, so collapse it.
+   const age = relative === null ? "" : relative.suffix === null ? "now" : relative.value;
+   return (
+-    <span className="ml-auto grid shrink-0 grid-cols-[1rem_1rem_2.5rem_2.25rem] items-center gap-x-1 text-xs text-muted-foreground tabular-nums">
++    <span className="ml-auto grid shrink-0 grid-cols-[1rem_1rem_1rem_2.5rem_2.25rem] items-center gap-x-1 text-xs text-muted-foreground tabular-nums">
+       <span className="flex size-4 items-center justify-center">
+         {sources?.includes("claudeAgent") ? (
+           <ClaudeAI className="size-3" aria-label="Claude Code" />
+@@ -1486,6 +1486,7 @@ function ImportRowMeta({
+       <span className="flex size-4 items-center justify-center">
+         {sources?.includes("codex") ? <OpenAI className="size-3" aria-label="Codex" /> : null}
+       </span>
++      <span className="flex size-4 items-center justify-center">{sources?.includes("dsh") ? <span className="text-[9px] font-semibold" aria-label="DeepSeek Harness" title="DeepSeek Harness">DS</span> : null}</span>
+       <span className="text-right">{threadCount}</span>
+       <span className="text-right whitespace-nowrap">{age}</span>
+     </span>
+diff --git a/packages/contracts/src/agentSessions.ts b/packages/contracts/src/agentSessions.ts
+index 91c18117..b9491309 100644
+--- a/packages/contracts/src/agentSessions.ts
++++ b/packages/contracts/src/agentSessions.ts
+@@ -2,8 +2,8 @@ import * as Schema from "effect/Schema";
+ import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+ import { ProviderInstanceId } from "./providerInstance.ts";
+ 
+-/** Coding agent home directories the scanner knows how to read. */
+-export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex"]);
++/** Original native sources the scanner can discover without activating an Agent. */
++export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "dsh"]);
+ export type AgentSessionSource = typeof AgentSessionSource.Type;
+ 
+ /** File identity saved with an imported session so bounded retries can skip unchanged history. */

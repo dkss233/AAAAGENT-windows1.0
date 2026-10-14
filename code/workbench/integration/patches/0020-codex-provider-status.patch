@@ -1,0 +1,29 @@
+diff --git a/apps/server/src/provider/Layers/CodexProvider.ts b/apps/server/src/provider/Layers/CodexProvider.ts
+--- a/apps/server/src/provider/Layers/CodexProvider.ts
++++ b/apps/server/src/provider/Layers/CodexProvider.ts
+@@ -33,7 +33,6 @@
+ import { resolveSpawnCommand } from "@t3tools/shared/shell";
+ import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+ import {
+-  AUTH_PROBE_TIMEOUT_MS,
+   buildServerProvider,
+   COMPACT_SLASH_COMMAND,
+   type ServerProviderDraft,
+@@ -48,6 +47,8 @@
+ } from "./codexUsageLimits.ts";
+ import packageJson from "../../../package.json" with { type: "json" };
+ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
++// A full status probe includes pinned startup, authentication, and the model catalog.
++const CODEX_PROVIDER_STATUS_TIMEOUT_MS = 30_000;
+ const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
+ 
+ type CodexRateLimitsProbe =
+@@ -608,7 +609,7 @@
+     environment: resolvedEnvironment,
+   }).pipe(
+     Effect.scoped,
+-    Effect.timeoutOption(Duration.millis(AUTH_PROBE_TIMEOUT_MS)),
++    Effect.timeoutOption(Duration.millis(CODEX_PROVIDER_STATUS_TIMEOUT_MS)),
+     Effect.result,
+   );
+ 

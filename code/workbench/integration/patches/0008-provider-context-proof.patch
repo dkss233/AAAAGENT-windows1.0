@@ -1,0 +1,208 @@
+diff --git a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+index f855771..e9eb0cb 100644
+--- a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
++++ b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+@@ -132,2 +132,28 @@ const hasMetricSnapshot = (
+ describe("OrchestrationEngine", () => {
++  it("rejects an unproved project sidecar before a receipt or event is written", async () => {
++    const system = await createOrchestrationSystem();
++    const commandId = CommandId.make("unproved-project-context");
++    const invalid = {
++      type: "thread.turn.start", commandId, threadId: ThreadId.make("thread-unproved"),
++      message: { messageId: asMessageId("message-unproved"), role: "user", text: "Reviewed text",
++        attachments: [] },
++      interactionMode: "default", runtimeMode: "approval-required", createdAt: now(),
++      providerOnlyProjectContext: { version: 1, commandId,
++        messageId: asMessageId("message-unproved"), threadId: ThreadId.make("thread-unproved"),
++        t3ProjectId: ProjectId.make("native-project"), providerInstanceId: ProviderInstanceId.make("codex"),
++        modelId: "model", branchRef: null, snapshotSequence: 0, draftId: "draft", draftVersion: 1,
++        fingerprint: "a".repeat(64), context: { version: 1, records: [] } },
++    } as const;
++    await expect(system.run(system.engine.dispatch(invalid))).rejects.toThrow(
++      "Invalid private project context proof",
++    );
++    expect((await system.readModel()).snapshotSequence).toBe(0);
++    // The same command id is still free: invalid proof never reached the receipt repository.
++    const accepted = await system.run(system.engine.dispatch({ type: "project.create", commandId,
++      projectId: ProjectId.make("native-project"), title: "Native project",
++      workspaceRoot: "/tmp/native-project", createdAt: now() }));
++    expect(accepted.sequence).toBeGreaterThan(0);
++    await system.dispose();
++  });
++
+   it.each(["running", "stopped"] as const)(
+diff --git a/apps/server/src/orchestration/Layers/OrchestrationEngine.ts b/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
+index 9136d08..248913a 100644
+--- a/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
++++ b/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
+@@ -43,2 +43,3 @@ import {
+ import { decideOrchestrationCommand } from "../decider.ts";
++import { verifyProviderContextProof } from "../ProviderContextProof.ts";
+ import { createEmptyReadModel, projectEvent } from "../projector.ts";
+@@ -439,2 +440,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+     Effect.gen(function* () {
++      if (!verifyProviderContextProof(command, process.env.AAAAGENT_T3_PROJECT_CONTEXT_HMAC)) {
++        return yield* new OrchestrationCommandInvariantError({
++          commandType: command.type,
++          detail: "Invalid private project context proof.",
++        });
++      }
+       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
+diff --git a/apps/server/src/orchestration/ProviderContextProof.test.ts b/apps/server/src/orchestration/ProviderContextProof.test.ts
+new file mode 100644
+index 0000000..f17e599
+--- /dev/null
++++ b/apps/server/src/orchestration/ProviderContextProof.test.ts
+@@ -0,0 +1,68 @@
++// @effect-diagnostics nodeBuiltinImport:off
++import { createHash, createHmac } from "node:crypto";
++import type { OrchestrationCommand } from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++import { providerContextProofPayload, verifyProviderContextProof } from "./ProviderContextProof.ts";
++
++const key = "ab".repeat(32);
++function signedCommand(): Extract<OrchestrationCommand, { type: "thread.turn.start" }> {
++  const binding = {
++    projectId: "logical-project", taskId: "task-1", environmentId: "environment-1",
++    threadId: "thread-1", providerInstanceId: "codex", modelId: "model-1",
++    branchRef: "main", snapshotSequence: 7, commandId: "command-1", draftId: "draft-1",
++    draftVersion: 2, messageId: "message-1",
++  };
++  const records = [{ version: 1, contextId: "memory-1", label: "项目记忆", kind: "project-memory",
++    payload: { status: "accepted", projectId: binding.projectId, id: "memory-1", version: 3,
++      kind: "fact", text: "Reviewed project fact", sources: [{ taskId: binding.taskId,
++        recordedAt: "2026-09-27T00:00:00.000Z" }] } }];
++  const text = "Reviewed command";
++  const fingerprint = createHash("sha256").update(JSON.stringify(["0.1.1", binding, text, records])).digest("hex");
++  const command = {
++    type: "thread.turn.start", commandId: binding.commandId, threadId: binding.threadId,
++    message: { messageId: binding.messageId, role: "user", text, attachments: [] },
++    runtimeMode: "approval-required", interactionMode: "default",
++    createdAt: "2026-09-27T00:00:00.000Z",
++    providerOnlyProjectContext: {
++      version: 1, commandId: binding.commandId, messageId: binding.messageId,
++      threadId: binding.threadId, t3ProjectId: "native-project", providerInstanceId: binding.providerInstanceId,
++      modelId: binding.modelId, branchRef: binding.branchRef, snapshotSequence: binding.snapshotSequence,
++      draftId: binding.draftId, draftVersion: binding.draftVersion, fingerprint,
++      context: { version: 1, records }, proof: { version: 1, projectId: binding.projectId,
++        taskId: binding.taskId, environmentId: binding.environmentId, mac: "0".repeat(64) },
++    },
++  } as unknown as Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
++  const sidecar = command.providerOnlyProjectContext!;
++  return { ...command, providerOnlyProjectContext: { ...sidecar,
++    proof: { ...sidecar.proof!, mac: createHmac("sha256", Buffer.from(key, "hex"))
++      .update(providerContextProofPayload(command, sidecar)).digest("hex") } } };
++}
++
++describe("private project context proof", () => {
++  it("accepts the exact committed tuple and leaves ordinary turns unchanged", () => {
++    const command = signedCommand();
++    expect(verifyProviderContextProof(command, key)).toBe(true);
++    expect(verifyProviderContextProof({ ...command, providerOnlyProjectContext: undefined }, undefined)).toBe(true);
++  });
++
++  it("rejects missing key/proof and every altered frozen identity or material", () => {
++    const command = signedCommand();
++    const context = command.providerOnlyProjectContext!;
++    expect(verifyProviderContextProof(command, undefined)).toBe(false);
++    expect(verifyProviderContextProof({ ...command, providerOnlyProjectContext: { ...context,
++      proof: undefined } }, key)).toBe(false);
++    for (const altered of [
++      { ...command, commandId: "different" },
++      { ...command, message: { ...command.message, text: "changed" } },
++      { ...command, providerOnlyProjectContext: { ...context, draftVersion: 3 } },
++      { ...command, providerOnlyProjectContext: { ...context, branchRef: "other" } },
++      { ...command, providerOnlyProjectContext: { ...context, modelId: "other" } },
++      { ...command, providerOnlyProjectContext: { ...context, fingerprint: "0".repeat(64) } },
++      { ...command, providerOnlyProjectContext: { ...context, proof: { ...context.proof!, taskId: "other" } } },
++      { ...command, providerOnlyProjectContext: { ...context, proof: { ...context.proof!, environmentId: "other" } } },
++      { ...command, providerOnlyProjectContext: { ...context, proof: { ...context.proof!, projectId: "other" } } },
++      { ...command, providerOnlyProjectContext: { ...context, context: { ...context.context,
++        records: [{ ...context.context.records[0]!, payload: { text: "changed" } }] } } },
++    ] as OrchestrationCommand[]) expect(verifyProviderContextProof(altered, key)).toBe(false);
++  });
++});
+diff --git a/apps/server/src/orchestration/ProviderContextProof.ts b/apps/server/src/orchestration/ProviderContextProof.ts
+new file mode 100644
+index 0000000..5b0f2d2
+--- /dev/null
++++ b/apps/server/src/orchestration/ProviderContextProof.ts
+@@ -0,0 +1,58 @@
++// @effect-diagnostics nodeBuiltinImport:off
++import { createHash, createHmac, timingSafeEqual } from "node:crypto";
++import type { OrchestrationCommand, ProviderOnlyProjectContext } from "@t3tools/contracts";
++
++type TurnStart = Extract<OrchestrationCommand, { type: "thread.turn.start" }>;
++
++function fingerprint(command: TurnStart, context: ProviderOnlyProjectContext): string {
++  const proof = context.proof!;
++  const binding = {
++    projectId: proof.projectId,
++    taskId: proof.taskId,
++    environmentId: proof.environmentId,
++    threadId: context.threadId,
++    providerInstanceId: context.providerInstanceId,
++    modelId: context.modelId,
++    branchRef: context.branchRef,
++    snapshotSequence: context.snapshotSequence,
++    commandId: context.commandId,
++    draftId: context.draftId,
++    draftVersion: context.draftVersion,
++    messageId: context.messageId,
++  };
++  return createHash("sha256").update(JSON.stringify([
++    "0.1.1", binding, command.message.text, context.context.records,
++  ])).digest("hex");
++}
++
++export function providerContextProofPayload(command: TurnStart, context: ProviderOnlyProjectContext): string {
++  const proof = context.proof!;
++  return JSON.stringify(["AAAAGENT-project-context-proof-v1", proof.projectId, proof.taskId,
++    proof.environmentId, context.commandId, context.messageId, context.threadId,
++    context.t3ProjectId, context.providerInstanceId, context.modelId, context.branchRef,
++    context.snapshotSequence, context.draftId, context.draftVersion, context.fingerprint,
++    command.message.text, context.context.records]);
++}
++
++/** Called by the one shared engine before queueing a command from HTTP, WS, RPC or server code. */
++export function verifyProviderContextProof(command: OrchestrationCommand, keyHex: string | undefined): boolean {
++  if (command.type !== "thread.turn.start" || command.providerOnlyProjectContext === undefined) return true;
++  const context = command.providerOnlyProjectContext;
++  const proof = context.proof;
++  if (!proof || proof.version !== 1 || !/^[a-f0-9]{64}$/.test(proof.mac) ||
++      context.commandId !== command.commandId || context.threadId !== command.threadId ||
++      context.messageId !== command.message.messageId ||
++      context.context.records.length === 0 || context.context.records.some((record) =>
++        record.kind !== "project-memory" || !("payload" in record) ||
++        typeof record.payload !== "object" || record.payload === null ||
++        (record.payload as { projectId?: unknown }).projectId !== proof.projectId) ||
++      typeof keyHex !== "string" || !/^[a-f0-9]{64}$/.test(keyHex)) return false;
++  try {
++    if (context.fingerprint !== fingerprint(command, context)) return false;
++    const expected = createHmac("sha256", Buffer.from(keyHex, "hex"))
++      .update(providerContextProofPayload(command, context)).digest();
++    return timingSafeEqual(expected, Buffer.from(proof.mac, "hex"));
++  } catch {
++    return false;
++  }
++}
+diff --git a/packages/contracts/src/orchestration.ts b/packages/contracts/src/orchestration.ts
+index bcf27c8..98c605d 100644
+--- a/packages/contracts/src/orchestration.ts
++++ b/packages/contracts/src/orchestration.ts
+@@ -1319,2 +1319,11 @@ export type ThreadTurnStartBootstrap = typeof ThreadTurnStartBootstrap.Type;
+ /** Private user-level material for one provider send; it is never a thread message. */
++export const ProviderProjectContextProof = Schema.Struct({
++  version: Schema.Literal(1),
++  projectId: TrimmedNonEmptyString,
++  taskId: TrimmedNonEmptyString,
++  environmentId: TrimmedNonEmptyString,
++  mac: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
++});
++export type ProviderProjectContextProof = typeof ProviderProjectContextProof.Type;
++
+ export const ProviderOnlyProjectContext = Schema.Struct({
+@@ -1333,2 +1342,3 @@ export const ProviderOnlyProjectContext = Schema.Struct({
+   context: OrchestrationMessageContext,
++  proof: Schema.optional(ProviderProjectContextProof),
+ });

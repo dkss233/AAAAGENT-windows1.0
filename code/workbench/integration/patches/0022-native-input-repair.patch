@@ -1,0 +1,55 @@
+--- a/apps/server/src/provider/Layers/CodexAdapter.ts
++++ b/apps/server/src/provider/Layers/CodexAdapter.ts
+@@ -48,6 +48,7 @@
+ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+ import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
+ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
++import { originalAppSharedSession } from "./CodexOriginalAppShared.ts";
+ 
+ import {
+   ProviderAdapterRequestError,
+@@ -2274,14 +2275,23 @@
+           input.modelSelection?.instanceId === boundInstanceId
+             ? getCodexServiceTierOptionValue(input.modelSelection)
+             : undefined;
+-        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
++        const shared = yield* Effect.promise(() => originalAppSharedSession({
++          binaryPath: codexConfig.binaryPath, homePath: codexConfig.homePath,
++          cwd: input.cwd ?? process.cwd(), threadId: input.threadId, resumeCursor: input.resumeCursor,
++        }));
++        if (shared.kind === "unavailable") return yield* new ProviderAdapterValidationError({
++          provider: PROVIDER, operation: "startSession", issue: "Original App shared execution owner is unavailable",
++        });
++        // The imported App session keeps its original owner's tool and Skill
++        // configuration. T3-created native sessions retain their own MCP setup.
++        const mcpSession = shared.kind === "shared" ? undefined : McpProviderSession.readMcpProviderSession(input.threadId);
+         const runtimeInput: CodexSessionRuntimeOptions = {
+           threadId: input.threadId,
+           providerInstanceId: boundInstanceId,
+           cwd: input.cwd ?? process.cwd(),
+           binaryPath: codexConfig.binaryPath,
+           ...(options?.models ? { models: options.models } : {}),
+-          launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
++          launchArgs: shared.kind === "shared" ? shared.launchArgs : resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
+           ...(options?.environment ? { environment: options.environment } : {}),
+           ...(codexConfig.homePath ? { homePath: codexConfig.homePath } : {}),
+           ...(isCodexResumeCursorSchema(input.resumeCursor)
+--- /dev/null
++++ b/apps/server/src/provider/Layers/CodexOriginalAppShared.ts
+@@ -0,0 +1,16 @@
++import { pathToFileURL } from "node:url";
++
++type SharedSession = { kind: "native" } | { kind: "unavailable" } | { kind: "shared"; launchArgs: string };
++
++export async function originalAppSharedSession(input: {
++  binaryPath: string; homePath?: string; cwd: string; threadId: string; resumeCursor?: unknown;
++}): Promise<SharedSession> {
++  const suffix = "/artifacts/runtime/engine-bindings/codex";
++  if (!input.binaryPath.endsWith(suffix) || !input.threadId.startsWith("import:codex:")) return { kind: "native" };
++  try {
++    const root = input.binaryPath.slice(0, -suffix.length);
++    const moduleUrl = pathToFileURL(root + "/code/workbench/integration/codex-shared-connection.mjs").href;
++    const integration = await import(/* @vite-ignore */ moduleUrl);
++    return await integration.originalAppSharedSession(input);
++  } catch { return { kind: "unavailable" }; }
++}

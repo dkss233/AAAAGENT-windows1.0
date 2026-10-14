@@ -1,0 +1,119 @@
+diff --git a/apps/server/src/orchestration/http.ts b/apps/server/src/orchestration/http.ts
+index 82f16fc7..efae78a6 100644
+--- a/apps/server/src/orchestration/http.ts
++++ b/apps/server/src/orchestration/http.ts
+@@ -4,6 +4,7 @@ import {
+   EnvironmentHttpApi,
+ } from "@t3tools/contracts";
+ import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
+ import * as Option from "effect/Option";
+ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+ 
+@@ -17,6 +18,8 @@ import {
+   requireEnvironmentScope,
+ } from "../auth/http.ts";
+ import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
++import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
++import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
+ import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+ import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+ 
+@@ -25,6 +28,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
+   "orchestration",
+   Effect.fnUntraced(function* (handlers) {
+     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
++    const commandReceipts = yield* OrchestrationCommandReceiptRepository;
+     const orchestrationEngine = yield* OrchestrationEngineService;
+     const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
+ 
+@@ -62,6 +66,19 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
+             );
+         }),
+       )
++      .handle(
++        "commandReceipt",
++        Effect.fn("environment.orchestration.commandReceipt")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
++          const stored = yield* commandReceipts.getByCommandId({ commandId: args.params.commandId }).pipe(
++            Effect.catch((cause) => failEnvironmentInternal("orchestration_command_receipt_failed", cause)),
++          );
++          if (Option.isNone(stored)) return null;
++          const { commandId, aggregateKind, aggregateId, acceptedAt, resultSequence, status } = stored.value;
++          return { commandId, aggregateKind, aggregateId, acceptedAt, resultSequence, status };
++        }),
++      )
+       .handle(
+         "threadSnapshot",
+         Effect.fn("environment.orchestration.threadSnapshot")(function* (args) {
+@@ -125,4 +142,4 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
+         }),
+       );
+   }),
+-);
++).pipe(Layer.provide(OrchestrationCommandReceiptRepositoryLive));
+diff --git a/packages/contracts/src/environmentHttp.ts b/packages/contracts/src/environmentHttp.ts
+index ae63a405..49971dff 100644
+--- a/packages/contracts/src/environmentHttp.ts
++++ b/packages/contracts/src/environmentHttp.ts
+@@ -27,6 +27,10 @@ import {
+ import {
+   DpopFailureReason,
+   AuthSessionId,
++  CommandId,
++  IsoDateTime,
++  NonNegativeInt,
++  ProjectId,
+   ThreadId,
+   TrimmedNonEmptyString,
+ } from "./baseSchemas.ts";
+@@ -34,6 +38,8 @@ import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+ import {
+   ClientOrchestrationCommand,
+   DispatchResult,
++  OrchestrationAggregateKind,
++  OrchestrationCommandReceiptStatus,
+   OrchestrationReadModel,
+   OrchestrationShellSnapshot,
+   OrchestrationThreadDetailSnapshot,
+@@ -93,6 +99,7 @@ export const EnvironmentInternalErrorReason = Schema.Literals([
+   "client_sessions_load_failed",
+   "client_session_revoke_failed",
+   "orchestration_snapshot_failed",
++  "orchestration_command_receipt_failed",
+   "orchestration_thread_snapshot_failed",
+   "orchestration_dispatch_failed",
+   "internal_error",
+@@ -505,6 +512,16 @@ const EnvironmentOrchestrationThreadSnapshotQuery = {
+   beforeCursor: Schema.optional(TrimmedNonEmptyString),
+ };
+ 
++const EnvironmentOrchestrationReceiptParams = Schema.Struct({ commandId: CommandId });
++const EnvironmentOrchestrationReceipt = Schema.NullOr(Schema.Struct({
++  commandId: CommandId,
++  aggregateKind: OrchestrationAggregateKind,
++  aggregateId: Schema.Union([ProjectId, ThreadId]),
++  acceptedAt: IsoDateTime,
++  resultSequence: NonNegativeInt,
++  status: OrchestrationCommandReceiptStatus,
++}));
++
+ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
+   .add(
+     HttpApiEndpoint.get("snapshot", "/api/orchestration/snapshot", {
+@@ -520,6 +537,14 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
+       error: EnvironmentOrchestrationSnapshotErrors,
+     }).middleware(EnvironmentAuthenticatedAuth),
+   )
++  .add(
++    HttpApiEndpoint.get("commandReceipt", "/api/orchestration/commands/:commandId/receipt", {
++      headers: OptionalBearerHeaders,
++      params: EnvironmentOrchestrationReceiptParams,
++      success: EnvironmentOrchestrationReceipt,
++      error: EnvironmentOrchestrationSnapshotErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
+   .add(
+     HttpApiEndpoint.get("threadSnapshot", "/api/orchestration/threads/:threadId", {
+       headers: OptionalBearerHeaders,

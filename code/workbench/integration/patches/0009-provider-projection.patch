@@ -1,0 +1,326 @@
+diff --git a/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts b/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
+index c7d9417b..8cf1a2c9 100644
+--- a/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
++++ b/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
+@@ -1,2 +1,3 @@
+ // @effect-diagnostics nodeBuiltinImport:off
++import { createHash, createHmac } from "node:crypto";
+ import * as NodeFS from "node:fs";
+@@ -12,2 +13,3 @@ import {
+   ProviderSetupError,
++  type ProviderOnlyProjectContext,
+ } from "@t3tools/contracts";
+@@ -27,2 +29,3 @@ import {
+ import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
++import * as Cause from "effect/Cause";
+ import * as Effect from "effect/Effect";
+@@ -82,2 +85,39 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
+
++const proofKey = "ab".repeat(32);
++process.env.AAAAGENT_T3_PROJECT_CONTEXT_HMAC = proofKey;
++function frozenProjectContext(snapshotSequence: number, payloadOverride: Record<string, unknown> = {},
++  durableText = "Inspect the result"): ProviderOnlyProjectContext {
++  const commandId = CommandId.make("cmd-project-memory-turn");
++  const messageId = asMessageId("message-project-memory-turn");
++  const payload = {
++    status: "accepted", projectId: "logical-project-1", id: "memory-1", version: 3,
++    kind: "decision", text: "Keep the accepted retry limit.",
++    sources: [{ taskId: "task-1", recordedAt: "2026-01-01T00:00:00.000Z" }],
++    ...payloadOverride,
++  };
++  const contextId = createHash("sha256")
++    .update(JSON.stringify([commandId, messageId, payload.id, payload.version, payload])).digest("hex");
++  const records = [{ version: 1 as const, kind: "project-memory" as const,
++    contextId: ComposerContextId.make(contextId), label: "项目记忆", payload }];
++  const binding = { projectId: payload.projectId, taskId: "task-1", environmentId: "environment-1",
++    threadId: ThreadId.make("thread-1"), providerInstanceId: ProviderInstanceId.make("codex"),
++    modelId: "gpt-5-codex", branchRef: null, snapshotSequence, commandId,
++    draftId: "draft-1", draftVersion: 1, messageId };
++  const fingerprint = createHash("sha256")
++    .update(JSON.stringify(["0.1.1", binding, durableText, records])).digest("hex");
++  const mac = createHmac("sha256", Buffer.from(proofKey, "hex"))
++    .update(JSON.stringify(["AAAAGENT-project-context-proof-v1", binding.projectId,
++      binding.taskId, binding.environmentId, commandId, messageId, binding.threadId,
++      asProjectId("project-1"), binding.providerInstanceId, binding.modelId, binding.branchRef,
++      snapshotSequence, binding.draftId, binding.draftVersion, fingerprint, durableText, records]))
++    .digest("hex");
++  return { version: 1, commandId, messageId, threadId: binding.threadId,
++    t3ProjectId: asProjectId("project-1"), providerInstanceId: binding.providerInstanceId,
++    modelId: binding.modelId, branchRef: null, snapshotSequence,
++    draftId: binding.draftId, draftVersion: binding.draftVersion, fingerprint,
++    context: { version: 1, records }, proof: { version: 1,
++      projectId: binding.projectId, taskId: binding.taskId,
++      environmentId: binding.environmentId, mac } } as ProviderOnlyProjectContext;
++}
++
+ const assistantQuoteText = "Retain the reconnect backoff.";
+@@ -936,2 +976,147 @@ describe("ProviderCommandReactor", () => {
+
++  effectIt.effect("sends frozen project memory only in the provider copy and keeps the user message intact", () =>
++    Effect.gen(function* () {
++      const harness = yield* Effect.promise(() => createHarness());
++      const snapshot = yield* Effect.promise(() => harness.readModel());
++      const durableText = "Inspect [build](t3-context://v1/terminal/terminal-1)";
++      const projectContext = frozenProjectContext(snapshot.snapshotSequence, {}, durableText);
++      const attachments = [{
++        type: "file" as const, id: "attached-notes", name: "notes.txt",
++        mimeType: "text/plain", sizeBytes: 8,
++      }];
++
++      yield* harness.engine.dispatch({
++        type: "thread.turn.start",
++        commandId: projectContext.commandId,
++        threadId: projectContext.threadId,
++        message: {
++          messageId: projectContext.messageId,
++          role: "user",
++          text: durableText,
++          attachments,
++          context: {
++            version: 1,
++            records: [{
++              version: 1, kind: "terminal", contextId: ComposerContextId.make("terminal-1"),
++              label: "build", terminalId: "terminal-1", terminalLabel: "Build",
++              lineStart: 7, lineEnd: 7, text: "compiled successfully",
++            }],
++          },
++        },
++        providerOnlyProjectContext: projectContext,
++        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
++        runtimeMode: "approval-required",
++        createdAt: "2026-01-01T00:00:00.000Z",
++      });
++
++      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
++      const sent = harness.sendTurn.mock.calls[0]?.[0] as { input: string; attachments: unknown };
++      expect(sent.attachments).toEqual(attachments);
++      expect(sent.input).toContain("[Terminal: build; ref=terminal-1]");
++      expect(sent.input).toContain('<context kind="terminal" id="terminal-1">');
++      expect(sent.input).toContain(`<context kind="project-memory" id="${projectContext.context.records[0]?.contextId}">`);
++      expect(sent.input).toContain("Keep the accepted retry limit.");
++      expect(sent.input.match(/<context kind="project-memory"/g)).toHaveLength(1);
++
++      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
++        (entry) => entry.id === ThreadId.make("thread-1"),
++      );
++      const persisted = thread?.messages.find((message) => message.id === projectContext.messageId);
++      expect(persisted?.text).toBe(durableText);
++      expect(persisted?.context?.records).toHaveLength(1);
++      expect(persisted?.context?.records[0]?.kind).toBe("terminal");
++    }),
++  );
++
++  effectIt.effect.each(["candidate", "missing-source", "tampered-record"] as const)(
++    "rejects %s project memory before starting a provider session",
++    (invalidCase) => Effect.gen(function* () {
++      const harness = yield* Effect.promise(() => createHarness());
++      const snapshot = yield* Effect.promise(() => harness.readModel());
++      const original = frozenProjectContext(snapshot.snapshotSequence,
++        invalidCase === "candidate" ? { status: "candidate" } :
++          invalidCase === "missing-source" ? { sources: [] } : {});
++      const projectContext = invalidCase === "tampered-record" ? {
++        ...original,
++        context: { ...original.context, records: [{
++          ...original.context.records[0]!, contextId: ComposerContextId.make("wrong-digest"),
++        }] },
++      } : original;
++      const dispatchResult = yield* Effect.exit(harness.engine.dispatch({
++        type: "thread.turn.start",
++        commandId: projectContext.commandId,
++        threadId: projectContext.threadId,
++        message: {
++          messageId: projectContext.messageId,
++          role: "user",
++          text: "Inspect the result",
++          attachments: [],
++        },
++        providerOnlyProjectContext: projectContext,
++        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
++        runtimeMode: "approval-required",
++        createdAt: "2026-01-01T00:00:00.000Z",
++      }));
++      if (Exit.isFailure(dispatchResult)) {
++        expect(invalidCase).toBe("tampered-record");
++        expect(Cause.pretty(dispatchResult.cause)).toContain("Invalid private project context proof.");
++        expect(harness.startSession).not.toHaveBeenCalled();
++        expect(harness.sendTurn).not.toHaveBeenCalled();
++        return;
++      }
++      yield* Effect.promise(() => harness.drain());
++      expect(harness.startSession).not.toHaveBeenCalled();
++      expect(harness.sendTurn).not.toHaveBeenCalled();
++      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
++        (entry) => entry.id === ThreadId.make("thread-1"),
++      );
++      expect(thread?.activities).toContainEqual(expect.objectContaining({
++        kind: "provider.turn.start.failed",
++        payload: expect.objectContaining({ detail: "Frozen project context does not match this turn." }),
++      }));
++      expect(thread?.messages.find((message) => message.id === projectContext.messageId)?.text)
++        .toBe("Inspect the result");
++    }),
++  );
++
++  effectIt.effect("rejects a frozen project context after the native branch changes before replay", () =>
++    Effect.gen(function* () {
++      const activation = yield* Deferred.make<void>();
++      const harness = yield* Effect.promise(() => createHarness({
++        serverActivation: Deferred.await(activation),
++      }));
++      const snapshot = yield* Effect.promise(() => harness.readModel());
++      const projectContext = frozenProjectContext(snapshot.snapshotSequence);
++      yield* harness.engine.dispatch({
++        type: "thread.turn.start",
++        commandId: projectContext.commandId,
++        threadId: projectContext.threadId,
++        message: {
++          messageId: projectContext.messageId, role: "user", text: "Inspect the result", attachments: [],
++        },
++        providerOnlyProjectContext: projectContext,
++        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
++        runtimeMode: "approval-required",
++        createdAt: "2026-01-01T00:00:00.000Z",
++      });
++      yield* harness.engine.dispatch({
++        type: "thread.meta.update",
++        commandId: CommandId.make("cmd-branch-changed-after-freeze"),
++        threadId: projectContext.threadId,
++        branch: "feature/drift",
++      });
++      yield* Deferred.succeed(activation, undefined);
++      yield* Effect.promise(() => harness.drain());
++      expect(harness.startSession).not.toHaveBeenCalled();
++      expect(harness.sendTurn).not.toHaveBeenCalled();
++      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
++        (entry) => entry.id === projectContext.threadId,
++      );
++      expect(thread?.activities).toContainEqual(expect.objectContaining({
++        kind: "provider.turn.start.failed",
++        payload: expect.objectContaining({ detail: "Frozen project context does not match this turn." }),
++      }));
++    }),
++  );
++
+   effectIt.effect("retains a turn dispatched immediately after start until activation", () =>
+diff --git a/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts b/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
+index a73d44ba..8006f79c 100644
+--- a/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
++++ b/apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
+@@ -7,2 +7,3 @@ import {
+   type OrchestrationEvent,
++  type ProviderOnlyProjectContext,
+   ProviderDriverKind,
+@@ -16,3 +17,7 @@ import {
+ import { assistantCitationsToPlainText } from "@t3tools/shared/assistantCitations";
+-import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
++import {
++  collectComposerContextReferences,
++  formatComposerContextReference,
++  projectComposerContextForProvider,
++} from "@t3tools/shared/composerContextReferences";
+ import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shared/git";
+@@ -25,2 +30,3 @@ import * as Duration from "effect/Duration";
+ import * as Effect from "effect/Effect";
++import * as Encoding from "effect/Encoding";
+ import * as Equal from "effect/Equal";
+@@ -73,2 +79,46 @@ const isProviderDriverKind = Schema.is(ProviderDriverKind);
+
++const PROJECT_MEMORY_KEYS = new Set([
++  "status", "projectId", "id", "version", "kind", "text", "branchRef", "condition", "sources",
++]);
++const PROJECT_SOURCE_KEYS = new Set([
++  "taskId", "nativeTurnId", "terminalEventId", "artifactRef", "userInputId", "recordedAt",
++]);
++const PROJECT_SOURCE_REFS = [
++  "taskId", "nativeTurnId", "terminalEventId", "artifactRef", "userInputId",
++] as const;
++const PROJECT_MEMORY_KINDS = new Set(["decision", "constraint", "fact", "open_question"]);
++const encodeProjectMemoryDigestInput = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value);
++}
++
++function validProjectMemorySource(value: unknown): boolean {
++  if (!isRecord(value) || Object.keys(value).some((key) => !PROJECT_SOURCE_KEYS.has(key)) ||
++      typeof value.recordedAt !== "string" || !Number.isFinite(Date.parse(value.recordedAt))) {
++    return false;
++  }
++  return PROJECT_SOURCE_REFS.every((key) => value[key] === undefined ||
++      typeof value[key] === "string" && value[key].trim().length > 0);
++}
++
++function validProjectMemoryPayload(value: unknown, branchRef: string | null): value is Record<string, unknown> {
++  return isRecord(value) && Object.keys(value).every((key) => PROJECT_MEMORY_KEYS.has(key)) &&
++    value.status === "accepted" && typeof value.projectId === "string" && !!value.projectId.trim() &&
++    typeof value.id === "string" && !!value.id.trim() &&
++    Number.isSafeInteger(value.version) && Number(value.version) > 0 &&
++    typeof value.kind === "string" && PROJECT_MEMORY_KINDS.has(value.kind) &&
++    typeof value.text === "string" && !!value.text.trim() && value.text.length <= 4000 &&
++    (value.branchRef === undefined || value.branchRef === branchRef) &&
++    (value.condition === undefined || typeof value.condition === "string" && !!value.condition.trim()) &&
++    Array.isArray(value.sources) && value.sources.length > 0 &&
++    value.sources.every(validProjectMemorySource);
++}
++
++function projectMemoryReferences(sidecar: ProviderOnlyProjectContext): string {
++  return sidecar.context.records.map((record) => formatComposerContextReference({
++    kind: record.kind, contextId: record.contextId, label: record.label,
++  })).join("\n");
++}
++
+ type ProviderIntentEvent = Extract<
+@@ -1251,2 +1301,44 @@ const make = Effect.gen(function* () {
+     }
++    const projectContext = event.payload.providerOnlyProjectContext;
++    if (projectContext) {
++      const selectedModel = event.payload.modelSelection ?? thread.modelSelection;
++      const userContextIds = new Set([
++        ...(message.context?.records.map((record) => record.contextId) ?? []),
++        ...collectComposerContextReferences(message.text).map((reference) => reference.contextId),
++      ]);
++      let logicalProjectId: string | undefined;
++      let valid = event.commandId !== null && projectContext.commandId === event.commandId &&
++        projectContext.messageId === event.payload.messageId && projectContext.messageId === message.id &&
++        projectContext.threadId === thread.id && projectContext.t3ProjectId === thread.projectId &&
++        projectContext.providerInstanceId === selectedModel.instanceId &&
++        projectContext.modelId === selectedModel.model && projectContext.branchRef === thread.branch &&
++        projectContext.context.records.length > 0 && projectContext.context.records.length <= 100;
++      for (const record of projectContext.context.records) {
++        if (!valid || record.kind !== "project-memory" || record.version !== 1 ||
++            record.label !== "项目记忆" || !("payload" in record) ||
++            !validProjectMemoryPayload(record.payload, projectContext.branchRef) ||
++            userContextIds.has(record.contextId)) {
++          valid = false;
++          break;
++        }
++        const payload = record.payload;
++        if (logicalProjectId !== undefined && logicalProjectId !== payload.projectId) {
++          valid = false;
++          break;
++        }
++        logicalProjectId = payload.projectId as string;
++        const digest = yield* crypto.digest("SHA-256", new TextEncoder().encode(encodeProjectMemoryDigestInput([
++          projectContext.commandId, projectContext.messageId, payload.id, payload.version, payload,
++        ]))).pipe(Effect.map(Encoding.encodeHex));
++        if (record.contextId !== digest) {
++          valid = false;
++          break;
++        }
++      }
++      if (!valid) {
++        return yield* appendTurnStartFailure(
++          "Provider turn start failed", "Frozen project context does not match this turn.",
++        );
++      }
++    }
+
+@@ -1482,4 +1574,6 @@ const make = Effect.gen(function* () {
+       messageText: projectComposerContextForProvider({
+-        text: message.text,
+-        records: message.context?.records ?? [],
++        text: projectContext ? `${message.text}\n\n${projectMemoryReferences(projectContext)}` : message.text,
++        records: projectContext
++          ? [...(message.context?.records ?? []), ...projectContext.context.records]
++          : message.context?.records ?? [],
+       }),

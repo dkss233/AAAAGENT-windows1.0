@@ -1,0 +1,1273 @@
+diff --git a/apps/server/src/orchestration/Layers/ProjectionPipeline.ts b/apps/server/src/orchestration/Layers/ProjectionPipeline.ts
+--- a/apps/server/src/orchestration/Layers/ProjectionPipeline.ts
++++ b/apps/server/src/orchestration/Layers/ProjectionPipeline.ts
+@@ -192,6 +192,7 @@
+ 
+     if (
+       activity.kind === "provider.user-input.respond.failed" &&
++      !requestId.startsWith("dsh:") &&
+       detail !== null &&
+       (detail.includes("stale pending user-input request") ||
+         detail.includes("unknown pending user-input request") ||
+@@ -1334,7 +1335,34 @@
+           });
+           return;
+ 
+-        case "thread.activity-appended":
++        case "thread.approval-response-requested":
++        case "thread.user-input-response-requested": {
++          if (!event.payload.requestId.startsWith("dsh:")) return;
++          const kind = event.type === "thread.approval-response-requested" ? "approval.requested" : "user-input.requested";
++          const rows = yield* projectionThreadActivityRepository.listByThreadId({
++            threadId: event.payload.threadId, activityKinds: [kind],
++          });
++          for (const row of rows) {
++            if (extractActivityRequestId(row.payload) !== event.payload.requestId) continue;
++            const payload = typeof row.payload === "object" && row.payload !== null ? row.payload as Record<string, unknown> : {};
++            yield* projectionThreadActivityRepository.upsert({ ...row, payload: { ...payload,
++              responseSubmitted: { commandId: event.commandId, sequence: event.sequence, submittedAt: event.occurredAt } } });
++          }
++          return;
++        }
++
++        case "thread.activity-appended": {
++          let payload = event.payload.activity.payload;
++          const requestId = extractActivityRequestId(payload);
++          if (requestId?.startsWith("dsh:") && ["approval.requested", "user-input.requested"].includes(event.payload.activity.kind)) {
++            const rows = yield* projectionThreadActivityRepository.listByThreadId({
++              threadId: event.payload.threadId, activityKinds: [event.payload.activity.kind],
++            });
++            const previous = rows.find(row => row.activityId === event.payload.activity.id);
++            const old = typeof previous?.payload === "object" && previous.payload !== null ? previous.payload as Record<string, unknown> : null;
++            if (old?.responseSubmitted && typeof payload === "object" && payload !== null)
++              payload = { ...payload, responseSubmitted: old.responseSubmitted };
++          }
+           yield* projectionThreadActivityRepository.upsert({
+             activityId: event.payload.activity.id,
+             threadId: event.payload.threadId,
+@@ -1342,13 +1370,14 @@
+             tone: event.payload.activity.tone,
+             kind: event.payload.activity.kind,
+             summary: event.payload.activity.summary,
+-            payload: event.payload.activity.payload,
++            payload,
+             ...(event.payload.activity.sequence !== undefined
+               ? { sequence: event.payload.activity.sequence }
+               : {}),
+             createdAt: event.payload.activity.createdAt,
+           });
+           return;
++        }
+ 
+         case "thread.reverted": {
+           const existingRows = yield* projectionThreadActivityRepository.listByThreadId({
+@@ -1493,9 +1522,9 @@
+         case "thread.session-set": {
+           const turnId = event.payload.session.activeTurnId;
+           if (turnId === null || event.payload.session.status !== "running") {
++            // Rebinding a ready session can precede the pending turn's start.
++            // Only an explicit failure/stop/interruption cancels that source input.
+             if (
+-              (event.payload.session.status === "ready" &&
+-                event.commandId?.startsWith("server:provider-session-set:") === true) ||
+               event.payload.session.status === "error" ||
+               event.payload.session.status === "stopped" ||
+               event.payload.session.status === "interrupted"
+@@ -1883,6 +1912,9 @@
+             return;
+           }
+           if (event.payload.activity.kind === "provider.approval.respond.failed") {
++            // The SDK may acknowledge a no-op. Its audit closes the request;
++            // a transport/stale error cannot confirm another client's result.
++            if (requestId.startsWith("dsh:")) return;
+             const payload =
+               typeof event.payload.activity.payload === "object" &&
+               event.payload.activity.payload !== null
+@@ -1964,7 +1996,7 @@
+             threadId: event.payload.threadId,
+             turnId: event.payload.activity.turnId,
+             status: "pending",
+-            decision: null,
++            decision: requestId.startsWith("dsh:") && Option.isSome(existingRow) ? existingRow.value.decision : null,
+             createdAt: Option.isSome(existingRow)
+               ? existingRow.value.createdAt
+               : event.payload.activity.createdAt,
+@@ -1983,12 +2015,13 @@
+               ? existingRow.value.threadId
+               : event.payload.threadId,
+             turnId: Option.isSome(existingRow) ? existingRow.value.turnId : null,
+-            status: "resolved",
++            // DSH HTTP success may be a no-op; retain the submitted choice until native audit resolution.
++            status: event.payload.requestId.startsWith("dsh:") ? "pending" : "resolved",
+             decision: event.payload.decision,
+             createdAt: Option.isSome(existingRow)
+               ? existingRow.value.createdAt
+               : event.payload.createdAt,
+-            resolvedAt: event.payload.createdAt,
++            resolvedAt: event.payload.requestId.startsWith("dsh:") ? null : event.payload.createdAt,
+           });
+           return;
+         }
+diff --git a/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts b/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
+--- a/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
++++ b/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
+@@ -1724,6 +1724,9 @@
+           AND stream_id = ${threadId}
+           AND sequence <= ${maxSequence}
+           AND event_type IN (
++            'thread.native-session-synced',
++            'thread.approval-response-requested',
++            'thread.user-input-response-requested',
+             'thread.message-sent',
+             'thread.proposed-plan-upserted',
+             'thread.activity-appended',
+diff --git a/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts b/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
+--- a/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
++++ b/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
+@@ -1795,6 +1795,15 @@
+ 
+       const now = event.createdAt;
+       const eventTurnId = toTurnId(event.turnId);
++      // A cold DSH monitor can re-observe completed original turns. Their stable
++      // native IDs already have durable lifecycle/messages; replaying started or
++      // completed items could consume a newer pending input or append old text.
++      // Approval/question settlement still follows its original native projection.
++      if (event.provider === "dsh" && eventTurnId &&
++          ["turn.started", "turn.completed", "item.completed"].includes(event.type)) {
++        const savedTurn = yield* projectionTurnRepository.getByTurnId({ threadId: thread.id, turnId: eventTurnId });
++        if (Option.isSome(savedTurn) && ["completed", "error", "interrupted"].includes(savedTurn.value.state)) return;
++      }
+       const activeTurnId = thread.session?.activeTurnId ?? null;
+       const isTerminalTurn = event.type === "turn.completed" || event.type === "turn.aborted";
+       const isCompactedThreadState =
+@@ -2365,15 +2374,18 @@
+             if (
+               activity.kind === "user-input.requested" &&
+               activity.turnId === turnId &&
+-              payload?.responseMode !== "message"
++              payload?.responseMode !== "message" &&
++              event.provider !== "dsh"
+             ) {
+               pendingRequestIds.add(requestId);
+             } else if (activity.kind === "user-input.resolved") {
+               pendingRequestIds.delete(requestId);
+             }
+           }
+-          // A terminal turn cannot accept native callback answers. Message-mode
+-          // questions may outlive that turn and still accept a later user message.
++          // DSH's native open/continued question projection owns its callback lifecycle;
++          // the adapter resolves it only after original settlement, even past turn end.
++          // Other providers' callback questions end with the turn; message-mode
++          // questions may still accept a later user message.
+           for (const requestId of pendingRequestIds) {
+             yield* orchestrationEngine.dispatch({
+               type: "thread.activity.append",
+diff --git a/apps/server/src/orchestration/NativeSessionHistory.ts b/apps/server/src/orchestration/NativeSessionHistory.ts
+--- a/apps/server/src/orchestration/NativeSessionHistory.ts
++++ b/apps/server/src/orchestration/NativeSessionHistory.ts
+@@ -6,7 +6,7 @@
+   v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : undefined;
+ export const digest = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
+ export interface NativeMessage { id: string; role: "user" | "assistant"; text: string; createdAt: string; sourceCommandId?: string }
+-export interface NativeTurn { id: string; state: OrchestrationLatestTurn["state"]; startedAt: string; completedAt: string | null; messages: NativeMessage[] }
++export interface NativeTurn { id: string; sourceTurnId?: string; state: OrchestrationLatestTurn["state"]; startedAt: string; completedAt: string | null; messages: NativeMessage[] }
+ export interface NativeHistory { nativeId: string; cwd: string; turns: NativeTurn[]; observation: "ready" | "running" | "waiting_approval" | "waiting_answer" | "unknown"; checkpoint: Record<string, any>; complete: boolean }
+ export const nativeMessageKey = (provider: string, nativeId: string, turn: NativeTurn, row: NativeMessage) => `native:${provider}:${nativeId}:message:${turn.id}:${String(turn.messages.indexOf(row)).padStart(8, "0")}:${row.id}`;
+ export interface SavedTurn { turnId: TurnId | null; pendingMessageId: MessageId | null; assistantMessageId: MessageId | null; state?: string; requestedAt?: string; startedAt?: string | null; completedAt?: string | null }
+@@ -83,7 +83,7 @@
+   const nextAliases = { ...aliases }, existingById = new Map(existing.map(m => [String(m.id), m]));
+   for (const native of history.turns) {
+     const firstUser = native.messages.find(m => m.role === "user");
+-    const knownTurnId = provider === "codex" ? native.id : firstUser?.sourceCommandId ? `dsh:${firstUser.sourceCommandId}` : undefined;
++    const knownTurnId = provider === "codex" ? native.id : native.sourceTurnId ?? (firstUser?.sourceCommandId ? `dsh:${firstUser.sourceCommandId}` : undefined);
+     const saved = savedTurns.find(t => t.turnId === (nextAliases[`turn:${native.id}`] ?? knownTurnId));
+     const turnId = TurnId.make(saved?.turnId ?? nextAliases[`turn:${native.id}`] ?? `native:${provider}:${history.nativeId}:turn:${native.id}`);
+     nextAliases[`turn:${native.id}`] = turnId;
+@@ -97,8 +97,11 @@
+       const old = existingById.get(id);
+       // Preserve the original source message, context, attachments, creation time and turn binding.
+       if (old && (old.role !== row.role || old.turnId !== null && old.turnId !== undefined && old.turnId !== turnId)) throw Error("Original message identity conflict");
+-      if (old && !id.startsWith("native:") && old.text !== row.text) throw Error("Original T3/native message content conflicts; no overwrite");
+-      const candidate: OrchestrationMessage = { ...(old ?? {}), id, role: row.role, text: row.text, turnId: old ? old.turnId ?? null : turnId, streaming: native.state === "running" && row.role === "assistant", createdAt: old?.createdAt ?? row.createdAt, updatedAt: native.completedAt ?? row.createdAt };
++      // The exact saved turn/pending input establishes identity. Provider transport
++      // can add a file reference or private context; it cannot rewrite source input.
++      const sourceInput = old?.role === "user" && row === firstUser && saved?.pendingMessageId === id && !id.startsWith("native:");
++      if (old && !id.startsWith("native:") && old.text !== row.text && !sourceInput) throw Error("Original T3/native message content conflicts; no overwrite");
++      const candidate: OrchestrationMessage = { ...(old ?? {}), id, role: row.role, text: sourceInput ? old.text : row.text, turnId: old ? old.turnId ?? null : turnId, streaming: native.state === "running" && row.role === "assistant", createdAt: old?.createdAt ?? row.createdAt, updatedAt: native.completedAt ?? row.createdAt };
+       if (!old || old.text !== candidate.text || old.streaming !== candidate.streaming || old.turnId !== candidate.turnId) messages.push(candidate);
+       if (row.role === "user" && userMessageId === null) userMessageId = id;
+       if (row.role === "assistant") assistantMessageId = id;
+diff --git a/apps/server/src/provider/Layers/DshAdapter.ts b/apps/server/src/provider/Layers/DshAdapter.ts
+--- a/apps/server/src/provider/Layers/DshAdapter.ts
++++ b/apps/server/src/provider/Layers/DshAdapter.ts
+@@ -1,7 +1,7 @@
+ import { createHash } from "node:crypto";
+ import {
+-  EventId, ProviderDriverKind, ProviderInstanceId, ThreadId, TurnId, RuntimeItemId,
+-  type ModelSelection,
++  EventId, RuntimeRequestId, ProviderDriverKind, ProviderInstanceId, ThreadId, TurnId, RuntimeItemId,
++  type ModelSelection, type ChatAttachment, type RuntimeMode,
+   type ProviderRuntimeEvent, type ProviderSession, type ServerProviderModel,
+ } from "@t3tools/contracts";
+ import * as Context from "effect/Context";
+@@ -12,14 +12,32 @@
+ 
+ import { ProviderAdapterRequestError, ProviderAdapterValidationError, type ProviderAdapterError } from "../Errors.ts";
+ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
++import { readDshAttachments, dshInputDigest } from "./DshWebInput.ts";
+ 
+ const DRIVER = ProviderDriverKind.make("dsh");
+ const nativeId = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
+ const now = Effect.map(DateTime.now, DateTime.formatIso);
+ 
+-/** Host methods are implemented by DshHostProtocol against the installed 0.1.5-rc.2 Gateway. */
++export interface DshTurnObservation {
++  readonly status: "unknown" | "queued" | "running" | "waiting_approval" | "waiting_answer" | "completed" | "failed" | "cancelled";
++  readonly nativeTurn?: number;
++  readonly terminalSeq?: number;
++  readonly approvals?: readonly { id: string; toolName: string; callId?: string; reason?: string; outcome?: string; actionable?: boolean }[];
++  readonly questions?: readonly { callId: string; state: "open" | "continued";
++    questions: readonly { id: string; question: string; detail?: string; header?: string; options?: readonly { label: string; description?: string }[]; multiSelect?: boolean }[] }[];
++  readonly messages?: readonly { readonly seq: number; readonly text: string }[];
++}
++
++/** Host methods use the fixed DSH 0.2.0-rc.2 Gateway. */
+ export interface DshHostPort {
+   /** I supplies this from the protected launcher and native model catalog. */
++  readonly attachmentsDir?: string;
++  retain?(sessionId: string): Promise<void>;
++  release?(sessionId: string): void;
++  permission?(sessionId: string, mode: RuntimeMode): Promise<void>;
++  interrupt?(sessionId: string, requestId: string): Promise<void>;
++  approve?(sessionId: string, requestId: string, auditId: string, decision: string): Promise<void>;
++  answer?(sessionId: string, requestId: string, callId: string, answers: Record<string, unknown>): Promise<void>;
+   describe(): Promise<{ readonly installed: boolean; readonly authenticated: boolean;
+     readonly version: string | null; readonly models: readonly ServerProviderModel[] }>;
+   readHistory?(sessionId: string, cwd: string, preset: string, checkpoint?: unknown): Promise<unknown>;
+@@ -29,13 +47,10 @@
+   selectModel(sessionId: string, selection: ModelSelection): Promise<void>;
+   pinTitle(sessionId: string): Promise<void>;
+   /** Uses exactly the T3 command ID as Host requestId. */
+-  prompt(sessionId: string, requestId: string, text: string): Promise<void>;
+-  observe(sessionId: string, requestId: string): Promise<{
+-    readonly status: "unknown" | "queued" | "running" | "waiting_approval" | "waiting_answer" |
+-      "completed" | "failed" | "cancelled";
+-    readonly nativeTurn?: number;
+-    readonly terminalSeq?: number;
+-    readonly messages?: readonly { readonly seq: number; readonly text: string }[];
++  prompt(sessionId: string, requestId: string, text: string, files?: ReturnType<typeof readDshAttachments>): Promise<void>;
++  observe(sessionId: string, requestId: string): Promise<DshTurnObservation & {
++    /** Native user-question-reply lineage, never another prompt or session. */
++    readonly followUps?: readonly (DshTurnObservation & { readonly callId: string; readonly nativeTurn: number })[];
+   }>;
+ }
+ 
+@@ -57,9 +72,6 @@
+   // A deterministic ID avoids creating another session after a lost create response.
+   return `t3_${createHash("sha256").update(JSON.stringify([environmentId, threadId])).digest("hex").slice(0, 40)}`;
+ };
+-
+-const textDigest = (sessionId: string, requestId: string, text: string): string =>
+-  createHash("sha256").update(JSON.stringify([sessionId, requestId, text])).digest("hex");
+ 
+ const cursor = (value: unknown): { sessionId: string; requestId?: string; messageDigest?: string } | null => {
+   if (!value || typeof value !== "object") return null;
+@@ -74,10 +86,11 @@
+ };
+ 
+ /** Saved by the existing ProviderSessionDirectory before any native side effect. */
+-export function dshPendingPromptCursor(resumeCursor: unknown, requestId: string | undefined, text: string | undefined) {
++export function dshPendingPromptCursor(resumeCursor: unknown, requestId: string | undefined, text: string | undefined, attachments: readonly ChatAttachment[] = [], attachmentsDir?: string) {
+   const saved = cursor(resumeCursor);
+-  if (!saved || !requestId || !nativeId(requestId) || !text?.trim()) return null;
+-  const messageDigest = textDigest(saved.sessionId, requestId, text);
++  if (!saved || !requestId || !nativeId(requestId) || (!text?.trim() && !attachments.length)) return null;
++  let messageDigest: string;
++  try { messageDigest = dshInputDigest(saved.sessionId, requestId, text ?? "", readDshAttachments(attachmentsDir, attachments)); } catch { return null; }
+   if (saved.requestId === requestId && saved.messageDigest !== messageDigest) return null;
+   return { sessionId: saved.sessionId, requestId, messageDigest };
+ }
+@@ -88,6 +101,10 @@
+   const requests = new Map<ThreadId, Map<string, TurnId>>();
+   const attempted = new Map<ThreadId, Set<string>>();
+   const monitoring = new Set<string>();
++  // Retain emitted identities across rebinding/runtime-mode changes in this adapter.
++  // Re-observing an older terminal must never consume the next pending source input.
++  const monitorStates = new Map<string, { started: Set<TurnId>; terminalEmitted: Set<TurnId>; waiting: Map<TurnId, string>; emittedMessages: Set<number>; opened: Set<string>; resolved: Set<string> }>();
++  const pendingResponses = new Map<string, { sessionId: string; requestId: string; turnId: TurnId; nativeId: string; kind: "approval" | "question" }>();
+   const pollIntervalMs = options.pollIntervalMs ?? 2000;
+ 
+   const error = (method: string, detail: string): ProviderAdapterError => new ProviderAdapterRequestError({
+@@ -103,24 +120,33 @@
+     threadId, createdAt, ...(turnId === undefined ? {} : { turnId }),
+   });
+ 
+-  const monitor = (threadId: ThreadId, sessionId: string, requestId: string, turnId: TurnId) =>
++  const monitor = (threadId: ThreadId, sessionId: string, requestId: string, rootTurnId: TurnId) =>
+     Effect.gen(function* () {
+       const key = `${threadId}:${requestId}`;
+       if (monitoring.has(key)) return;
+       monitoring.add(key);
+-      let started = false;
+-      let waiting = "";
+-      const emittedMessages = new Set<number>();
++      const state = monitorStates.get(key) ?? { started: new Set<TurnId>(), terminalEmitted: new Set<TurnId>(), waiting: new Map<TurnId, string>(), emittedMessages: new Set<number>(), opened: new Set<string>(), resolved: new Set<string>() };
++      monitorStates.set(key, state);
++      const { started, terminalEmitted, waiting, emittedMessages, opened, resolved } = state;
+       try {
+         while (sessions.has(threadId)) {
+-          const observed = yield* remote("session/page", () => options.host.observe(sessionId, requestId))
+-            .pipe(Effect.orElseSucceed(() => ({ status: "unknown" as const })));
++          const snapshot = yield* remote("session/page", () => options.host.observe(sessionId, requestId))
++            .pipe(Effect.orElseSucceed((): Awaited<ReturnType<DshHostPort["observe"]>> => ({ status: "unknown" })));
++          if (!sessions.has(threadId)) return;
++          const turns = [snapshot, ...(snapshot.followUps ?? [])], liveQuestions = new Set<string>();
++          for (const observed of turns) {
++            const turnId = "callId" in observed ? TurnId.make(`dsh:${sessionId}:question:${observed.callId}:${observed.nativeTurn}`) : rootTurnId;
+           if (observed.status === "running" || observed.status.startsWith("waiting_") ||
+               observed.status === "completed" || observed.status === "failed" || observed.status === "cancelled") {
+-            if (!started) {
+-              yield* emit({ ...base(threadId, `dsh:${sessionId}:${requestId}:started`, yield* now, turnId),
++            if (!started.has(turnId)) {
++              yield* emit({ ...base(threadId, `${turnId}:started`, yield* now, turnId),
+                 type: "turn.started", payload: {} });
+-              started = true;
++              started.add(turnId);
++            }
++            if (["running", "waiting_approval", "waiting_answer"].includes(observed.status)) {
++              const session = sessions.get(threadId);
++              if (session && cursor(session.resumeCursor)?.requestId === requestId)
++                sessions.set(threadId, { ...session, activeTurnId: turnId, status: "running", updatedAt: yield* now });
+             }
+           }
+           if ("messages" in observed && observed.nativeTurn !== undefined) {
+@@ -132,26 +158,67 @@
+               emittedMessages.add(message.seq);
+             }
+           }
++          for (const approval of observed.approvals ?? []) {
++            const requestKey = `dsh:${sessionId}:${approval.id}`;
++            if (approval.actionable && !opened.has(requestKey)) {
++              pendingResponses.set(requestKey, { sessionId, requestId, turnId, nativeId: approval.id, kind: "approval" });
++              yield* emit({ ...base(threadId, requestKey + ":opened", yield* now, turnId),
++                requestId: RuntimeRequestId.make(requestKey), type: "request.opened", payload: {
++                  requestType: "permission_approval", detail: approval.reason ?? approval.toolName,
++                  options: [{ decision: "accept", label: "允许一次" }, { decision: "decline", label: "拒绝" }],
++                  args: { toolName: approval.toolName, ...(approval.callId ? { callId: approval.callId } : {}) } } });
++              opened.add(requestKey);
++            }
++            if (approval.outcome && opened.has(requestKey) && !resolved.has(requestKey)) {
++              yield* emit({ ...base(threadId, requestKey + ":resolved", yield* now, turnId),
++                requestId: RuntimeRequestId.make(requestKey), type: "request.resolved", payload: {
++                  requestType: "permission_approval", decision: approval.outcome === "allowed-once" ? "accept" : "decline",
++                  resolution: { nativeOutcome: approval.outcome } } });
++              pendingResponses.delete(requestKey); resolved.add(requestKey);
++            }
++          }
++          for (const question of observed.questions ?? []) {
++            const requestKey = `dsh:${sessionId}:question:${question.callId}`; liveQuestions.add(requestKey);
++            if (!opened.has(requestKey)) {
++              pendingResponses.set(requestKey, { sessionId, requestId, turnId, nativeId: question.callId, kind: "question" });
++              yield* emit({ ...base(threadId, requestKey + ":opened", yield* now, turnId),
++                requestId: RuntimeRequestId.make(requestKey), type: "user-input.requested", payload: {
++                  questions: question.questions.map(item => ({ id: item.id, header: item.header ?? "请回答",
++                    question: item.detail ? `${item.question}\n${item.detail}` : item.question, options: (item.options ?? []).map(option => ({ label: option.label,
++                      description: option.description ?? "" })), allowCustomAnswer: true, multiSelect: item.multiSelect ?? false })) } });
++              opened.add(requestKey);
++            }
++          }
+           if (observed.status === "waiting_approval" || observed.status === "waiting_answer") {
+-            if (waiting !== observed.status) {
+-              yield* emit({ ...base(threadId, `dsh:${sessionId}:${requestId}:${observed.status}`, yield* now, turnId),
++            if (waiting.get(turnId) !== observed.status) {
++              yield* emit({ ...base(threadId, `${turnId}:${observed.status}`, yield* now, turnId),
+                 type: "session.state.changed", payload: { state: "waiting",
+                   reason: observed.status === "waiting_approval" ? "Approval pending in original DSH Host" :
+                     "Question pending in original DSH Host" } });
+-              waiting = observed.status;
++              waiting.set(turnId, observed.status);
+             }
+           }
+           if (observed.status === "completed" || observed.status === "failed" || observed.status === "cancelled") {
+-            if (observed.nativeTurn === undefined || observed.terminalSeq === undefined) return;
+-            yield* emit({ ...base(threadId, `dsh:${sessionId}:${observed.terminalSeq}`, yield* now, turnId),
++            if (observed.nativeTurn === undefined || observed.terminalSeq === undefined) continue;
++            if (!terminalEmitted.has(turnId)) yield* emit({ ...base(threadId, `dsh:${sessionId}:${observed.terminalSeq}`, yield* now, turnId),
+               type: "turn.completed", payload: { state: observed.status } });
++            terminalEmitted.add(turnId);
+             const session = sessions.get(threadId);
+-            if (session) {
++            if (session && session.activeTurnId === turnId) {
+               const { activeTurnId: _activeTurnId, ...settled } = session;
+               sessions.set(threadId, { ...settled, status: "ready", updatedAt: yield* now });
+             }
+-            return;
+-          }
++          }
++          }
++          for (const [requestKey, response] of pendingResponses) {
++            if (response.kind === "question" && response.sessionId === sessionId && response.requestId === requestId &&
++                turns.every(turn => turn.questions !== undefined) && opened.has(requestKey) && !liveQuestions.has(requestKey) && !resolved.has(requestKey)) {
++              yield* emit({ ...base(threadId, requestKey + ":resolved", yield* now, response.turnId),
++                requestId: RuntimeRequestId.make(requestKey), type: "user-input.resolved", payload: { answers: {} } });
++              pendingResponses.delete(requestKey); resolved.add(requestKey);
++            }
++          }
++          if (turns.every(turn => ["completed", "failed", "cancelled"].includes(turn.status) && turn.terminalSeq !== undefined) && !liveQuestions.size) return;
+           yield* Effect.sleep(`${pollIntervalMs} millis`);
+         }
+       } finally { monitoring.delete(key); }
+@@ -174,6 +241,10 @@
+         yield* remote("session/create", () => options.host.create(sessionId, input.cwd!, options.preset));
+         yield* remote("session/rename", () => options.host.pinTitle(sessionId));
+       }
++      if (options.host.retain) yield* remote("$events", () => options.host.retain!(sessionId));
++      if (options.host.permission) yield* remote("commands/execute", () => options.host.permission!(sessionId, input.runtimeMode)).pipe(
++        Effect.tapError(() => Effect.sync(() => options.host.release?.(sessionId))),
++      );
+       const timestamp = yield* now;
+       const session: ProviderSession = { provider: DRIVER, providerInstanceId: options.instanceId,
+         threadId: input.threadId, status: "ready", runtimeMode: input.runtimeMode, cwd: input.cwd,
+@@ -200,12 +271,13 @@
+       if (!input.modelSelection || input.modelSelection.instanceId !== options.instanceId) {
+         return yield* error("sendTurn", "Explicit native DSH model and reasoning selection required");
+       }
+-      if (!input.sourceCommandId || !nativeId(String(input.sourceCommandId)) || !input.input?.trim() ||
+-          input.attachments?.length) return yield* new ProviderAdapterValidationError({ provider: DRIVER,
+-            operation: "sendTurn", issue: "Stable command ID and text are required; attachments are not verified" });
++      if (!input.sourceCommandId || !nativeId(String(input.sourceCommandId)) || (!input.input?.trim() && !input.attachments?.length)) return yield* new ProviderAdapterValidationError({ provider: DRIVER,
++            operation: "sendTurn", issue: "Stable command ID and valid text or attachments are required" });
+       const requestId = String(input.sourceCommandId);
+       const turnId = TurnId.make(`dsh:${requestId}`);
+-      const digest = textDigest(saved.sessionId, requestId, input.input);
++      const files = yield* Effect.try({ try: () => readDshAttachments(options.host.attachmentsDir, input.attachments ?? []),
++        catch: () => error("sendTurn", "Original attachment content unavailable") });
++      const digest = dshInputDigest(saved.sessionId, requestId, input.input ?? "", files);
+       if (saved.requestId === requestId && saved.messageDigest !== digest) {
+         return yield* error("sendTurn", "Restored command text cannot be verified; no retry was sent");
+       }
+@@ -234,7 +306,7 @@
+           yield* remote("session/rename", () => options.host.pinTitle(saved.sessionId));
+         }
+         const accepted = priorAttempt ? yield* readback()
+-          : yield* remote("session/prompt", () => options.host.prompt(saved.sessionId, requestId, input.input!)).pipe(
++          : yield* remote("session/prompt", () => options.host.prompt(saved.sessionId, requestId, input.input ?? "", files)).pipe(
+               Effect.matchEffect({ onSuccess: () => Effect.succeed(true), onFailure: readback }),
+             );
+         if (!accepted) return yield* error("sendTurn", "Prompt receipt unknown; no retry was sent");
+@@ -251,19 +323,50 @@
+   const unsupported = (method: string) => Effect.fail(error(method, "Native request identity or exact-turn condition unverified; use original DSH Host"));
+   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
+     provider: DRIVER,
+-    capabilities: { sessionModelSwitch: "unsupported", supportsConversationRollback: false },
++    capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+     startSession,
+     sendTurn,
+-    interruptTurn: () => unsupported("interruptTurn"),
+-    respondToRequest: () => unsupported("respondToRequest"),
+-    respondToUserInput: () => unsupported("respondToUserInput"),
+-    stopSession: (threadId) => Effect.sync(() => { sessions.delete(threadId); requests.delete(threadId); attempted.delete(threadId); }),
++    interruptTurn: (threadId, turnId) => Effect.gen(function* () {
++      const session = sessions.get(threadId), saved = cursor(session?.resumeCursor);
++      if (!saved?.requestId || !turnId || session?.activeTurnId !== turnId || !options.host.interrupt)
++        return yield* error("interruptTurn", "Exact original active turn unavailable");
++      yield* remote("session/cancel", () => options.host.interrupt!(saved.sessionId, saved.requestId!));
++    }),
++    respondToRequest: (threadId, requestKey, decision) => Effect.gen(function* () {
++      const saved = cursor(sessions.get(threadId)?.resumeCursor), pending = pendingResponses.get(requestKey);
++      if (!saved || pending?.kind !== "approval" || pending.sessionId !== saved.sessionId || !options.host.approve)
++        return yield* error("respondToRequest", "Original live approval unavailable");
++      yield* remote("$events/result", () => options.host.approve!(pending.sessionId, pending.requestId, pending.nativeId, decision));
++    }),
++    respondToUserInput: (threadId, requestKey, answers) => Effect.gen(function* () {
++      const saved = cursor(sessions.get(threadId)?.resumeCursor), pending = pendingResponses.get(requestKey);
++      if (!saved || pending?.kind !== "question" || pending.sessionId !== saved.sessionId || !options.host.answer)
++        return yield* error("respondToUserInput", "Original pending question unavailable");
++      yield* remote("userQuestions/answer", () => options.host.answer!(pending.sessionId, pending.requestId, pending.nativeId, answers));
++    }),
++    stopSession: threadId => Effect.gen(function* () {
++      const session = sessions.get(threadId), saved = cursor(session?.resumeCursor);
++      if (session?.activeTurnId) {
++        if (!saved?.requestId || !options.host.interrupt) return yield* error("stopSession", "Original session cancel unavailable");
++        yield* remote("session/cancel", () => options.host.interrupt!(saved.sessionId, saved.requestId!));
++        let confirmed = false;
++        for (let attempt = 0; attempt < 10; attempt++) {
++          const observed = yield* remote("session/page", () => options.host.observe(saved.sessionId, saved.requestId!));
++          if ([observed, ...(observed.followUps ?? [])].every(turn => ["cancelled","completed","failed"].includes(turn.status))) { confirmed = true; break; }
++          yield* Effect.sleep("100 millis");
++        }
++        if (!confirmed) return yield* error("stopSession", "Native cancellation unknown; original session retained");
++      }
++      if (saved) options.host.release?.(saved.sessionId);
++      sessions.delete(threadId); requests.delete(threadId); attempted.delete(threadId);
++      for (const [key, pending] of pendingResponses) if (pending.sessionId === saved?.sessionId) pendingResponses.delete(key);
++    }),
+     listSessions: () => Effect.sync(() => [...sessions.values()]),
+     hasSession: (threadId) => Effect.sync(() => sessions.has(threadId)),
+     readThread: (threadId) => Effect.sync(() => ({ threadId,
+       turns: [...(requests.get(threadId)?.values() ?? [])].map(id => ({ id, items: [] })) })),
+     rollbackThread: () => unsupported("rollbackThread"),
+-    stopAll: () => Effect.sync(() => { sessions.clear(); requests.clear(); attempted.clear(); }),
++    stopAll: () => Effect.sync(() => { for (const session of sessions.values()) { const saved = cursor(session.resumeCursor); if (saved) options.host.release?.(saved.sessionId); } sessions.clear(); requests.clear(); attempted.clear(); pendingResponses.clear(); monitorStates.clear(); }),
+     streamEvents: Stream.fromQueue(events),
+   };
+   return adapter;
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.ts b/apps/server/src/provider/Layers/DshHostProtocol.ts
+--- a/apps/server/src/provider/Layers/DshHostProtocol.ts
++++ b/apps/server/src/provider/Layers/DshHostProtocol.ts
+@@ -1,10 +1,13 @@
+ // @effect-diagnostics globalTimers:off cryptoRandomUUID:off -- This bounded native HTTP client owns its deadline and wire request IDs.
+ import type { ModelSelection, ServerProviderModel } from "@t3tools/contracts";
+-import type { DshHostPort } from "./DshAdapter.ts";
++import type { DshHostPort, DshTurnObservation } from "./DshAdapter.ts";
+ import { readDshHistoryChunk } from "./DshNativeHistory.ts";
+-
+-type DshMethod = "session/list" | "session/page" | "session/create" | "session/prompt" | "session/modelCatalog" | "session/selectModel" | "session/rename";
+-export interface DshSessionRpc { call(method: DshMethod, args: object): Promise<unknown> }
++import { DshRemoteEvents } from "./DshRemoteEvents.ts";
++
++import type { ChatAttachment, RuntimeMode } from "@t3tools/contracts";
++
++type DshMethod = "session/list" | "session/page" | "session/create" | "session/prompt" | "session/modelCatalog" | "session/selectModel" | "session/rename" | "permissionPresets/catalog" | "commands/execute" | "session/cancel" | "userQuestions/answer" | "$events/result";
++export interface DshSessionRpc { call(method: DshMethod, args: object): Promise<unknown>; readonly events?: DshRemoteEvents; uploadFile?(sessionId: string, name: string, bytes: Uint8Array): Promise<unknown> }
+ 
+ export class DshTransportError extends Error {
+   readonly code: "unavailable" | "authentication_required" | "incompatible";
+@@ -21,10 +24,12 @@
+   private readonly resolveGatewayUrl: () => Promise<string>;
+   private readonly fetcher: typeof fetch;
+   private readonly timeoutMs: number;
++  readonly events: DshRemoteEvents;
+   constructor(resolveGatewayUrl: () => Promise<string>, fetcher: typeof fetch = fetch, timeoutMs = 5000) {
+     this.resolveGatewayUrl = resolveGatewayUrl;
+     this.fetcher = fetcher;
+     this.timeoutMs = timeoutMs;
++    this.events = new DshRemoteEvents(() => this.authenticate(), args => this.call("$events/result", args));
+     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new DshTransportError("incompatible");
+   }
+ 
+@@ -40,23 +45,51 @@
+     } catch { throw new DshTransportError("authentication_required"); }
+   }
+ 
+-  async call(method: DshMethod, args: object): Promise<unknown> {
+-    if (!["session/list", "session/page", "session/create", "session/prompt", "session/modelCatalog", "session/selectModel", "session/rename"].includes(method)) {
+-      throw new DshTransportError("incompatible");
+-    }
+-    const abort = new AbortController();
+-    const timer = setTimeout(() => abort.abort(), this.timeoutMs);
++  async authenticate(signal: AbortSignal = AbortSignal.timeout(this.timeoutMs)): Promise<{ origin: string; cookie: string }> {
+     try {
+       const gateway = await this.gateway();
+-      const exchange = await this.fetcher(gateway, { redirect: "manual", signal: abort.signal });
++      const exchange = await this.fetcher(gateway, { redirect: "manual", signal });
+       const cookie = exchange.headers.get("set-cookie")?.split(";")[0];
+       await exchange.body?.cancel();
+       if (exchange.status !== 303 || !["/", "./"].includes(exchange.headers.get("location") ?? "") || !cookie ||
+           !/^[A-Za-z0-9_-]+=[A-Za-z0-9_.-]+$/.test(cookie)) throw new DshTransportError("authentication_required");
++      return { origin: gateway.origin, cookie };
++    } catch (error) { if (error instanceof DshTransportError) throw error; throw new DshTransportError("unavailable"); }
++  }
++  async uploadFile(sessionId: string, name: string, bytes: Uint8Array): Promise<unknown> {
++    if (!nativeId(sessionId) || !name || bytes.byteLength < 1 || bytes.byteLength > 50 * 1024 * 1024)
++      throw new DshTransportError("incompatible");
++    try {
++      const signal = AbortSignal.timeout(this.timeoutMs), { origin, cookie } = await this.authenticate(signal);
++      const query = new URLSearchParams({ sessionId, name });
++      const response = await this.fetcher(`${origin}/api/session/uploadFileBinary?${query}`, {
++        method: "POST", redirect: "manual", signal, headers: { Cookie: cookie, Origin: origin,
++          "Content-Type": "application/octet-stream" }, body: Buffer.from(bytes),
++      });
++      if (!response.ok || Number(response.headers.get("content-length") ?? 0) > 4096)
++        throw new DshTransportError("unavailable");
++      const reader = response.body?.getReader(); if (!reader) throw new DshTransportError("incompatible");
++      const chunks: Uint8Array[] = []; let size = 0;
++      while (true) { const part = await reader.read(); if (part.done) break; size += part.value.byteLength;
++        if (size > 4096) { await reader.cancel(); throw new DshTransportError("incompatible"); } chunks.push(part.value); }
++      const result = record(JSON.parse(Buffer.concat(chunks).toString("utf8")));
++      if (result?.ok !== true) throw new DshTransportError("incompatible");
++      return result.value;
++    } catch (error) { if (error instanceof DshTransportError) throw error; throw new DshTransportError("unavailable"); }
++  }
++
++  async call(method: DshMethod, args: object): Promise<unknown> {
++    if (!["session/list", "session/page", "session/create", "session/prompt", "session/modelCatalog", "session/selectModel", "session/rename", "permissionPresets/catalog", "commands/execute", "session/cancel", "userQuestions/answer", "$events/result"].includes(method)) {
++      throw new DshTransportError("incompatible");
++    }
++    const abort = new AbortController();
++    const timer = setTimeout(() => abort.abort(), this.timeoutMs);
++    try {
++      const { origin, cookie } = await this.authenticate(abort.signal);
+       const rpcId = crypto.randomUUID();
+-      const response = await this.fetcher(`${gateway.origin}/api/${method}`, {
++      const response = await this.fetcher(`${origin}/api/${method}`, {
+         method: "POST", redirect: "manual", signal: abort.signal,
+-        headers: { Cookie: cookie, Origin: gateway.origin, "Content-Type": "application/json" },
++        headers: { Cookie: cookie, Origin: origin, "Content-Type": "application/json" },
+         body: JSON.stringify({ type: "client-request", rpcId, method, payload: { args } }),
+       });
+       if (response.status === 401 || response.status === 403) throw new DshTransportError("authentication_required");
+@@ -143,8 +176,37 @@
+ }
+ 
+ /** Native catalog capability must survive both wire schemas before any scoped selection. */
+-export function makeDshHostProtocol(rpc: DshSessionRpc): DshHostPort {
++export function makeDshHostProtocol(rpc: DshSessionRpc, options: { attachmentsDir?: string } = {}): DshHostPort {
+   return {
++    ...(options.attachmentsDir ? { attachmentsDir: options.attachmentsDir } : {}),
++    retain: async sessionId => { if (!rpc.events) throw new DshTransportError("incompatible"); await rpc.events.retain(sessionId); },
++    release: sessionId => rpc.events?.release(sessionId),
++    permission: async (sessionId: string, mode: RuntimeMode) => {
++      if (!nativeId(sessionId)) throw new DshTransportError("incompatible");
++      const preset = mode === "auto-accept-edits" ? "workspace-write" : mode === "full-access" ? "danger-full-access" : null;
++      const catalog = record(await rpc.call("permissionPresets/catalog", {}));
++      if (!preset || !Array.isArray(catalog?.options) || !catalog.options.some(option => record(option)?.value === preset))
++        throw new DshTransportError("incompatible");
++      const rows = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
++      if (rows.length !== 1) throw new DshTransportError("incompatible");
++      if (record(rows[0]?.projections?.values?.permissions)?.currentValue !== preset) {
++        const executed = record(await rpc.call("commands/execute", { agentId: sessionId, line: `/permission ${preset}`, submittedAttachments: [] }));
++        if (record(executed?.result)?.kind !== "success") throw new DshTransportError("incompatible");
++      }
++      const current = (await listRows(rpc)).filter(row => row.sessionId === sessionId);
++      if (current.length !== 1 || record(current[0]?.projections?.values?.permissions)?.currentValue !== preset)
++        throw new DshTransportError("incompatible");
++      const knobs = await readPermissionKnobs(rpc, sessionId, current[0]!.projections!.asOfSeq);
++      if (knobs.sandbox !== preset || knobs.approval !== (preset === "workspace-write" ? "ask" : "never"))
++        throw new DshTransportError("incompatible");
++    },
++    interrupt: async (sessionId, requestId) => {
++      const observed = await readExactPrompt(rpc, sessionId, requestId);
++      if (!["running", "waiting_approval", "waiting_answer"].includes(observed.status) || observed.nativeTurn === undefined)
++        throw new DshTransportError("incompatible");
++      const response = record(await rpc.call("session/cancel", { request: { sessionId } }));
++      if (response?.accepted !== true) throw new DshTransportError("incompatible");
++    },
+     readHistory: (sessionId, cwd, preset, checkpoint) => readDshHistoryChunk(rpc, sessionId, cwd, preset, checkpoint),
+     describe: async () => {
+       await listRows(rpc);
+@@ -191,13 +253,88 @@
+       const value = record(await rpc.call("session/rename", { request: { sessionId, title } }));
+       if (value?.title !== title || !integer(value.seq)) throw new DshTransportError("incompatible");
+     },
+-    prompt: async (sessionId, requestId, text) => {
+-      if (!nativeId(sessionId) || !nativeId(requestId) || !text.trim()) throw new DshTransportError("incompatible");
+-      const value = record(await rpc.call("session/prompt", { request: { sessionId, requestId, mode: "queue",
+-        content: [{ type: "text", text }] } }));
++    prompt: async (sessionId, requestId, text, files = []) => {
++      if (!nativeId(sessionId) || !nativeId(requestId) || (!text.trim() && !files.length)) throw new DshTransportError("incompatible");
++      if (rpc.events) await rpc.events.retain(sessionId);
++      const content: object[] = text ? [{ type: "text", text }] : [];
++      for (const { attachment, bytes } of files) {
++        if (attachment.type === "image") {
++          if (!["image/png","image/jpeg","image/webp","image/gif"].includes(attachment.mimeType)) throw new DshTransportError("incompatible");
++          content.push({ type: "image", mediaType: attachment.mimeType, data: bytes.toString("base64"), name: attachment.name });
++        } else if (attachment.type === "file") {
++          if (!rpc.uploadFile) throw new DshTransportError("incompatible");
++          const uploaded = record(await rpc.uploadFile(sessionId, attachment.name, bytes)), file = record(uploaded?.file);
++          if (!nonempty(uploaded?.receiptId) || file?.bytes !== bytes.byteLength || !nonempty(file?.attachmentId))
++            throw new DshTransportError("incompatible");
++          content.push({ type: "file", receiptId: uploaded.receiptId });
++        } else throw new DshTransportError("incompatible");
++      }
++      const value = record(await rpc.call("session/prompt", { request: { sessionId, requestId, mode: "queue", content } }));
+       if (value?.accepted !== true) throw new DshTransportError("incompatible");
+     },
+-    observe: async (sessionId, requestId) => readExactPrompt(rpc, sessionId, requestId),
++    approve: async (sessionId, requestId, auditId, decision) => {
++      if (!["accept", "decline", "cancel"].includes(decision) || !rpc.events) throw new DshTransportError("incompatible");
++      const before = await readExactPrompt(rpc, sessionId, requestId);
++      const allApprovals = [before, ...(before.followUps ?? [])].flatMap(turn => turn.approvals ?? []);
++      const audits = allApprovals.filter(item => item.id === auditId), audit = audits[0];
++      if (audits.length !== 1 || !audit || audit.outcome) throw new DshTransportError("incompatible");
++      const matches = rpc.events.list(sessionId).filter(frame => frame.event === "approval/request" &&
++        frame.request.toolName === audit.toolName && frame.request.callId === audit.callId && frame.request.reason === audit.reason);
++      const duplicate = allApprovals.filter(item => !item.outcome && item.toolName === audit.toolName &&
++        item.callId === audit.callId && item.reason === audit.reason);
++      if (matches.length !== 1 || duplicate.length !== 1 || matches[0]!.submitted) throw new DshTransportError("incompatible");
++      const desired = decision === "accept" ? "allowed-once" : "rejected";
++      await rpc.events.answer(matches[0]!, desired);
++      // Another original client may have won. Read the exact audit, never HTTP ok/cancel alone.
++      for (let attempt = 0; attempt < 10; attempt++) {
++        const current = await readExactPrompt(rpc, sessionId, requestId);
++        const outcome = [current, ...(current.followUps ?? [])].flatMap(turn => turn.approvals ?? []).find(item => item.id === auditId)?.outcome;
++        if (outcome) { if (outcome !== desired) throw new DshTransportError("incompatible"); return; }
++        await new Promise(done => setTimeout(done, 100));
++      }
++      throw new DshTransportError("unavailable");
++    },
++    answer: async (sessionId, requestId, callId, answers) => {
++      const observed = await readExactPrompt(rpc, sessionId, requestId);
++      const matches = [observed, ...(observed.followUps ?? [])].flatMap(turn => turn.questions ?? []).filter(item => item.callId === callId);
++      const question = matches[0];
++      if (matches.length !== 1 || !question) throw new DshTransportError("incompatible");
++      const batch = question.questions.map(item => {
++        const raw = answers[item.id];
++        const values = typeof raw === "string" ? [raw] : Array.isArray(raw) ? raw : record(raw)?.answers;
++        if (!Array.isArray(values) || values.some(value => typeof value !== "string")) throw new DshTransportError("incompatible");
++        const labels = (item.options ?? []).map(option => option.label);
++        const selected = values.filter((value: string) => labels.includes(value)), custom = values.filter((value: string) => !labels.includes(value));
++        if (!item.multiSelect && selected.length > 1) throw new DshTransportError("incompatible");
++        return { id: item.id, selected, ...(custom.length ? { custom: custom.join("\n") } : {}) };
++      });
++      if (Object.keys(answers).length !== batch.length) throw new DshTransportError("incompatible");
++      if (question.state === "open") {
++        if (!rpc.events) throw new DshTransportError("incompatible");
++        const pending = rpc.events.list(sessionId).filter(frame => frame.event === "user-questions/request" &&
++          record(frame.request.wait)?.callId === callId);
++        if (pending.length !== 1) throw new DshTransportError("incompatible");
++        await rpc.events.answer(pending[0]!, { answers: batch });
++      } else {
++        const accepted = await rpc.call("userQuestions/answer", { agentId: sessionId, callId, answer: { answers: batch } });
++        if (accepted !== true) throw new DshTransportError("incompatible");
++        // True is queued submission; the native projection closes only on admission.
++      }
++    },
++    observe: async (sessionId, requestId) => {
++      if (rpc.events) await rpc.events.refresh(sessionId);
++      const observed = await readExactPrompt(rpc, sessionId, requestId);
++      const frames = rpc.events?.list(sessionId) ?? [];
++      const allApprovals = [observed, ...(observed.followUps ?? [])].flatMap(turn => turn.approvals ?? []);
++      const decorate = (turn: DshTurnObservation) => turn.approvals?.map(audit => ({ ...audit,
++        actionable: !audit.outcome && frames.filter(frame => frame.event === "approval/request" &&
++          frame.request.toolName === audit.toolName && frame.request.callId === audit.callId && frame.request.reason === audit.reason && !frame.submitted).length === 1 &&
++          allApprovals.filter(item => !item.outcome && item.toolName === audit.toolName && item.callId === audit.callId && item.reason === audit.reason).length === 1,
++      }));
++      const approvals = decorate(observed);
++      return { ...observed, ...(approvals ? { approvals } : {}), ...(observed.followUps ? {
++        followUps: observed.followUps.map(turn => ({ ...turn, approvals: decorate(turn) ?? [] })) } : {}) };
++    },
+   };
+ }
+ 
+@@ -216,7 +353,9 @@
+     const events: NativeEvent[] = [];
+     let beforeSeq: number | undefined;
+     let exhausted = false;
+-    for (let pageIndex = 0; pageIndex < 16; pageIndex++) {
++    // The frozen upper sequence and strictly decreasing cursor make this finite
++    // without discarding older commands in long original sessions.
++    for (;;) {
+       const page = record(await rpc.call("session/page", { request: { address: { kind: "session", sessionId }, throughSeq,
+         maxMessages: 6, ...(beforeSeq === undefined ? {} : { beforeSeq }) } }));
+       const records = page?.records;
+@@ -230,13 +369,16 @@
+       if (!page.hasMore) { exhausted = true; break; }
+       beforeSeq = current[0]?.seq as number;
+     }
+-    let activeTurn: number | null = null;
+-    let boundTurn: number | null = null;
+-    let end: { seq: number; reason: string } | null = null;
+-    let duplicate = false;
+-    const messages: { seq: number; text: string }[] = [];
++    let activeTurn: number | null = null, boundTurn: number | null = null;
+     const foreignTurns = new Set<number>();
+-    const pending = new Set<string>();
++    type Turn = { nativeTurn: number; callId?: string; end?: { seq: number; reason: string };
++      messages: { seq: number; text: string }[]; pending: Set<string>; calls: Set<string>;
++      approvals: NonNullable<DshTurnObservation["approvals"]>[number][] };
++    const turns = new Map<number, Turn>(), questionOwners = new Map<string, number>(), replies = new Set<string>();
++    const addTurn = (nativeTurn: number, callId?: string): Turn => {
++      const value: Turn = { nativeTurn, ...(callId ? { callId } : {}), messages: [], pending: new Set(), calls: new Set(), approvals: [] };
++      turns.set(nativeTurn, value); return value;
++    };
+     for (const event of events.sort((a, b) => a.seq - b.seq)) {
+       const data = record(event.data);
+       const turn = data?.turn;
+@@ -244,12 +386,25 @@
+       if (event.type === "user/message" && activeTurn !== null) {
+         const source = record(data?.source);
+         if (source?.kind === "user" && source.rpcId === requestId) {
+-          if (boundTurn !== null) duplicate = true;
+-          boundTurn = activeTurn;
++          if (boundTurn !== null) return unknown;
++          boundTurn = activeTurn; addTurn(activeTurn);
+         } else if (source?.kind === "user") foreignTurns.add(activeTurn);
+-      }
+-      if (boundTurn !== null && activeTurn === boundTurn) {
+-        if (event.type === "assistant/message" && turn === boundTurn) {
++        else if (source?.kind === "user-question-reply" && source.outcome === "answered" &&
++            nonempty(source.callId) && questionOwners.has(source.callId)) {
++          if (replies.has(source.callId)) return unknown;
++          replies.add(source.callId);
++          if (!turns.has(activeTurn)) addTurn(activeTurn, source.callId);
++        } else if (source?.kind === "user-question-reply") foreignTurns.add(activeTurn);
++      }
++      const current: Turn | undefined = activeTurn === null ? undefined : turns.get(activeTurn);
++      if (current) {
++        const questionCall = data?.name === "ask_user_question" ?
++          event.type === "tool/call" ? data.callId : event.type === "tool/ptc-dispatch" ? data.subCallId : null : null;
++        if (nonempty(questionCall)) {
++          if (questionOwners.has(questionCall)) return unknown;
++          current.calls.add(questionCall); questionOwners.set(questionCall, current.nativeTurn);
++        }
++        if (event.type === "assistant/message" && turn === current.nativeTurn) {
+           const content = record(data?.message)?.content;
+           if (!Array.isArray(content)) return unknown;
+           const texts: string[] = [];
+@@ -262,25 +417,81 @@
+             }
+           }
+           const text = texts.join("");
+-          if (text.trim()) messages.push({ seq: event.seq, text });
+-        }
+-        if (event.type === "approval/asked" && typeof data?.id === "string") pending.add(data.id);
+-        if (event.type === "approval/decided" && typeof data?.id === "string") pending.delete(data.id);
++          if (text.trim()) current.messages.push({ seq: event.seq, text });
++        }
++        if (event.type === "approval/asked" && typeof data?.id === "string" && typeof data.toolName === "string") {
++          if (current.approvals.some(item => item.id === data.id)) return unknown;
++          current.pending.add(data.id); current.approvals.push({ id: data.id, toolName: data.toolName,
++            ...(typeof data.callId === "string" ? { callId: data.callId } : {}),
++            ...(typeof data.reason === "string" ? { reason: data.reason } : {}) });
++        }
++        if (event.type === "approval/decided" && typeof data?.id === "string") {
++          current.pending.delete(data.id); const audit = current.approvals.find(item => item.id === data.id);
++          if (audit && typeof data.outcome === "string") audit.outcome = data.outcome;
++        }
+       }
+       if (event.type === "turn/end" && integer(turn)) {
+-        if (boundTurn === turn) end = { seq: event.seq, reason: String(record(data?.reason)?.kind ?? "") };
++        const ended = turns.get(turn);
++        if (ended) {
++          if (ended.end) return unknown;
++          ended.end = { seq: event.seq, reason: String(record(data?.reason)?.kind ?? "") };
++        }
+         if (activeTurn === turn) activeTurn = null;
+       }
+     }
+-    if (duplicate || boundTurn !== null && foreignTurns.has(boundTurn) || queued && end) return unknown;
++    if (!exhausted || [...turns.keys()].some(turn => foreignTurns.has(turn)) || queued && boundTurn !== null) return unknown;
+     if (boundTurn === null) return queued ? { status: "queued" } : unknown;
+-    if (end) {
+-      const status = end.reason === "completed" && pending.size === 0 ? "completed" :
+-        ["aborted", "interrupted"].includes(end.reason) ? "cancelled" :
+-        ["error", "blocked", "max-tokens"].includes(end.reason) ? "failed" : "unknown";
+-      return status === "unknown" ? unknown : { status, nativeTurn: boundTurn, terminalSeq: end.seq, messages };
+-    }
+-    if (!row.running || activeTurn !== boundTurn || !exhausted) return unknown;
+-    return { status: pending.size ? "waiting_approval" : "running", nativeTurn: boundTurn, messages };
++    const questionView = record(row.projections?.values?.userQuestions);
++    if (!Array.isArray(questionView?.active) || !Array.isArray(questionView?.settled)) return unknown;
++    const activeQuestions = questionView.active;
++    const questions: NonNullable<DshTurnObservation["questions"]> = Array.isArray(activeQuestions)
++      ? activeQuestions.filter(item => questionOwners.has(String(record(item)?.callId)) && (record(item)?.state === "open" || record(item)?.state === "continued"))
++          .map(item => item as NonNullable<DshTurnObservation["questions"]>[number]) : [];
++    if (questions.some(question => !nonempty(question.callId) || !Array.isArray(question.questions) ||
++        !question.questions.length || question.questions.some(item => !nonempty(item.id) || !nonempty(item.question)))) return unknown;
++    if (new Set(questions.map(question => question.callId)).size !== questions.length) return unknown;
++    const observations: (DshTurnObservation & { nativeTurn: number; callId?: string })[] = [];
++    for (const current of turns.values()) {
++      const ownedQuestions = questions.filter(question => current.calls.has(question.callId));
++      const status: DshTurnObservation["status"] = current.end ?
++        current.end.reason === "completed" && current.pending.size === 0 ? "completed" :
++        ["aborted", "interrupted"].includes(current.end.reason) ? "cancelled" :
++        ["error", "blocked", "max-tokens"].includes(current.end.reason) ? "failed" : "unknown" :
++        row.running && activeTurn === current.nativeTurn ?
++          current.pending.size ? "waiting_approval" : ownedQuestions.length ? "waiting_answer" : "running" : "unknown";
++      if (status === "unknown") return unknown;
++      observations.push({ status, nativeTurn: current.nativeTurn, ...(current.callId ? { callId: current.callId } : {}),
++        ...(current.end ? { terminalSeq: current.end.seq } : {}), messages: current.messages, approvals: current.approvals, questions: ownedQuestions });
++    }
++    const root = observations[0]!;
++    return { ...root, followUps: observations.slice(1) as (DshTurnObservation & { nativeTurn: number; callId: string })[] };
+   } catch { return unknown; }
+ }
++
++/** The catalog advertises names. Native audit verifies the actual knob values,
++ * including a configured preset reusing a familiar name with different policy. */
++async function readPermissionKnobs(rpc: DshSessionRpc, sessionId: string, throughSeq: number) {
++  if (!integer(throughSeq)) throw new DshTransportError("incompatible");
++  let beforeSeq: number | undefined;
++  const knobs: { sandbox?: string; approval?: string } = {};
++  for (;;) {
++    const page = record(await rpc.call("session/page", { request: { address: { kind: "session", sessionId },
++      throughSeq, maxMessages: 6, ...(beforeSeq === undefined ? {} : { beforeSeq }) } }));
++    if (!Array.isArray(page?.records) || !page.records.length || typeof page.hasMore !== "boolean") break;
++    const events = page.records.map(item => record(record(item)?.event));
++    if (events.some(event => !event || !integer(event.seq) || Number(event.seq) >= (beforeSeq ?? throughSeq + 1)))
++      throw new DshTransportError("incompatible");
++    if (events.at(-1)?.seq !== (beforeSeq ?? throughSeq + 1) - 1 ||
++        events.some((event, index) => index > 0 && Number(event?.seq) !== Number(events[index - 1]?.seq) + 1))
++      throw new DshTransportError("incompatible");
++    for (const event of [...events].reverse()) {
++      const data = record(event?.data);
++      if (!knobs.sandbox && event?.type === "sandbox/mode" && nonempty(data?.mode)) knobs.sandbox = data.mode;
++      if (!knobs.approval && event?.type === "approval/policy" && nonempty(data?.policy)) knobs.approval = data.policy;
++    }
++    if (knobs.sandbox && knobs.approval) return knobs;
++    if (!page.hasMore) break;
++    beforeSeq = Number(events[0]?.seq);
++  }
++  throw new DshTransportError("incompatible");
++}
+diff --git a/apps/server/src/provider/Layers/DshNativeHistory.ts b/apps/server/src/provider/Layers/DshNativeHistory.ts
+--- a/apps/server/src/provider/Layers/DshNativeHistory.ts
++++ b/apps/server/src/provider/Layers/DshNativeHistory.ts
+@@ -5,7 +5,7 @@
+ /** Forward checkpoint in bounded event batches; each batch is read from the original, stable native head. */
+ export async function readDshHistoryChunk(rpc: DshSessionRpc, sessionId: string, cwd: string, preset: string, checkpoint?: unknown): Promise<NativeHistory> {
+   const saved = object(checkpoint);
+-  const afterSeq = Number.isSafeInteger(saved?.afterSeq) && saved!.afterSeq >= -1 ? saved!.afterSeq as number : -1;
++  const afterSeq = saved?.version === 2 && Number.isSafeInteger(saved?.afterSeq) && saved!.afterSeq >= -1 ? saved!.afterSeq as number : -1;
+   const listed = object(await rpc.call("session/list", { _request: {} }));
+   const matches = Array.isArray(listed?.items) ? listed.items.filter(r => r.sessionId === sessionId) : [];
+   const row = matches[0], head = row?.projections?.asOfSeq;
+@@ -22,9 +22,14 @@
+   events.sort((a, b) => a.seq - b.seq);
+   if (events.length !== throughSeq - afterSeq || events.some((e, i) => e.seq !== afterSeq + 1 + i)) throw Error("Original DSH history checkpoint gap");
+   const turns: NativeTurn[] = [];
+-  let active: NativeTurn | null = saved?.activeTurn ? structuredClone(saved.activeTurn) : null;
++  let active: NativeTurn | null = saved?.version === 2 && saved.activeTurn ? structuredClone(saved.activeTurn) : null;
+   if (active) turns.push(active);
+-  const pending = new Map<string, string>(Array.isArray(saved?.pending) ? saved.pending : []);
++  const pending = new Map<string, string>(saved?.version === 2 && Array.isArray(saved.pending) ? saved.pending : []);
++  const questionOwners = new Map<string, string>(saved?.version === 2 && Array.isArray(saved.questionOwners) ? saved.questionOwners : []);
++  const questionView = object(row.projections?.values?.userQuestions);
++  if (!Array.isArray(questionView?.active) || !Array.isArray(questionView?.settled)) throw Error("Original DSH question wire projection unavailable");
++  const questions = questionView.active;
++  if (!Array.isArray(questions) || questions.some(q => !object(q) || typeof q.callId !== "string" || !q.callId || !["open", "continued"].includes(q.state) || !Array.isArray(q.questions) || !q.questions.length || q.questions.some((item: any) => typeof item?.id !== "string" || !item.id || typeof item.question !== "string" || !item.question)) || new Set(questions.map(q => q.callId)).size !== questions.length) throw Error("Original DSH question projection unavailable");
+   const stamp = (e: any) => {
+     if (!Number.isSafeInteger(e.time) || e.time < 0) throw Error("Original DSH timestamp unavailable");
+     return new Date(e.time).toISOString();
+@@ -38,9 +41,18 @@
+       if (!active || active.id !== `turn:${d?.turn}`) throw Error("Original DSH terminal identity conflict");
+       active.state = d.reason?.kind === "completed" ? "completed" : ["aborted", "interrupted"].includes(d.reason?.kind) ? "interrupted" : "error";
+       active.completedAt = stamp(e); active = null; pending.clear();
+-    } else if (e.type === "user/message" && d?.source?.kind === "user") {
+-      if (!active || d.role !== "user" || typeof d.id !== "string" || typeof d.source.rpcId !== "string") throw Error("Original DSH human message identity conflict");
+-      active.messages.push({ id: `dsh:${sessionId}:${e.seq}`, role: "user", text: nativeVisibleText(d.content), createdAt: stamp(e), sourceCommandId: d.source.rpcId });
++    } else if (e.type === "tool/call" && d?.name === "ask_user_question") {
++      if (!active || typeof d.callId !== "string" || !d.callId || questionOwners.has(d.callId)) throw Error("Original DSH question call identity conflict");
++      questionOwners.set(d.callId, active.id);
++    } else if (e.type === "user/message" && ["user", "user-question-reply"].includes(d?.source?.kind)) {
++      if (!active || d.role !== "user" || typeof d.id !== "string") throw Error("Original DSH human message identity conflict");
++      if (d.source.kind === "user") {
++        if (typeof d.source.rpcId !== "string") throw Error("Original DSH prompt source identity conflict");
++      } else {
++        if (d.source.outcome !== "answered" || !questionOwners.has(d.source.callId)) throw Error("Original DSH question reply identity conflict");
++        active.sourceTurnId = `dsh:${sessionId}:question:${d.source.callId}:${active.id.slice(5)}`;
++      }
++      active.messages.push({ id: `dsh:${sessionId}:${e.seq}`, role: "user", text: nativeVisibleText(d.content), createdAt: stamp(e), ...(d.source.kind === "user" ? { sourceCommandId: d.source.rpcId } : {}) });
+     } else if (e.type === "assistant/message") {
+       if (!active || active.id !== `turn:${d?.turn}` || d.message?.role !== "assistant" || typeof d.message.id !== "string") throw Error("Original DSH assistant identity conflict");
+       const text = nativeVisibleText(d.message.content);
+@@ -51,7 +63,17 @@
+   }
+   const complete = throughSeq === head;
+   if (complete && !!active !== row.running) throw Error("Original DSH lifecycle not yet consistent");
++  if (complete) {
++    for (const [id, kind] of pending) if (kind === "question") pending.delete(id);
++    for (const question of questions) {
++      if (!questionOwners.has(question.callId)) throw Error("Original DSH question owner identity conflict");
++      pending.set(question.callId, "question");
++    }
++    // Only still-active question owners need to survive the bounded checkpoint.
++    const activeIds = new Set(questions.map(q => q.callId));
++    for (const id of questionOwners.keys()) if (!activeIds.has(id)) questionOwners.delete(id);
++  }
+   const observation = !complete ? "unknown" : pending.size ? [...pending.values()].some(k => k.includes("question")) ? "waiting_answer" : "waiting_approval" : active ? "running" : "ready";
+   // The active turn is small and carried across batches; completed older turns are never copied into this checkpoint.
+-  return { nativeId: sessionId, cwd, turns, complete, observation, checkpoint: { afterSeq: throughSeq, activeTurn: active, pending: [...pending] } };
++  return { nativeId: sessionId, cwd, turns, complete, observation, checkpoint: { version: 2, afterSeq: throughSeq, activeTurn: active, pending: [...pending], questionOwners: [...questionOwners] } };
+ }
+diff --git a/apps/server/src/provider/Layers/DshRemoteEvents.ts b/apps/server/src/provider/Layers/DshRemoteEvents.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshRemoteEvents.ts
+@@ -0,0 +1,123 @@
++// @effect-diagnostics globalTimers:off -- Native WS connection deadlines, not provider task scheduling.
++// Fixed DSH 0.2.0-rc.2 Gateway $events carrier. No browser or second task queue.
++import { NodeWS } from "@effect/platform-node/NodeSocket";
++const WebSocket = NodeWS.WebSocket;
++import { randomUUID } from "node:crypto";
++
++export interface DshRemoteEvent {
++  readonly clientId: string;
++  readonly eventId: string;
++  readonly agentId: string;
++  readonly event: "approval/request" | "user-questions/request";
++  readonly request: Record<string, unknown>;
++  submitted: boolean;
++}
++const object = (value: unknown): Record<string, unknown> | null =>
++  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
++const id = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 512;
++
++/** One live connection for this original Host. Disconnect revokes every answer;
++ * reconnect reads pending native events but never repeats an earlier decision.
++ */
++export class DshRemoteEvents {
++  private readonly owned = new Set<string>();
++  private readonly submitted = new Set<string>();
++  private readonly pending = new Map<string, DshRemoteEvent>();
++  private socket: InstanceType<typeof WebSocket> | null = null;
++  private connecting: Promise<void> | null = null;
++  private clientId: string | null = null;
++  private generation = 0;
++  private readonly authenticate: () => Promise<{ origin: string; cookie: string }>;
++  private readonly result: (args: object) => Promise<unknown>;
++  constructor(authenticate: () => Promise<{ origin: string; cookie: string }>, result: (args: object) => Promise<unknown>) {
++    this.authenticate = authenticate; this.result = result;
++  }
++
++  async retain(sessionId: string): Promise<void> {
++    this.owned.add(sessionId);
++    try { await this.ensure(); } catch (error) { this.owned.delete(sessionId); throw error; }
++  }
++  release(sessionId: string): void {
++    this.owned.delete(sessionId);
++    for (const [key, frame] of this.pending) if (frame.agentId === sessionId) this.pending.delete(key);
++    if (!this.owned.size) this.close();
++  }
++  close(): void {
++    this.generation++;
++    const socket = this.socket; this.socket = null; this.clientId = null; this.pending.clear();
++    // Closing delivery leaves the original native request for another client.
++    socket?.close();
++  }
++  list(sessionId: string): readonly DshRemoteEvent[] {
++    if (!this.owned.has(sessionId) || !this.clientId || this.socket?.readyState !== WebSocket.OPEN) return [];
++    return [...this.pending.values()].filter(frame => frame.agentId === sessionId && frame.clientId === this.clientId);
++  }
++  async refresh(sessionId: string): Promise<void> {
++    if (!this.owned.has(sessionId)) throw Error("dsh_request_expired");
++    await this.ensure();
++  }
++  async answer(frame: DshRemoteEvent, value: unknown): Promise<void> {
++    if (this.pending.get(frame.eventId) !== frame || frame.submitted ||
++        frame.clientId !== this.clientId || this.socket?.readyState !== WebSocket.OPEN || !this.owned.has(frame.agentId))
++      throw Error("dsh_request_expired");
++    frame.submitted = true; this.submitted.add(frame.eventId); // An ambiguous result must never repeat this authorization.
++    await this.result({ clientId: frame.clientId, eventId: frame.eventId, outcome: { kind: "result", value } });
++    // HTTP ok can be a no-op. Only original session audit/projection confirms it.
++  }
++  private async ensure(): Promise<void> {
++    if (this.clientId && this.socket?.readyState === WebSocket.OPEN) return;
++    if (this.connecting) return this.connecting;
++    this.connecting = this.connect();
++    try { await this.connecting; } finally { this.connecting = null; }
++  }
++  private async connect(): Promise<void> {
++    const generation = this.generation;
++    const { origin, cookie } = await this.authenticate();
++    if (generation !== this.generation || !this.owned.size) throw Error("dsh_request_expired");
++    const streamId = randomUUID();
++    await new Promise<void>((resolve, reject) => {
++      const socket = new WebSocket(origin.replace(/^http:/, "ws:") + "/api/remote.mux", {
++        headers: { Cookie: cookie, Origin: origin }, maxPayload: 1024 * 1024, handshakeTimeout: 5000,
++      });
++      this.socket = socket; this.clientId = null; this.pending.clear();
++      let ready = false;
++      const timer = setTimeout(() => { socket.close(); reject(Error("dsh_events_unavailable")); }, 5000);
++      const revoke = () => {
++        clearTimeout(timer);
++        if (this.socket === socket) { this.socket = null; this.clientId = null; this.pending.clear(); }
++        if (!ready) reject(Error("dsh_events_unavailable"));
++      };
++      socket.on("error", revoke); socket.on("close", revoke);
++      socket.on("open", () => {
++        if (generation !== this.generation || !this.owned.size) { socket.close(); revoke(); return; }
++        socket.send(JSON.stringify({ type: "open", streamId, endpoint: "$events", payload: { args: {} } }));
++      });
++      socket.on("message", (bytes, binary) => {
++        try {
++          if (binary || this.socket !== socket || generation !== this.generation || !this.owned.size) throw Error("dsh_events_invalid");
++          const frame = object(JSON.parse(bytes.toString()));
++          if (frame?.streamId !== streamId || frame.type !== "item") throw Error("dsh_events_invalid");
++          const value = object(frame.value);
++          if (!value) throw Error("dsh_events_invalid");
++          if (value.type === "ready" && id(value.clientId) && !ready) {
++            this.clientId = value.clientId; ready = true; clearTimeout(timer); resolve(); return;
++          }
++          if (!ready || !this.clientId) throw Error("dsh_events_invalid");
++          if (value.type === "cancel" && id(value.eventId)) { this.pending.delete(value.eventId); return; }
++          if (value.type === "emit") return;
++          const request = object(value.request);
++          if (value.type !== "waterfall" || !id(value.eventId) || !id(value.agentId) || !id(value.event) || !request)
++            throw Error("dsh_events_invalid");
++          if (!this.owned.has(value.agentId) || !["approval/request", "user-questions/request"].includes(value.event)) {
++            // The SDK default listener declines to handle unrelated waterfalls.
++            void this.result({ clientId: this.clientId, eventId: value.eventId, outcome: { kind: "next" } }).catch(() => socket.close());
++            return;
++          }
++          if (this.pending.size >= 128 || this.pending.has(value.eventId)) throw Error("dsh_events_invalid");
++          this.pending.set(value.eventId, { clientId: this.clientId, eventId: value.eventId,
++            agentId: value.agentId, event: value.event as DshRemoteEvent["event"], request, submitted: this.submitted.has(value.eventId) });
++        } catch { socket.close(); revoke(); }
++      });
++    });
++  }
++}
+diff --git a/apps/server/src/provider/Layers/DshWebInput.ts b/apps/server/src/provider/Layers/DshWebInput.ts
+new file mode 100644
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshWebInput.ts
+@@ -0,0 +1,37 @@
++// @effect-diagnostics nodeBuiltinImport:off -- Freeze immutable original upload bytes before the durable claim.
++import { createHash } from "node:crypto";
++import { constants, openSync, fstatSync, readFileSync, closeSync, realpathSync } from "node:fs";
++import { type ChatAttachment } from "@t3tools/contracts";
++import { resolveAttachmentPath } from "../../attachmentStore.ts";
++
++/** Read the original immutable upload IDs before any Host operation. Native
++ * receipts are ephemeral; the durable T3 cursor instead freezes content hashes.
++ */
++export function readDshAttachments(attachmentsDir: string | undefined, attachments: readonly ChatAttachment[]) {
++  return attachments.map(attachment => {
++    if (!attachmentsDir || !["file", "image"].includes(attachment.type) || !attachment.sizeBytes ||
++        attachment.sizeBytes > (attachment.type === "image" ? 10 : 50) * 1024 * 1024)
++      throw Error("dsh_attachment_unavailable");
++    const file = resolveAttachmentPath({ attachmentsDir, attachment });
++    if (!file || realpathSync(file) !== file) throw Error("dsh_attachment_unavailable");
++    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
++    try {
++      const before = fstatSync(fd);
++      if (!before.isFile() || before.size !== attachment.sizeBytes) throw Error("dsh_attachment_unavailable");
++      const bytes = readFileSync(fd), after = fstatSync(fd);
++      if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || bytes.length !== before.size)
++        throw Error("dsh_attachment_changed");
++      const sha256 = createHash("sha256").update(bytes).digest("hex");
++      return { attachment, bytes, sha256 };
++    } finally { closeSync(fd); }
++  });
++}
++
++export function dshInputDigest(sessionId: string, requestId: string, text: string,
++  files: ReturnType<typeof readDshAttachments>) {
++  // Preserve original text-only cursor compatibility.
++  const input = files.length ? [sessionId, requestId, text, files.map(({ attachment, sha256 }) =>
++    ({ id: attachment.id, type: attachment.type, name: attachment.name, mimeType: attachment.mimeType,
++      sizeBytes: attachment.sizeBytes, sha256 }))] : [sessionId, requestId, text];
++  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
++}
+diff --git a/apps/server/src/provider/Layers/ProviderService.ts b/apps/server/src/provider/Layers/ProviderService.ts
+--- a/apps/server/src/provider/Layers/ProviderService.ts
++++ b/apps/server/src/provider/Layers/ProviderService.ts
+@@ -1742,7 +1742,7 @@
+             if (routed.adapter.provider === "dsh") {
+               const binding = yield* directory.getBinding(input.threadId);
+               const pending = Option.isSome(binding) && binding.value.providerInstanceId === routed.instanceId
+-                ? dshPendingPromptCursor(binding.value.resumeCursor, input.sourceCommandId, input.input) : null;
++                ? dshPendingPromptCursor(binding.value.resumeCursor, input.sourceCommandId, input.input, input.attachments ?? [], serverConfig.attachmentsDir) : null;
+               if (!pending || Option.isNone(binding)) {
+                 return yield* toValidationError("ProviderService.sendTurn", "DSH command identity cannot be durably prepared");
+               }
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -456,9 +456,10 @@
+   Effect.gen(function* () {
+     const environment = yield* ServerEnvironment.ServerEnvironment;
+     const environmentId = yield* environment.getEnvironmentId;
++    const config = yield* ServerConfig.ServerConfig;
+     return { environmentId,
+       port: makeDshHostProtocol(new HttpDshSessionRpc(() =>
+-        resolveDshGatewayUrl(process.env.AAAAGENT_DSH_WEB_LOG))),
++        resolveDshGatewayUrl(process.env.AAAAGENT_DSH_WEB_LOG)), { attachmentsDir: config.attachmentsDir }),
+     };
+   }),
+ );
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -346,6 +346,8 @@
+   {
+     type:
+       | "thread.native-session-synced"
++      | "thread.approval-response-requested"
++      | "thread.user-input-response-requested"
+       | "thread.message-sent"
+       | "thread.proposed-plan-upserted"
+       | "thread.activity-appended"
+@@ -356,6 +358,8 @@
+ > {
+   return (
+     event.type === "thread.native-session-synced" ||
++    event.type === "thread.approval-response-requested" ||
++    event.type === "thread.user-input-response-requested" ||
+     event.type === "thread.message-sent" ||
+     event.type === "thread.proposed-plan-upserted" ||
+     event.type === "thread.activity-appended" ||
+diff --git a/packages/client-runtime/src/pendingRequests.ts b/packages/client-runtime/src/pendingRequests.ts
+--- a/packages/client-runtime/src/pendingRequests.ts
++++ b/packages/client-runtime/src/pendingRequests.ts
+@@ -173,6 +173,7 @@
+     } else if (
+       activity.kind === "approval.resolved" ||
+       (activity.kind === "provider.approval.respond.failed" &&
++        !requestId.startsWith("dsh:") &&
+         isStaleRequestFailure(activity.kind, payload))
+     ) {
+       closedApprovals.add(requestId);
+@@ -180,6 +181,7 @@
+     } else if (
+       activity.kind === "user-input.resolved" ||
+       (activity.kind === "provider.user-input.respond.failed" &&
++        !requestId.startsWith("dsh:") &&
+         isStaleRequestFailure(activity.kind, payload))
+     ) {
+       closedUserInputs.add(requestId);
+diff --git a/packages/client-runtime/src/state/threadReducer.ts b/packages/client-runtime/src/state/threadReducer.ts
+--- a/packages/client-runtime/src/state/threadReducer.ts
++++ b/packages/client-runtime/src/state/threadReducer.ts
+@@ -681,7 +681,14 @@
+ 
+     // ── Activities ──────────────────────────────────────────────────
+     case "thread.activity-appended": {
+-      const activity = event.payload.activity;
++      let activity = event.payload.activity;
++      const payload = typeof activity.payload === "object" && activity.payload !== null ? activity.payload as Record<string, unknown> : null;
++      if (typeof payload?.requestId === "string" && payload.requestId.startsWith("dsh:") &&
++          ["approval.requested", "user-input.requested"].includes(activity.kind)) {
++        const previous = thread.activities.find(item => item.id === activity.id);
++        const old = typeof previous?.payload === "object" && previous.payload !== null ? previous.payload as Record<string, unknown> : null;
++        if (old?.responseSubmitted) activity = { ...activity, payload: { ...payload, responseSubmitted: old.responseSubmitted } };
++      }
+       // A resolvable context-window update supersedes earlier resolvable ones
+       // for the same turn: consumers only read the latest value (walking the
+       // array backwards), and providers stream these updates continuously, so
+@@ -738,9 +745,19 @@
+       };
+     }
+ 
++    case "thread.approval-response-requested":
++    case "thread.user-input-response-requested": {
++      if (!event.payload.requestId.startsWith("dsh:")) return { kind: "unchanged" };
++      const kind = event.type === "thread.approval-response-requested" ? "approval.requested" : "user-input.requested";
++      const activities = thread.activities.map(activity => {
++        const payload = typeof activity.payload === "object" && activity.payload !== null ? activity.payload as Record<string, unknown> : null;
++        return activity.kind === kind && payload?.requestId === event.payload.requestId
++          ? { ...activity, payload: { ...payload, responseSubmitted: {
++              commandId: event.commandId, sequence: event.sequence, submittedAt: event.occurredAt } } } : activity;
++      });
++      return { kind: "updated", thread: { ...thread, activities, updatedAt: event.occurredAt } };
++    }
+     // ── Events that don't mutate thread state directly ──────────────
+-    case "thread.approval-response-requested":
+-    case "thread.user-input-response-requested":
+     case "thread.checkpoint-revert-requested":
+       return { kind: "unchanged" };
+   }
+diff --git a/packages/client-runtime/src/work-log/userInput.ts b/packages/client-runtime/src/work-log/userInput.ts
+--- a/packages/client-runtime/src/work-log/userInput.ts
++++ b/packages/client-runtime/src/work-log/userInput.ts
+@@ -135,6 +135,7 @@
+     if (!isQuestionAnswer(answer)) continue;
+     const submittedAnswer =
+       Object.keys(answers).length > 0 || Object.keys(attachmentsByQuestionId).length > 0;
++    const resolution = group.findLast((activity) => activity.kind === "user-input.resolved");
+     for (const activity of group) replacements.set(activity, null);
+     replacements.set(group[0]!, {
+       ...group[0]!,
+@@ -142,9 +143,7 @@
+       tone: "tool",
+       summary: submittedAnswer
+         ? "User input submitted"
+-        : group.some((activity) => activity.kind === "user-input.resolved")
+-          ? "User input dismissed"
+-          : "User input requested",
++        : resolution?.summary ?? "User input requested",
+       payload: answer,
+     });
+   }

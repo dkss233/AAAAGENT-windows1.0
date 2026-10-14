@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "host": "127.0.0.1",
+  "port": 19380,
+  "timeoutMs": 120000,
+  "maxBodyBytes": 26214400,
+  "providers": {
+    "ollama": {
+      "enabled": false,
+      "protocol": "ollama",
+      "baseUrl": "http://127.0.0.1:11434",
+      "models": { "chat": ["qwen3.5:0.8b", "qwen3.5:2b", "qwen3.5:4b"] }
+    },
+    "local-openai": {
+      "enabled": false,
+      "protocol": "openai",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "models": { "chat": { "local-chat": "your-loaded-model-id" } }
+    },
+    "sensevoice": {
+      "enabled": true,
+      "protocol": "sensevoice",
+      "modelPath": "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx",
+      "tokensPath": "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/tokens.txt",
+      "numThreads": 4,
+      "models": { "asr": ["sensevoice-small"] }
+    },
+    "gpt-sovits": {
+      "enabled": true,
+      "protocol": "gpt-sovits",
+      "baseUrl": "http://127.0.0.1:9880",
+      "voices": {},
+      "models": { "tts": ["gpt-sovits"] }
+    },
+    "paraformer": {
+      "enabled": true,
+      "protocol": "paraformer",
+      "modelPath": "models/sherpa-onnx-paraformer-zh-2024-03-09/model.int8.onnx",
+      "tokensPath": "models/sherpa-onnx-paraformer-zh-2024-03-09/tokens.txt",
+      "numThreads": 4,
+      "models": { "asr": { "paraformer-zh": "paraformer-zh" } }
+    },
+    "whisper": {
+      "enabled": true,
+      "protocol": "whisper",
+      "encoderPath": "models/sherpa-onnx-whisper-small/small-encoder.int8.onnx",
+      "decoderPath": "models/sherpa-onnx-whisper-small/small-decoder.int8.onnx",
+      "tokensPath": "models/sherpa-onnx-whisper-small/small-tokens.txt",
+      "numThreads": 4,
+      "models": { "asr": ["whisper-small"] }
+    },
+    "qwen-tts": {
+      "enabled": false,
+      "protocol": "openai",
+      "baseUrl": "http://127.0.0.1:8093/v1",
+      "models": { "tts": { "qwen3-tts-0.6b": "Qwen/Qwen3-TTS-12Hz-0.6B-Base" } }
+    },
+    "kokoro": {
+      "enabled": true,
+      "protocol": "kokoro",
+      "modelDir": "models/kokoro-int8-multi-lang-v1_1",
+      "numThreads": 4,
+      "models": { "tts": ["kokoro-82m"] }
+    },
+    "minimax-text": {
+      "enabled": false,
+      "allowRemote": true,
+      "protocol": "openai",
+      "baseUrl": "https://api.minimax.io/v1",
+      "apiKeyEnv": "MINIMAX_API_KEY",
+      "models": { "chat": { "minimax-text": "MiniMax-M3.1-Flash-Preview" } }
+    },
+    "minimax-speech": {
+      "enabled": false,
+      "allowRemote": true,
+      "protocol": "minimax-speech",
+      "baseUrl": "https://api.minimax.io/v1",
+      "apiKeyEnv": "MINIMAX_API_KEY",
+      "models": { "tts": ["speech-2.8-turbo", "speech-2.8-hd"] }
+    }
+  }
+}

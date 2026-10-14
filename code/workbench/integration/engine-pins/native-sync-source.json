@@ -1,0 +1,23 @@
+{
+  "package": "B57-DSH-SUPERVISED-STATE-SYNC",
+  "version": "0.3.5",
+  "upstream_commit": "c13f7d93fff0f578886985a3f673b4b21b7f6ac8",
+  "patch_sha256": "2d92bec2bf324cd4fd441a4b14638b210e6e0a89217152bfed9004a61c195a0e",
+  "applied_diff_sha256": "884139b3ea021601f180474c0318f3e22b0c6213eaeff0ef2d60e26f467846cd",
+  "upstream_package_hashes": {
+    "package.json": "aedc7229c76a4b9ba6afb0ab54994579ec7ee7e500fe94ceda8f853fa829671c",
+    "pnpm-lock.yaml": "7db1be7cfb291cf1e5c22c1645db261872d2512559ec60e5d1e196a5c1cb425d",
+    "pnpm-workspace.yaml": "1cfe943948494f3752380e82a1a05aa4d58a1d746329e3c080112a9b58c4a83d",
+    "apps/web/package.json": "e5aad07780550ae351ac33c55e0e6a284af7fc240c730f0c1506fcac294a0bd6",
+    "apps/web/vite.config.ts": "c4fced55d5ff434ace3ccc89d213c36499d6a9d20e681cab7135cda4732002b1"
+  },
+  "approved_assembly_baseline": {
+    "package": "B57-DSH-SUPERVISED-STATE-SYNC",
+    "inventory_sha256": "66c4c3a11d5b28341bd029a2df3b6e59547f3994a6188ccaa9eeb181de30ee3d",
+    "server_bundle_sha256": "cd62bd4f6d6e2e2572e2defd237a67cc3e3d968c9d2ada309716d922ae2cc989",
+    "build_receipt_sha256": "376a094fbd7b725dd8dbf103b7352e7528df0286c5e6cab0d4966d7df541afa4",
+    "source_lock_sha256": "340cdcb25d4b54d9a46ff587e19d8111447ef78200b9779c687579bfe47f3039",
+    "source_patch_sha256": "75ba2a71758616110aa876820a655822d3d648de24ca5d2e8601e369c4386584",
+    "forwarded_source_patch_sha256": "620d4b0bb1f81cf3363b5aae07b735161f8d8893014adcd97f3a6eab750eb820"
+  }
+}

@@ -1,0 +1,1194 @@
+diff --git a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+index e9eb0cbb..11cb801c 100644
+--- a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
++++ b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+@@ -1,4 +1,5 @@
+ // @effect-diagnostics nodeBuiltinImport:off
++import * as SqlClient from "effect/unstable/sql/SqlClient";
+ import * as NodeFSP from "node:fs/promises";
+ import * as NodeOS from "node:os";
+ import * as NodePath from "node:path";
+@@ -89,7 +90,7 @@ function makeOrchestrationLayer(
+           )
+         : RepositoryIdentityResolver.layer,
+     ),
+-    Layer.provide(persistence),
++    Layer.provideMerge(persistence),
+     Layer.provideMerge(ServerConfigLayer),
+     Layer.provideMerge(NodeServices.layer),
+   );
+@@ -103,9 +104,12 @@ async function createOrchestrationSystem(
+     makeOrchestrationLayer(databasePath, repositoryIdentityResolver),
+   );
+   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
++  const sql = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
+   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+   return {
+-    engine,
++    engine, sql,
++    shell: () => runtime.runPromise(snapshotQuery.getShellSnapshot()),
++    readShell: (threadId: ThreadId) => runtime.runPromise(snapshotQuery.getThreadShellById(threadId)),
+     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
+     readThread: (threadId: ThreadId) =>
+       runtime.runPromise(snapshotQuery.getThreadDetailById(threadId)),
+@@ -118,6 +122,65 @@ function now() {
+   return "2026-01-01T00:00:00.000Z";
+ }
+ 
++describe("formal native-session synchronization", () => {
++  it("commits messages/turn/checkpoint together, rejects stale or wrong binding, and retains content after restart", async () => {
++    const folder = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-native-sync-"));
++    const database = NodePath.join(folder, "state.sqlite");
++    let system = await createOrchestrationSystem(database);
++    const threadId = ThreadId.make("native-sync-thread"), projectId = ProjectId.make("native-sync-project");
++    const turnId = TurnId.make("native-observed-turn");
++    const checkedAt = "2026-01-01T00:05:00.000Z";
++    const expectedBinding = JSON.stringify({ provider: "codex", instanceId: "codex", nativeId: "original-native", cwd: "/tmp/native-sync" });
++    const user = { id: MessageId.make("native-user"), role: "user" as const, text: "external input", turnId, streaming: false, createdAt: now(), updatedAt: now() };
++    const assistant = { ...user, id: MessageId.make("native-assistant"), role: "assistant" as const, text: "external reply", createdAt: "2026-01-01T00:00:01.000Z", updatedAt: "2026-01-01T00:00:01.000Z" };
++    const turn = { turnId, state: "completed" as const, requestedAt: now(), startedAt: now(), completedAt: now(), assistantMessageId: assistant.id };
++    const command = { type: "thread.native-session.sync" as const, commandId: CommandId.make("native-sync-first"), threadId,
++      provider: "codex" as const, instanceId: ProviderInstanceId.make("codex"), nativeId: "original-native", previousVersion: null,
++      syncVersion: "v1", expectedBinding, checkedAt, observation: "ready" as const, checkpoint: { after: 1 },
++      messages: [user, assistant], turns: [{ ...turn, userMessageId: user.id }], latestTurn: turn };
++    try {
++      await system.run(system.engine.dispatch({ type: "project.create", commandId: CommandId.make("native-project"), projectId, title: "Native", workspaceRoot: "/tmp/native-sync", createdAt: now() }));
++      await system.run(system.engine.dispatch({ type: "thread.create", commandId: CommandId.make("native-thread"), threadId, projectId, title: "Native", modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "fixture" }, runtimeMode: "full-access", interactionMode: "default", branch: null, worktreePath: null, createdAt: now() }));
++      await system.run(system.sql`INSERT INTO provider_session_runtime (thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, last_seen_at, resume_cursor_json, runtime_payload_json) VALUES (${threadId}, 'codex', 'codex', 'codex', 'full-access', 'stopped', ${now()}, ${JSON.stringify({ threadId: "original-native" })}, ${JSON.stringify({ cwd: "/tmp/native-sync" })})`);
++      const accepted = await system.run(system.engine.dispatch(command));
++      expect((await system.shell()).threads.find(t => t.id === threadId)?.nativeSessionObservation?.status).toBe("ready");
++      expect(Option.getOrThrow(await system.readShell(threadId)).nativeSessionObservation?.nativeId).toBe("original-native");
++      expect(await system.run(system.engine.dispatch(command))).toEqual(accepted);
++      let detail = Option.getOrThrow(await system.readThread(threadId));
++      expect(detail.messages.map(m => m.text)).toEqual(["external input", "external reply"]);
++      expect(detail.latestTurn?.turnId).toBe(turnId);
++      expect(detail.latestTurn?.state).toBe("completed");
++      expect(detail.session).toBeNull();
++      expect(detail.activities.find(a => a.kind === "native.session.sync")?.payload).toMatchObject({ syncVersion: "v1", nativeId: "original-native" });
++      await expect(system.run(system.engine.dispatch({ ...command, commandId: CommandId.make("native-stale"), syncVersion: "v2" }))).rejects.toThrow(/version/);
++      await expect(system.run(system.engine.dispatch({ ...command, commandId: CommandId.make("native-wrong"), previousVersion: "v1", expectedBinding: "wrong" }))).rejects.toThrow(/binding/);
++      expect(Option.getOrThrow(await system.readThread(threadId)).messages).toEqual(detail.messages);
++      await system.dispose(); system = await createOrchestrationSystem(database);
++      detail = Option.getOrThrow(await system.readThread(threadId));
++      expect(detail.messages).toHaveLength(2); expect(detail.latestTurn?.turnId).toBe(turnId);
++      await system.run(system.engine.dispatch({ ...command, commandId: CommandId.make("native-unreadable"), previousVersion: "v1", syncVersion: "unknown-v2", observation: "unknown", messages: [], turns: [], latestTurn: null }));
++      detail = Option.getOrThrow(await system.readThread(threadId));
++      expect(detail.messages).toHaveLength(2); expect(detail.latestTurn?.state).toBe("completed");
++      expect(detail.activities.find(a => a.kind === "native.session.sync")?.payload).toMatchObject({ syncVersion: "unknown-v2", observation: "unknown" });
++      await system.run(system.engine.dispatch({ ...command, commandId: CommandId.make("native-ready-again"), previousVersion: "unknown-v2", syncVersion: "ready-v3", messages: [], turns: [], latestTurn: null }));
++      await system.run(system.sql`UPDATE provider_session_runtime SET status='running' WHERE thread_id=${threadId}`);
++      await system.run(system.engine.dispatch({ type: "thread.session.set", commandId: CommandId.make("native-ready-session"), threadId, createdAt: checkedAt, session: { threadId, providerName: "codex", status: "ready", runtimeMode: "full-access", activeTurnId: null, lastError: null, updatedAt: checkedAt } }));
++      await system.run(system.engine.dispatch({ type: "thread.session.set", commandId: CommandId.make("native-working-session"), threadId, createdAt: checkedAt, session: { threadId, providerName: "codex", status: "running", runtimeMode: "full-access", activeTurnId: turnId, lastError: null, updatedAt: checkedAt } }));
++      await expect(system.run(system.engine.dispatch({ type: "thread.native-session.release", commandId: CommandId.make("native-running-release-blocked"), threadId, expectedBinding, checkedAt }))).rejects.toThrow(/completed idle/);
++      await system.run(system.engine.dispatch({ type: "thread.session.set", commandId: CommandId.make("native-completed-session"), threadId, createdAt: checkedAt, session: { threadId, providerName: "codex", status: "ready", runtimeMode: "full-access", activeTurnId: null, lastError: null, updatedAt: checkedAt } }));
++      await system.run(system.engine.dispatch({ type: "thread.activity.append", commandId: CommandId.make("native-async-question"), threadId, createdAt: checkedAt, activity: { id: EventId.make("native-async-question"), turnId, tone: "info", kind: "user-input.requested", summary: "Fixture question", payload: { requestId: "question", responseMode: "message" }, createdAt: checkedAt } }));
++      const release = { type: "thread.native-session.release" as const, commandId: CommandId.make("native-release-question-blocked"), threadId, expectedBinding, checkedAt };
++      await expect(system.run(system.engine.dispatch(release))).rejects.toThrow(/no requests/);
++      expect(Option.getOrThrow(await system.readThread(threadId)).activities.some(a => a.kind === "user-input.dismissed")).toBe(false);
++      await system.run(system.engine.dispatch({ type: "thread.activity.append", commandId: CommandId.make("native-question-resolved"), threadId, createdAt: checkedAt, activity: { id: EventId.make("native-question-resolved"), turnId, tone: "info", kind: "user-input.resolved", summary: "Fixture resolved", payload: { requestId: "question" }, createdAt: checkedAt } }));
++      await system.run(system.engine.dispatch({ ...release, commandId: CommandId.make("native-release-exact-idle") }));
++      const events = await system.run(system.sql<{ event_type: string }>`SELECT event_type FROM orchestration_events WHERE stream_id=${threadId}`);
++      expect(events.filter(e => e.event_type === "thread.native-session-synced")).toHaveLength(3);
++      expect(events.some(e => e.event_type === "thread.turn-start-requested")).toBe(false);
++    } finally { await system.dispose(); await NodeFSP.rm(folder, { recursive: true, force: true }); }
++  });
++});
++
+ const hasMetricSnapshot = (
+   snapshots: ReadonlyArray<Metric.Metric.Snapshot>,
+   id: string,
+diff --git a/apps/server/src/orchestration/Layers/OrchestrationEngine.ts b/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
+index 248913af..1bf2c93c 100644
+--- a/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
++++ b/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
+@@ -5,7 +5,7 @@ import type {
+   ProjectId,
+   ThreadId,
+ } from "@t3tools/contracts";
+-import { OrchestrationCommand } from "@t3tools/contracts";
++import { EventId, OrchestrationCommand } from "@t3tools/contracts";
+ import * as Cause from "effect/Cause";
+ import * as Clock from "effect/Clock";
+ import * as Crypto from "effect/Crypto";
+@@ -40,6 +40,7 @@ import {
+   type OrchestrationDispatchError,
+   type OrchestrationProjectorDecodeError,
+ } from "../Errors.ts";
++import { nativeBindingToken } from "../NativeSessionHistory.ts";
+ import { decideOrchestrationCommand } from "../decider.ts";
+ import { verifyProviderContextProof } from "../ProviderContextProof.ts";
+ import { createEmptyReadModel, projectEvent } from "../projector.ts";
+@@ -243,6 +244,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+           envelope.command.type === "thread.user-input.dismiss"
+             ? yield* projectionSnapshotQuery.getUserInputActivity(envelope.command)
+             : Option.none();
++        if (envelope.command.type === "thread.native-session.release") {
++          const current = yield* projectionSnapshotQuery.getThreadDetailById(envelope.command.threadId);
++          if (Option.isSome(current)) commandReadModel = { ...commandReadModel, threads: commandReadModel.threads.map(t => t.id === current.value.id ? current.value : t) };
++        }
++        if (envelope.command.type === "thread.native-session.sync" || envelope.command.type === "thread.turn.start") {
++          const threadId = envelope.command.threadId;
++          const rows = yield* sql<{ payload_json: string }>`SELECT payload_json FROM projection_thread_activities WHERE thread_id=${threadId} AND kind='native.session.sync' LIMIT 1`;
++          const payload = rows[0] ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(rows[0].payload_json) : undefined;
++          commandReadModel = { ...commandReadModel, threads: commandReadModel.threads.map(t => t.id === threadId ? { ...t, activities: [...t.activities.filter(a => a.kind !== "native.session.sync"), ...(payload ? [{ id: EventId.make(`native-sync:${threadId}`), turnId: null, tone: "info" as const, kind: "native.session.sync", summary: "", payload, createdAt: t.updatedAt }] : [])] } : t) };
++        }
+         const eventBase = yield* decideOrchestrationCommand({
+           command: envelope.command,
+           readModel: commandReadModel,
+@@ -274,6 +285,20 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+         const committedCommand = yield* sql
+           .withTransaction(
+             Effect.gen(function* () {
++              if (envelope.command.type === "thread.native-session.sync" || envelope.command.type === "thread.native-session.release") {
++                const cmd = envelope.command;
++                for (const message of cmd.type === "thread.native-session.sync" ? cmd.messages : []) {
++                  const owners = yield* sql<{ thread_id: string }>`SELECT thread_id FROM projection_thread_messages WHERE message_id=${message.id}`;
++                  if (owners[0] && owners[0].thread_id !== cmd.threadId) return yield* new OrchestrationCommandInvariantError({ commandType: cmd.type, detail: "Native message identity belongs to another thread." });
++                }
++                const rows = yield* sql<{ provider_name: string; provider_instance_id: string; resume_cursor_json: string; runtime_payload_json: string }>`SELECT provider_name, provider_instance_id, resume_cursor_json, runtime_payload_json FROM provider_session_runtime WHERE thread_id=${cmd.threadId}`;
++                if (cmd.type === "thread.native-session.release") {
++                  const runtimeStatus = yield* sql<{ status: string }>`SELECT status FROM provider_session_runtime WHERE thread_id=${cmd.threadId}`;
++                  if (runtimeStatus[0]?.status !== "running") return yield* new OrchestrationCommandInvariantError({ commandType: cmd.type, detail: "Original writer is no longer ready for idle release." });
++                }
++                const row = rows[0];
++                if (!row || nativeBindingToken({ provider: row.provider_name, providerInstanceId: row.provider_instance_id, resumeCursor: yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(row.resume_cursor_json), runtimePayload: yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(row.runtime_payload_json) }) !== cmd.expectedBinding) return yield* new OrchestrationCommandInvariantError({ commandType: cmd.type, detail: "Original native binding changed before synchronization." });
++              }
+               const committedEvents: OrchestrationEvent[] = [];
+               const attachmentCleanups: Effect.Effect<void>[] = [];
+               let nextCommandReadModel = commandReadModel;
+diff --git a/apps/server/src/orchestration/Layers/ProjectionPipeline.ts b/apps/server/src/orchestration/Layers/ProjectionPipeline.ts
+index 41631681..4bc6350d 100644
+--- a/apps/server/src/orchestration/Layers/ProjectionPipeline.ts
++++ b/apps/server/src/orchestration/Layers/ProjectionPipeline.ts
+@@ -1,5 +1,6 @@
+ import {
+   ApprovalRequestId,
++  nativeSessionSyncActivity,
+   isImportedAgentSessionMessageId,
+   UserInputAttachmentAnswerPayload,
+   type ChatAttachment,
+@@ -605,6 +606,17 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
+       "applyThreadsProjection",
+     )(function* (event, attachmentSideEffects) {
+       switch (event.type) {
++        case "thread.native-session-synced": {
++          const prior = yield* projectionThreadRepository.getById({ threadId: event.payload.threadId });
++          if (Option.isNone(prior)) return;
++          yield* projectionThreadRepository.upsert({ ...prior.value, latestTurnId: event.payload.latestTurn?.turnId ?? prior.value.latestTurnId,
++            ...(event.payload.latestTurn && (event.payload.latestTurn.turnId !== prior.value.latestTurnId || event.payload.latestTurn.state === "running") ? { settledOverride: null, unsettledAt: event.payload.checkedAt } : {}),
++            updatedAt: event.payload.checkedAt,
++            latestUserMessageAt: event.payload.messages.filter(m => m.role === "user").reduce((latest: string | null, m) => latest === null || m.createdAt > latest ? m.createdAt : latest, prior.value.latestUserMessageAt),
++          });
++          yield* refreshThreadShellSummary(event.payload.threadId);
++          return;
++        }
+         case "thread.created":
+           // A draft retry can re-create this id; links belong to the old incarnation.
+           yield* projectionThreadPullRequestRepository.deleteByThreadId({
+@@ -1134,6 +1146,19 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
+       "applyThreadMessagesProjection",
+     )(function* (event, attachmentSideEffects) {
+       switch (event.type) {
++        case "thread.native-session-synced": {
++          for (const message of event.payload.messages) {
++            const prior = yield* projectionThreadMessageRepository.getByMessageId({ messageId: message.id });
++            yield* projectionThreadMessageRepository.upsert({
++              messageId: message.id, threadId: event.payload.threadId, turnId: message.turnId ?? null,
++              role: message.role, text: message.text, isStreaming: message.streaming,
++              createdAt: Option.isSome(prior) ? prior.value.createdAt : message.createdAt, updatedAt: message.updatedAt,
++              ...(Option.isSome(prior) && prior.value.attachments !== undefined ? { attachments: [...prior.value.attachments] } : {}),
++              ...(Option.isSome(prior) && prior.value.context !== undefined ? { context: prior.value.context } : {}),
++            });
++          }
++          return;
++        }
+         // A draft retry re-creates a soft-deleted thread id. Every projector
+         // drops its own rows for the old incarnation here so replay from any
+         // per-projector cursor rebuilds the new thread without stale history.
+@@ -1296,6 +1321,13 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
+       "applyThreadActivitiesProjection",
+     )(function* (event, attachmentSideEffects) {
+       switch (event.type) {
++        case "thread.native-session-synced": {
++          const activity = nativeSessionSyncActivity(event.payload);
++          yield* projectionThreadActivityRepository.upsert({ activityId: activity.id, threadId: event.payload.threadId,
++            turnId: activity.turnId, tone: activity.tone, kind: activity.kind, summary: activity.summary,
++            payload: activity.payload, sequence: event.sequence, createdAt: activity.createdAt });
++          return;
++        }
+         case "thread.created":
+           yield* projectionThreadActivityRepository.deleteByThreadId({
+             threadId: event.payload.threadId,
+@@ -1379,6 +1411,22 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
+       "applyThreadTurnsProjection",
+     )(function* (event, _attachmentSideEffects) {
+       switch (event.type) {
++        case "thread.native-session-synced": {
++          for (const turn of event.payload.turns) {
++            const prior = yield* projectionTurnRepository.getByTurnId({ threadId: event.payload.threadId, turnId: turn.turnId });
++            const old = Option.getOrUndefined(prior);
++            yield* projectionTurnRepository.upsertByTurnId({
++              threadId: event.payload.threadId, turnId: turn.turnId,
++              pendingMessageId: old?.pendingMessageId ?? turn.userMessageId,
++              sourceProposedPlanThreadId: old?.sourceProposedPlanThreadId ?? null, sourceProposedPlanId: old?.sourceProposedPlanId ?? null,
++              assistantMessageId: turn.assistantMessageId, state: turn.state,
++              requestedAt: old?.requestedAt ?? turn.requestedAt, startedAt: old?.startedAt ?? turn.startedAt, completedAt: old?.state === turn.state && old.completedAt ? old.completedAt : turn.completedAt,
++              checkpointTurnCount: old?.checkpointTurnCount ?? null, checkpointRef: old?.checkpointRef ?? null,
++              checkpointStatus: old?.checkpointStatus ?? null, checkpointFiles: old?.checkpointFiles ?? [],
++            });
++          }
++          return;
++        }
+         case "thread.created":
+           yield* projectionTurnRepository.deleteByThreadId({
+             threadId: event.payload.threadId,
+diff --git a/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts b/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
+index ec6169df..02c7dbd5 100644
+--- a/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
++++ b/apps/server/src/orchestration/Layers/ProjectionSnapshotQuery.ts
+@@ -1,3 +1,5 @@
++import { nativeSessionObservationFromPayload } from "@t3tools/contracts";
++import { requestNativeSessionSync } from "../NativeSessionSync.ts";
+ import {
+   AgentSessionImportSource,
+   ApprovalRequestId,
+@@ -827,6 +829,20 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
+       `,
+   });
+ 
++  const nativeObservations = Effect.fn("ProjectionSnapshotQuery.nativeObservations")(function* (threadId?: ThreadId) {
++    const rows = yield* (threadId === undefined
++      ? sql<{ threadId: string; payload: unknown }>`SELECT thread_id AS "threadId", payload_json AS "payload" FROM projection_thread_activities WHERE kind = 'native.session.sync'`
++      : sql<{ threadId: string; payload: unknown }>`SELECT thread_id AS "threadId", payload_json AS "payload" FROM projection_thread_activities WHERE kind = 'native.session.sync' AND thread_id = ${threadId}`).pipe(
++        Effect.mapError(toPersistenceSqlError("ProjectionSnapshotQuery.nativeObservations:query")),
++      );
++    const decoded = new Map<string, ReturnType<typeof nativeSessionObservationFromPayload>>();
++    for (const row of rows) {
++      const payload = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json))(row.payload);
++      decoded.set(row.threadId, nativeSessionObservationFromPayload(Option.getOrNull(payload)));
++    }
++    return decoded;
++  });
++
+   const listThreadActivityRows = SqlSchema.findAll({
+     Request: Schema.Void,
+     Result: ProjectionThreadActivityDbRowSchema,
+@@ -2728,6 +2744,7 @@ pending_approval_requests AS (
+                 updatedAt = maxIso(updatedAt, row.updatedAt);
+               }
+ 
++              const nativeObservationByThread = yield* nativeObservations();
+               const repositoryIdentities =
+                 yield* resolveRepositoryIdentitiesForProjects(projectRows);
+               const latestTurnByThread = new Map(
+@@ -2784,6 +2801,7 @@ pending_approval_requests AS (
+                         hasPendingApprovals: row.pendingApprovalCount > 0,
+                         hasPendingUserInput: row.pendingUserInputCount > 0,
+                         hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
++                        nativeSessionObservation: nativeObservationByThread.get(row.threadId) ?? null,
+                         backgroundLiveness: threadBackgroundLiveness.getThreadBackgroundLiveness(
+                           row.threadId,
+                         ),
+@@ -2892,6 +2910,7 @@ pending_approval_requests AS (
+                 updatedAt = maxIso(updatedAt, row.updatedAt);
+               }
+ 
++              const nativeObservationByThread = yield* nativeObservations();
+               const pullRequestsByThread = groupPullRequestRowsByThread(pullRequestRows);
+               const activeProjectIds = new Set(threadRows.map((row) => row.projectId));
+               const repositoryIdentities = yield* resolveRepositoryIdentitiesForProjects(
+@@ -2948,6 +2967,7 @@ pending_approval_requests AS (
+                   hasPendingApprovals: row.pendingApprovalCount > 0,
+                   hasPendingUserInput: row.pendingUserInputCount > 0,
+                   hasActionableProposedPlan: row.hasActionableProposedPlan > 0,
++                  nativeSessionObservation: nativeObservationByThread.get(row.threadId) ?? null,
+                   backgroundLiveness: threadBackgroundLiveness.getThreadBackgroundLiveness(
+                     row.threadId,
+                   ),
+@@ -3305,6 +3325,7 @@ pending_approval_requests AS (
+         hasPendingApprovals: threadRow.value.pendingApprovalCount > 0,
+         hasPendingUserInput: threadRow.value.pendingUserInputCount > 0,
+         hasActionableProposedPlan: threadRow.value.hasActionableProposedPlan > 0,
++        nativeSessionObservation: (yield* nativeObservations(threadId)).get(threadId) ?? null,
+         backgroundLiveness: threadBackgroundLiveness.getThreadBackgroundLiveness(
+           threadRow.value.threadId,
+         ),
+@@ -3623,6 +3644,7 @@ pending_approval_requests AS (
+         }),
+         proposedPlans: proposedPlanRows.map(mapProposedPlanRow),
+         activities,
++        nativeSessionObservation: (yield* nativeObservations(threadId)).get(threadId) ?? null,
+         checkpoints: checkpointRows.map((row) => ({
+           turnId: row.turnId,
+           checkpointTurnCount: row.checkpointTurnCount,
+@@ -3674,6 +3696,7 @@ pending_approval_requests AS (
+     sql
+       .withTransaction(
+         Effect.gen(function* () {
++        requestNativeSessionSync(threadId);
+           if (window?.turnLimit === undefined) {
+             const thread = yield* getThreadDetailByIdBounded(threadId, undefined, {
+               mode: "client",
+diff --git a/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts b/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
+index 072ac511..2349b43d 100644
+--- a/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
++++ b/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
+@@ -52,6 +52,7 @@ import {
+   type ProviderRuntimeIngestionShape,
+ } from "../Services/ProviderRuntimeIngestion.ts";
+ import { projectActivityPayload } from "../ActivityPayloadProjection.ts";
++import { makeNativeSessionSync } from "../NativeSessionSync.ts";
+ import { forkParked } from "../../serverActivation.ts";
+ import { ServerSettingsService } from "../../serverSettings.ts";
+ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+@@ -2705,8 +2706,10 @@ const make = Effect.gen(function* () {
+     detectProviderDiffRepository(event).pipe(logIngestionFailure("diff", event)),
+   );
+ 
++  const nativeSessionSync = yield* makeNativeSessionSync;
+   const start: ProviderRuntimeIngestionShape["start"] = () =>
+     Effect.gen(function* () {
++      yield* forkParked(nativeSessionSync);
+       yield* forkParked(
+         Stream.runForEach(providerService.streamEvents, (event) =>
+           event.type === "turn.diff.updated"
+diff --git a/apps/server/src/orchestration/NativeSessionDetailEvents.test.ts b/apps/server/src/orchestration/NativeSessionDetailEvents.test.ts
+new file mode 100644
+index 00000000..de2034ae
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeSessionDetailEvents.test.ts
+@@ -0,0 +1,47 @@
++import { describe, it, expect } from "vite-plus/test";
++import { EventId, MessageId, ProjectId, ProviderInstanceId, ThreadId, TurnId, type OrchestrationThread, type OrchestrationEvent } from "@t3tools/contracts";
++import { isThreadDetailEvent } from "../ws.ts";
++import { applyThreadDetailEvent } from "../../../../packages/client-runtime/src/state/threadReducer.ts";
++
++const at = "2026-10-03T00:00:00.000Z", threadId = ThreadId.make("detail-thread"), turnId = TurnId.make("native-turn");
++const original: OrchestrationThread = {
++  id: threadId, projectId: ProjectId.make("detail-project"), title: "Original", modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "fixture" },
++  runtimeMode: "full-access", interactionMode: "default", branch: null, worktreePath: null, latestTurn: null,
++  createdAt: at, updatedAt: at, archivedAt: null, settledOverride: "settled", settledAt: at, deletedAt: null,
++  pullRequests: [], messages: [], proposedPlans: [], checkpoints: [], session: null,
++  activities: [{ id: EventId.make("question"), turnId: null, tone: "info", kind: "user-input.requested", summary: "Pending", payload: { requestId: "original-question" }, createdAt: at }],
++};
++const message = { id: MessageId.make("native-user"), role: "user" as const, text: "external input", turnId, streaming: false, createdAt: at, updatedAt: at };
++const latestTurn = { turnId, state: "running" as const, requestedAt: at, startedAt: at, completedAt: null, assistantMessageId: null };
++const event: OrchestrationEvent = {
++  type: "thread.native-session-synced", eventId: EventId.make("native-detail-event"), sequence: 4,
++  aggregateKind: "thread", aggregateId: threadId, occurredAt: at, commandId: null, causationEventId: null, correlationId: null, metadata: {},
++  payload: { threadId, nativeId: "original-native", provider: "codex", instanceId: ProviderInstanceId.make("codex"), expectedBinding: "fixture",
++    previousVersion: null, syncVersion: "version-1", checkedAt: at, observation: "running", checkpoint: {}, messages: [message], turns: [{ ...latestTurn, userMessageId: message.id }], latestTurn },
++};
++
++describe("native detail subscription delivery", () => {
++  it("passes the WS live/replay filter and updates the same formal client dialogue without starting a provider session", () => {
++    expect(isThreadDetailEvent(event)).toBe(true);
++    const result = applyThreadDetailEvent(original, event);
++    expect(result.kind).toBe("updated");
++    if (result.kind !== "updated") throw Error("Native detail event lost");
++    expect(result.thread.id).toBe(threadId); expect(result.thread.messages.map(m => m.text)).toEqual(["external input"]);
++    expect(result.thread.latestTurn?.state).toBe("running"); expect(result.thread.session).toBeNull();
++    expect(result.thread.nativeSessionObservation?.status).toBe("running");
++    expect(result.thread.settledOverride).toBeNull(); expect(result.thread.activities[0]).toEqual(original.activities[0]);
++    const repeated = applyThreadDetailEvent(result.thread, event);
++    expect(repeated.kind === "updated" && repeated.thread.messages).toHaveLength(1);
++  });
++  it("keeps already synchronized messages and pending questions when native history is temporarily unavailable", () => {
++    const first = applyThreadDetailEvent(original, event);
++    if (first.kind !== "updated") throw Error("Missing first event");
++    const unavailable: OrchestrationEvent = { ...event, payload: { ...event.payload, previousVersion: "version-1", syncVersion: "unknown-2", observation: "unknown", messages: [], turns: [], latestTurn: null } };
++    const result = applyThreadDetailEvent(first.thread, unavailable);
++    if (result.kind !== "updated") throw Error("Missing unavailable event");
++    expect(result.thread.messages).toHaveLength(1); expect(result.thread.latestTurn?.state).toBe("running");
++    expect(result.thread.nativeSessionObservation?.status).toBe("unknown");
++    expect(result.thread.activities.some(a => a.id === "question")).toBe(true);
++    expect(result.thread.activities.filter(a => a.kind === "native.session.sync")).toHaveLength(1);
++  });
++});
+diff --git a/apps/server/src/orchestration/NativeSessionHistory.test.ts b/apps/server/src/orchestration/NativeSessionHistory.test.ts
+new file mode 100644
+index 00000000..12bd6ed9
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeSessionHistory.test.ts
+@@ -0,0 +1,105 @@
++import { describe, it, expect } from "vite-plus/test";
++import { MessageId, TurnId, type OrchestrationMessage } from "@t3tools/contracts";
++import { decodeCodexHistory, nativeVisibleText, planNativeHistory, type NativeHistory } from "./NativeSessionHistory.ts";
++import { readDshHistoryChunk } from "../provider/Layers/DshNativeHistory.ts";
++import type { DshSessionRpc } from "../provider/Layers/DshHostProtocol.ts";
++
++const at = "2026-10-03T00:00:00.000Z", tid = TurnId.make("dsh:source-command");
++const first: OrchestrationMessage[] = [
++  { id: MessageId.make("original-user"), role: "user", text: "same", streaming: false, turnId: null, createdAt: at, updatedAt: at },
++  { id: MessageId.make("assistant:dsh:sid:5"), role: "assistant", text: "reply", streaming: false, turnId: tid, createdAt: at, updatedAt: at },
++];
++const history: NativeHistory = { nativeId: "sid", cwd: "/fixture", observation: "ready", checkpoint: {}, complete: true, turns: [
++  { id: "turn:1", state: "completed", startedAt: at, completedAt: at, messages: [
++    { id: "dsh:sid:4", role: "user", text: "same", createdAt: at, sourceCommandId: "source-command" },
++    { id: "dsh:sid:5", role: "assistant", text: "reply", createdAt: at },
++  ] },
++  { id: "turn:2", state: "completed", startedAt: at, completedAt: at, messages: [
++    { id: "dsh:sid:10", role: "user", text: "same", createdAt: at, sourceCommandId: "external-command" },
++    { id: "dsh:sid:11", role: "assistant", text: "reply", createdAt: at },
++  ] },
++] };
++const saved = [{ turnId: tid, pendingMessageId: first[0]!.id, assistantMessageId: first[1]!.id }];
++
++describe("native message identity and original records", () => {
++  it("adopts original source-command user and assistant IDs while equal-text second turn remains distinct", () => {
++    const plan = planNativeHistory(history, "dsh", saved, first);
++    expect(plan.turns[0]?.turnId).toBe(tid);
++    expect(plan.turns[0]?.userMessageId).toBe("original-user");
++    expect(plan.turns[0]?.assistantMessageId).toBe(first[1]!.id);
++    expect(plan.messages.some(m => m.id === "original-user")).toBe(false);
++    expect(first[0]?.turnId).toBeNull();
++    expect(plan.messages.filter(m => !first.some(x => x.id === m.id))).toHaveLength(2);
++    expect(plan.turns[1]?.turnId).not.toBe(tid);
++  });
++  it("repeated read with saved aliases does not duplicate a single message", () => {
++    const plan = planNativeHistory(history, "dsh", saved, first);
++    const existing = [...first.filter(m => !plan.messages.some(u => u.id === m.id)), ...plan.messages];
++    expect(planNativeHistory(history, "dsh", saved, existing, plan.aliases).messages).toEqual([]);
++  });
++  it("does not overwrite the original input if original native source disagrees", () => {
++    expect(() => planNativeHistory(history, "dsh", saved, [{ ...first[0]!, text: "different" }, first[1]!])).toThrow(/content conflicts/);
++  });
++  it("rejects a mapped message owned by another turn", () => {
++    expect(() => planNativeHistory(history, "dsh", saved, [first[0]!, { ...first[1]!, turnId: TurnId.make("other") }])).toThrow(/identity conflict/);
++  });
++  it("uses Codex native turn identity and preserves a failed pre-provider user", () => {
++    const raw = { id: "native", cwd: "/fixture", createdAt: 1, updatedAt: 3, turns: [{ id: "native-turn", startedAt: 2, completedAt: 3, status: "completed", items: [
++      { type: "userMessage", id: "native-user", content: [{ type: "text", text: "prompt" }] }, { type: "agentMessage", id: "native-assistant", text: "reply" },
++    ] }] };
++    const failed = { ...first[0]!, id: MessageId.make("failed-user"), text: "failed" };
++    const original = { ...first[0]!, id: MessageId.make("success-user"), text: "prompt" };
++    const plan = planNativeHistory(decodeCodexHistory(raw, "native", "/fixture"), "codex", [{ turnId: TurnId.make("native-turn"), pendingMessageId: original.id, assistantMessageId: null }], [failed, original]);
++    expect(plan.turns[0]?.userMessageId).toBe("success-user");
++    expect(plan.messages.some(m => m.id === "failed-user")).toBe(false);
++    expect(failed.text).toBe("failed");
++  });
++  it("rejects wrong native ID/cwd and duplicate native item IDs", () => {
++    const raw = { id: "native", cwd: "/fixture", createdAt: 1, updatedAt: 3, turns: [{ id: "t", status: "completed", items: [{ type: "agentMessage", id: "a", text: "x" }, { type: "agentMessage", id: "a", text: "x" }] }] };
++    expect(() => decodeCodexHistory(raw, "other", "/fixture")).toThrow(/scope/);
++    expect(() => decodeCodexHistory(raw, "native", "/other")).toThrow(/scope/);
++    expect(() => decodeCodexHistory(raw, "native", "/fixture")).toThrow(/Duplicate/);
++  });
++  it("keeps visible attachment context without copying reasoning or private paths", () => {
++    const value = nativeVisibleText([{ type: "text", text: "visible" }, { type: "reasoning", text: "private" }, { type: "image", path: "/secret" }]);
++    expect(value).toContain("visible"); expect(value).toContain("原生附件"); expect(value).not.toContain("private"); expect(value).not.toContain("secret");
++  });
++  it("preserves an accepted terminal time when a later native read uses a thread-level fallback", () => {
++    const accepted = "2026-10-03T00:00:01.123Z";
++    const next = structuredClone(history);
++    next.turns[0]!.completedAt = "2026-10-03T01:00:00.000Z";
++    const plan = planNativeHistory(next, "dsh", [{ ...saved[0]!, state: "completed", completedAt: accepted }], first);
++    expect(plan.turns[0]?.completedAt).toBe(accepted);
++  });
++});
++
++describe("incremental DSH original history", () => {
++  const events = Array.from({ length: 700 }, (_, seq) => ({ seq, time: 1_800_000_000_000 + seq, type: "developer/message", data: {} as any }));
++  events[1] = { ...events[1]!, type: "turn/start", data: { turn: 1 } };
++  events[2] = { ...events[2]!, type: "user/message", data: { id: "u", source: { kind: "user", rpcId: "source" }, role: "user", content: [{ type: "text", text: "human" }] } };
++  events[650] = { ...events[650]!, type: "assistant/message", data: { turn: 1, message: { id: "a", role: "assistant", content: [{ type: "text", text: "answer" }] } } };
++  events[699] = { ...events[699]!, type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } };
++  const makeRpc = (all = events): DshSessionRpc => ({ call: async (method, raw) => {
++    if (method === "session/list") return { items: [{ sessionId: "sid", cwd: "/fixture", running: false, projections: { asOfSeq: all.at(-1)!.seq, values: { agentPreset: "preset" } } }] };
++    if (method !== "session/page") throw Error("write is forbidden");
++    const q = (raw as any).request, end = Math.min(q.throughSeq, (q.beforeSeq ?? q.throughSeq + 1) - 1);
++    return { records: all.filter(e => e.seq <= end && e.seq > end - 16).map(event => ({ type: "event", event })), hasMore: end >= 16 };
++  } });
++  it("continues past the old history size limit and carries the same active turn across batches", async () => {
++    const rpc = makeRpc(); let checkpoint: unknown; const found: NativeHistory[] = [];
++    for (let i = 0; i < 3; i++) { const part = await readDshHistoryChunk(rpc, "sid", "/fixture", "preset", checkpoint); found.push(part); checkpoint = part.checkpoint; }
++    expect(found.map(h => h.checkpoint.afterSeq)).toEqual([255, 511, 699]);
++    expect(found[0]?.complete).toBe(false); expect(found[2]?.complete).toBe(true);
++    expect(found[2]?.turns[0]?.messages.map(m => m.text)).toEqual(["human", "answer"]);
++    expect(found[2]?.turns[0]?.state).toBe("completed");
++    const same = await readDshHistoryChunk(rpc, "sid", "/fixture", "preset", checkpoint);
++    expect(same.turns).toEqual([]); expect(same.observation).toBe("ready");
++  });
++  it("rejects scope change and native sequence rollback", async () => {
++    await expect(readDshHistoryChunk(makeRpc(), "sid", "/other", "preset")).rejects.toThrow(/scope/);
++    await expect(readDshHistoryChunk(makeRpc(), "sid", "/fixture", "preset", { afterSeq: 999 })).rejects.toThrow(/scope/);
++  });
++  it("rejects a missing event instead of clearing the prior checkpoint", async () => {
++    await expect(readDshHistoryChunk(makeRpc(events.filter(e => e.seq !== 10)), "sid", "/fixture", "preset")).rejects.toThrow(/sequence/);
++  });
++});
+diff --git a/apps/server/src/orchestration/NativeSessionHistory.ts b/apps/server/src/orchestration/NativeSessionHistory.ts
+new file mode 100644
+index 00000000..8c3ad545
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeSessionHistory.ts
+@@ -0,0 +1,98 @@
++// @effect-diagnostics globalDate:off preferSchemaOverJson:off -- Pure native decoder uses provider timestamps and a deterministic binding fingerprint.
++import { createHash } from "node:crypto";
++import { MessageId, TurnId, type OrchestrationMessage, type OrchestrationLatestTurn } from "@t3tools/contracts";
++
++export const object = (v: unknown): Record<string, any> | undefined =>
++  v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : undefined;
++export const digest = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
++export interface NativeMessage { id: string; role: "user" | "assistant"; text: string; createdAt: string; sourceCommandId?: string }
++export interface NativeTurn { id: string; state: OrchestrationLatestTurn["state"]; startedAt: string; completedAt: string | null; messages: NativeMessage[] }
++export interface NativeHistory { nativeId: string; cwd: string; turns: NativeTurn[]; observation: "ready" | "running" | "waiting_approval" | "waiting_answer" | "unknown"; checkpoint: Record<string, any>; complete: boolean }
++export const nativeMessageKey = (provider: string, nativeId: string, turn: NativeTurn, row: NativeMessage) => `native:${provider}:${nativeId}:message:${turn.id}:${String(turn.messages.indexOf(row)).padStart(8, "0")}:${row.id}`;
++export interface SavedTurn { turnId: TurnId | null; pendingMessageId: MessageId | null; assistantMessageId: MessageId | null; state?: string; requestedAt?: string; startedAt?: string | null; completedAt?: string | null }
++
++export function nativeBindingToken(binding: { provider: string; providerInstanceId?: string; resumeCursor?: unknown; runtimePayload?: unknown }) {
++  const cursor = object(binding.resumeCursor), runtime = object(binding.runtimePayload);
++  const nativeId = binding.provider === "codex" ? cursor?.threadId : cursor?.sessionId;
++  if (typeof nativeId !== "string" || typeof runtime?.cwd !== "string") throw Error("Original native binding unavailable");
++  return JSON.stringify({ provider: binding.provider, instanceId: binding.providerInstanceId, nativeId, cwd: runtime.cwd });
++}
++
++const isoSeconds = (v: unknown, fallback?: string) => {
++  if (typeof v === "number" && Number.isFinite(v)) return new Date(v * 1000).toISOString();
++  if (fallback) return fallback;
++  throw Error("Original native timestamp unavailable");
++};
++
++/** Only human input and assistant text enter formal messages. Other visible input is explicitly marked. */
++export function nativeVisibleText(content: unknown) {
++  if (!Array.isArray(content)) throw Error("Original native content unavailable");
++  return content.map(p => {
++    const part = object(p); if (!part || typeof part.type !== "string") throw Error("Invalid original native content");
++    if (part.type === "reasoning") return "";
++    if (part.type === "text" || part.type === "inputText") {
++      if (typeof part.text !== "string" || part.text.includes("\0")) throw Error("Invalid original native text");
++      return part.text;
++    }
++    // Paths, file bodies, model instructions and private reasoning are never copied as placeholders.
++    return `\n[原生附件：${part.type.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "其他"}；详情见原会话]\n`;
++  }).join("");
++}
++
++export function decodeCodexHistory(value: unknown, nativeId: string, cwd: string): NativeHistory {
++  const thread = object(value);
++  if (!thread || thread.id !== nativeId || thread.cwd !== cwd || !Array.isArray(thread.turns)) throw Error("Original Codex history scope changed");
++  const turns: NativeTurn[] = [], turnIds = new Set<string>(), ids = new Set<string>();
++  for (const raw of thread.turns) {
++    const turn = object(raw);
++    if (!turn || typeof turn.id !== "string" || turnIds.has(turn.id) || !Array.isArray(turn.items)) throw Error("Invalid original Codex turn identity");
++    turnIds.add(turn.id);
++    const startedAt = isoSeconds(turn.startedAt, isoSeconds(thread.createdAt));
++    const state = turn.status === "inProgress" ? "running" : turn.status === "completed" ? "completed" : turn.status === "interrupted" ? "interrupted" : turn.status === "failed" ? "error" : undefined;
++    if (!state) throw Error("Original Codex turn state unavailable");
++    const row: NativeTurn = { id: turn.id, state, startedAt, completedAt: state === "running" ? null : isoSeconds(turn.completedAt, isoSeconds(thread.updatedAt)), messages: [] };
++    for (const rawItem of turn.items) {
++      const item = object(rawItem);
++      if (!item || !["userMessage", "agentMessage"].includes(item.type)) continue;
++      if (typeof item.id !== "string" || ids.has(item.id)) throw Error("Duplicate original Codex message identity");
++      ids.add(item.id);
++      const text = item.type === "userMessage" ? nativeVisibleText(item.content) : item.text;
++      if (typeof text !== "string" || text.includes("\0")) throw Error("Invalid original Codex assistant text");
++      row.messages.push({ id: item.id, role: item.type === "userMessage" ? "user" : "assistant", text, createdAt: item.type === "userMessage" ? startedAt : row.completedAt ?? startedAt });
++    }
++    turns.push(row);
++  }
++  return { nativeId, cwd, turns, observation: turns.at(-1)?.state === "running" ? "running" : "ready", checkpoint: { afterTurnId: turns.at(-1)?.id ?? null }, complete: true };
++}
++
++/** Existing T3 turn/user identities are authoritative; text similarity never establishes identity. */
++export function planNativeHistory(history: NativeHistory, provider: "codex" | "dsh", savedTurns: readonly SavedTurn[], existing: readonly OrchestrationMessage[], aliases: Record<string, string> = {}) {
++  const messages: OrchestrationMessage[] = [];
++  const turns: (OrchestrationLatestTurn & { userMessageId: MessageId | null })[] = [];
++  const nextAliases = { ...aliases }, existingById = new Map(existing.map(m => [String(m.id), m]));
++  for (const native of history.turns) {
++    const firstUser = native.messages.find(m => m.role === "user");
++    const knownTurnId = provider === "codex" ? native.id : firstUser?.sourceCommandId ? `dsh:${firstUser.sourceCommandId}` : undefined;
++    const saved = savedTurns.find(t => t.turnId === (nextAliases[`turn:${native.id}`] ?? knownTurnId));
++    const turnId = TurnId.make(saved?.turnId ?? nextAliases[`turn:${native.id}`] ?? `native:${provider}:${history.nativeId}:turn:${native.id}`);
++    nextAliases[`turn:${native.id}`] = turnId;
++    let userMessageId: MessageId | null = null, assistantMessageId: MessageId | null = null;
++    for (const row of native.messages) {
++      const nativeKey = `message:${row.id}`;
++      const originalAssistant = `assistant:${row.id}`;
++      const mapped = nextAliases[nativeKey] ?? (row === firstUser && saved?.pendingMessageId ? saved.pendingMessageId : row.role === "assistant" && (existingById.has(originalAssistant) || saved?.assistantMessageId === originalAssistant) ? originalAssistant : undefined);
++      const id = MessageId.make(mapped ?? nativeMessageKey(provider, history.nativeId, native, row));
++      nextAliases[nativeKey] = id;
++      const old = existingById.get(id);
++      // Preserve the original source message, context, attachments, creation time and turn binding.
++      if (old && (old.role !== row.role || old.turnId !== null && old.turnId !== undefined && old.turnId !== turnId)) throw Error("Original message identity conflict");
++      if (old && !id.startsWith("native:") && old.text !== row.text) throw Error("Original T3/native message content conflicts; no overwrite");
++      const candidate: OrchestrationMessage = { ...(old ?? {}), id, role: row.role, text: row.text, turnId: old ? old.turnId ?? null : turnId, streaming: native.state === "running" && row.role === "assistant", createdAt: old?.createdAt ?? row.createdAt, updatedAt: native.completedAt ?? row.createdAt };
++      if (!old || old.text !== candidate.text || old.streaming !== candidate.streaming || old.turnId !== candidate.turnId) messages.push(candidate);
++      if (row.role === "user" && userMessageId === null) userMessageId = id;
++      if (row.role === "assistant") assistantMessageId = id;
++    }
++    turns.push({ turnId, userMessageId, state: native.state, requestedAt: saved?.requestedAt ?? native.startedAt, startedAt: saved?.startedAt ?? native.startedAt, completedAt: saved?.state === native.state && saved.completedAt ? saved.completedAt : native.completedAt, assistantMessageId });
++  }
++  return { messages, turns, latestTurn: turns.at(-1) ?? null, aliases: nextAliases };
++}
+diff --git a/apps/server/src/orchestration/NativeSessionSync.ts b/apps/server/src/orchestration/NativeSessionSync.ts
+new file mode 100644
+index 00000000..3abb8db5
+--- /dev/null
++++ b/apps/server/src/orchestration/NativeSessionSync.ts
+@@ -0,0 +1,107 @@
++// @effect-diagnostics globalDate:off -- The clock only expires advisory UI observation; provider evidence uses original timestamps.
++import { CommandId, MessageId, ProviderInstanceId, NativeSessionSyncPayload, type ThreadId } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Result from "effect/Result";
++import * as Data from "effect/Data";
++import * as Option from "effect/Option";
++import * as Schema from "effect/Schema";
++import * as Clock from "effect/Clock";
++import * as DateTime from "effect/DateTime";
++import { ProviderSessionDirectory } from "../provider/Services/ProviderSessionDirectory.ts";
++import { ProviderAdapterRegistry } from "../provider/Services/ProviderAdapterRegistry.ts";
++import { ProjectionThreadMessageRepository } from "../persistence/Services/ProjectionThreadMessages.ts";
++import { ProjectionTurnRepository } from "../persistence/Services/ProjectionTurns.ts";
++import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
++import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
++import { object, digest, nativeMessageKey, nativeBindingToken, decodeCodexHistory, planNativeHistory, type NativeHistory } from "./NativeSessionHistory.ts";
++
++class NativeSyncReadError extends Data.TaggedError("NativeSyncReadError")<{ readonly message: string }> {}
++const viewed = new Map<ThreadId, { lastView: number; subscribers: number }>();
++/** Advisory watch registration. It conveys no native ID, provider setting, write authorization or model request. */
++export function requestNativeSessionSync(threadId: ThreadId) { const current = viewed.get(threadId); viewed.set(threadId, { lastView: Date.now(), subscribers: current?.subscribers ?? 0 }); }
++
++export function attachNativeSessionSyncWatch(threadId: ThreadId) {
++  requestNativeSessionSync(threadId); viewed.get(threadId)!.subscribers++;
++  let closed = false;
++  return () => { if (closed) return; closed = true; const watch = viewed.get(threadId); if (watch) watch.subscribers = Math.max(0, watch.subscribers - 1); };
++}
++
++export const makeNativeSessionSync = Effect.gen(function* () {
++  const directoryOption = yield* Effect.serviceOption(ProviderSessionDirectory);
++  const registryOption = yield* Effect.serviceOption(ProviderAdapterRegistry);
++  const snapshots = yield* ProjectionSnapshotQuery;
++  const engine = yield* OrchestrationEngineService;
++  const turnRepository = yield* ProjectionTurnRepository;
++  const messageRepository = yield* ProjectionThreadMessageRepository;
++  if (Option.isNone(directoryOption) || Option.isNone(registryOption)) return Effect.void;
++  const directory = directoryOption.value, registry = registryOption.value;
++  const syncOne = Effect.fn("NativeSessionSync.syncOne")(function* (threadId: ThreadId) {
++    const bindingOption = yield* directory.getBinding(threadId);
++    if (Option.isNone(bindingOption)) return;
++    const binding = bindingOption.value;
++    if (!["codex", "dsh"].includes(binding.provider) || !binding.providerInstanceId || binding.status === "starting") return;
++    const scope = object(yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(nativeBindingToken(binding)))!;
++    const detail = yield* snapshots.getThreadDetailById(threadId, { activityKinds: ["native.session.sync"] });
++    if (Option.isNone(detail) || detail.value.archivedAt !== null || detail.value.deletedAt !== null || detail.value.session?.status === "running" || detail.value.session?.status === "starting") return;
++    const thread = detail.value;
++    const prior = object(thread.activities.find(a => a.kind === "native.session.sync")?.payload);
++    if (prior && (prior.nativeId !== scope.nativeId || prior.instanceId !== scope.instanceId)) throw Error("Original native sync scope changed");
++    const info = yield* registry.getInstanceInfo(ProviderInstanceId.make(scope.instanceId));
++    const adapter = yield* registry.getByInstance(ProviderInstanceId.make(scope.instanceId));
++    if (!info.enabled || info.driverKind !== scope.provider || adapter.provider !== scope.provider || !adapter.readNativeThread) return;
++    const checkpoint = object(prior?.checkpoint) ?? {};
++    const read = adapter.readNativeThread({ threadId: scope.nativeId, cwd: scope.cwd, includeTurns: true, checkpoint: checkpoint.native });
++    const checkedAt = DateTime.formatIso(yield* DateTime.now);
++    const attempt = yield* Effect.result(read.pipe(Effect.timeout("25 seconds")));
++    let history: NativeHistory | null = null;
++    if (Result.isSuccess(attempt)) history = yield* Effect.try({
++      try: () => scope.provider === "codex" ? decodeCodexHistory(attempt.success, scope.nativeId, scope.cwd) : attempt.success as NativeHistory,
++      catch: () => new NativeSyncReadError({ message: "Original native history validation failed" }),
++    }).pipe(Effect.orElseSucceed(() => null));
++    if (history && (history.nativeId !== scope.nativeId || history.cwd !== scope.cwd)) history = null;
++    const savedTurns = yield* turnRepository.listByThreadId({ threadId });
++    const existing = [...thread.messages];
++    if (history) {
++      const candidates = new Set<string>();
++      for (const turn of history.turns) for (const row of turn.messages) {
++        candidates.add(`assistant:${row.id}`);
++        candidates.add(nativeMessageKey(scope.provider, scope.nativeId, turn, row));
++      }
++      for (const turn of savedTurns) if (turn.pendingMessageId) candidates.add(turn.pendingMessageId);
++      for (const id of candidates) {
++        if (existing.some(m => m.id === id)) continue;
++        const row = yield* messageRepository.getByMessageId({ messageId: MessageId.make(id) });
++        if (Option.isSome(row)) {
++          if (row.value.threadId !== threadId) throw Error("Original message belongs to another thread");
++          const { messageId, isStreaming, threadId: _threadId, ...message } = row.value;
++          existing.push({ ...message, id: messageId, streaming: isStreaming });
++        }
++      }
++    }
++    const plan = history ? yield* Effect.try({ try: () => planNativeHistory(history!, scope.provider, savedTurns, existing, checkpoint.aliases ?? {}), catch: () => new NativeSyncReadError({ message: "Native history/T3 identity conflict" }) }).pipe(Effect.orElseSucceed(() => null)) : null;
++    const content = {
++      threadId, provider: scope.provider, instanceId: scope.instanceId, nativeId: scope.nativeId,
++      expectedBinding: nativeBindingToken(binding), observation: plan && history ? history.observation : "unknown",
++      checkpoint: plan && history ? { native: history.checkpoint, aliases: plan.aliases, latestTurn: history.complete ? plan.latestTurn ?? checkpoint.latestTurn ?? null : checkpoint.latestTurn ?? null } : checkpoint,
++      messages: plan?.messages ?? [], turns: plan?.turns ?? [],
++      latestTurn: history?.complete && plan ? plan.latestTurn ?? checkpoint.latestTurn ?? null : null,
++    };
++    // Digest represents native content/state, not poll time. Duplicate reads produce no event.
++    const syncVersion = digest({ binding: content.expectedBinding, observation: content.observation, checkpoint: content.checkpoint, nativeTurns: scope.provider === "codex" && history && plan ? history.turns : null });
++    const payload = yield* Schema.decodeUnknownEffect(NativeSessionSyncPayload)({ ...content, checkedAt, previousVersion: prior?.syncVersion ?? null, syncVersion });
++    if (syncVersion !== prior?.syncVersion) yield* engine.dispatch({ type: "thread.native-session.sync", commandId: CommandId.make(`native-sync:${threadId}:${digest([prior?.syncVersion ?? null, syncVersion])}`), ...payload });
++    if (scope.provider === "codex" && binding.status === "running" && payload.observation === "ready" && payload.latestTurn?.state === "completed") {
++      yield* engine.dispatch({ type: "thread.native-session.release", threadId, checkedAt, expectedBinding: payload.expectedBinding, commandId: CommandId.make(`native-release:${threadId}:${payload.latestTurn.turnId}:${syncVersion}`) });
++    }
++  });
++  // Reads are serialized and scoped to viewed conversations. No thread load/resume, engine graph scan or model action.
++  return Effect.gen(function* () {
++    while (true) {
++      for (const [threadId, watch] of [...viewed]) {
++        if (watch.subscribers === 0 && (yield* Clock.currentTimeMillis) - watch.lastView > 120_000) { viewed.delete(threadId); continue; }
++        yield* syncOne(threadId).pipe(Effect.catchCause(() => Effect.logDebug("Original native session sync unavailable", { threadId })));
++      }
++      yield* Effect.sleep("5 seconds");
++    }
++  });
++});
+diff --git a/apps/server/src/orchestration/decider.ts b/apps/server/src/orchestration/decider.ts
+index 369abf9d..c2720254 100644
+--- a/apps/server/src/orchestration/decider.ts
++++ b/apps/server/src/orchestration/decider.ts
+@@ -1388,6 +1388,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
+     }
+ 
+     case "thread.turn.start": {
++      const nativeThread = readModel.threads.find(t => t.id === command.threadId);
++      const observation = (nativeThread?.activities.find(a => a.kind === "native.session.sync")?.payload as { observation?: string } | undefined)?.observation;
++      if (observation === "running" || observation === "waiting_approval" || observation === "waiting_answer" || observation === "unknown") return yield* new OrchestrationCommandInvariantError({ commandType: command.type, detail: "The original native session is busy or unverified; wait for a verified idle observation before continuing here." });
+       if (isImportedAgentSessionMessageId(command.message.messageId)) {
+         return yield* new OrchestrationCommandInvariantError({
+           commandType: command.type,
+@@ -2018,6 +2021,23 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
+       };
+     }
+ 
++    case "thread.native-session.release": {
++      const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
++      const observed = thread.activities.find(a => a.kind === "native.session.sync")?.payload as { observation?: string; provider?: string } | undefined;
++      if (thread.session?.status !== "ready" || thread.latestTurn?.state !== "completed" || observed?.provider !== "codex" || observed.observation !== "ready" || openRequests(thread).size > 0 || hasQueuedTurnStartForThread(thread, command.checkedAt)) return yield* new OrchestrationCommandInvariantError({ commandType: command.type, detail: "Native writer release requires an exact completed idle session with no requests or queued input." });
++      return yield* decideOrchestrationCommand({ readModel, command: { type: "thread.settle", commandId: command.commandId, threadId: command.threadId } });
++    }
++
++    case "thread.native-session.sync": {
++      const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
++      const prior = thread.activities.find(a => a.kind === "native.session.sync")?.payload as { syncVersion?: string; nativeId?: string; instanceId?: string } | undefined;
++      if (thread.deletedAt !== null || thread.archivedAt !== null || thread.session?.status === "running" || thread.session?.status === "starting" || threadHasQueuedTurnStart({ latestUserMessageAt: thread.messages.filter(m => m.role === "user").at(-1)?.createdAt ?? null, latestTurn: thread.latestTurn, session: thread.session }, command.checkedAt) || (prior?.syncVersion ?? null) !== command.previousVersion || prior && (prior.nativeId !== command.nativeId || prior.instanceId !== command.instanceId)) {
++        return yield* new OrchestrationCommandInvariantError({ commandType: command.type, detail: "Native sync binding/version changed or local execution is active." });
++      }
++      const { type: _type, commandId: _commandId, ...payload } = command;
++      return { ...(yield* withEventBase({ aggregateKind: "thread", aggregateId: command.threadId, occurredAt: command.checkedAt, commandId: command.commandId })), type: "thread.native-session-synced", payload };
++    }
++
+     case "thread.history.import": {
+       const thread = yield* requireThread({
+         readModel,
+diff --git a/apps/server/src/orchestration/projector.ts b/apps/server/src/orchestration/projector.ts
+index 85d9db3f..4f9cbfa2 100644
+--- a/apps/server/src/orchestration/projector.ts
++++ b/apps/server/src/orchestration/projector.ts
+@@ -9,6 +9,7 @@ import type {
+ } from "@t3tools/contracts";
+ import {
+   isImportedAgentSessionMessageId,
++  mergeNativeSessionSync,
+   OrchestrationCheckpointSummary,
+   OrchestrationMessage,
+   OrchestrationSession,
+@@ -84,7 +85,7 @@ function retainThreadActivities(activities: OrchestrationThread["activities"]) {
+       // The worktree setup record is upserted under one id for the thread's
+       // whole life and is the only durable copy of a running setup; an async
+       // setup script can outlast a chatty first turn.
+-      activity.kind === WORKTREE_SETUP_ACTIVITY_KIND,
++      activity.kind === WORKTREE_SETUP_ACTIVITY_KIND || activity.kind === "native.session.sync",
+   );
+ }
+ 
+@@ -759,6 +760,11 @@ export function projectEvent(
+         })),
+       );
+ 
++    case "thread.native-session-synced": {
++      const thread = nextBase.threads.find(t => t.id === event.payload.threadId);
++      return Effect.succeed(thread ? { ...nextBase, threads: updateThread(nextBase.threads, thread.id, mergeNativeSessionSync(thread, event.payload, event.sequence)) } : nextBase);
++    }
++
+     case "thread.message-sent":
+       return Effect.gen(function* () {
+         const payload = yield* decodeForEvent(
+diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
+index 563346f2..e38e23f3 100644
+--- a/apps/server/src/provider/Drivers/CodexDriver.ts
++++ b/apps/server/src/provider/Drivers/CodexDriver.ts
+@@ -349,11 +349,11 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
+           ...adapter,
+           readNativeThread: (input) => Effect.gen(function* () {
+             const { client } = yield* withCodexAppServerClient({
+-              binaryPath: effectiveConfig.binaryPath, homePath: effectiveConfig.homePath,
++              binaryPath: processEnv.AAAAGENT_CODEX_READONLY_BINARY ?? effectiveConfig.binaryPath, homePath: effectiveConfig.homePath,
+               launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
+               cwd: input.cwd, environment: processEnv,
+             });
+-            return yield* readCompleteNativeThread(client, input.threadId, input.includeTurns);
++            return yield* readCompleteNativeThread(client, input.threadId, input.includeTurns, input.checkpoint);
+           }).pipe(
+             Effect.scoped, Effect.timeout("20 seconds"),
+             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+diff --git a/apps/server/src/provider/Drivers/DshDriver.ts b/apps/server/src/provider/Drivers/DshDriver.ts
+index f993679a..8c7d270e 100644
+--- a/apps/server/src/provider/Drivers/DshDriver.ts
++++ b/apps/server/src/provider/Drivers/DshDriver.ts
+@@ -5,7 +5,7 @@ import * as Option from "effect/Option";
+ import * as Schema from "effect/Schema";
+ import * as Stream from "effect/Stream";
+ 
+-import { ProviderDriverError } from "../Errors.ts";
++import { ProviderAdapterRequestError, ProviderDriverError } from "../Errors.ts";
+ import { DshHostService, makeDshAdapter } from "../Layers/DshAdapter.ts";
+ import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
+ import {
+@@ -94,7 +94,10 @@ export const DshDriver: ProviderDriver<DshSettings, DshDriverEnv> = {
+       };
+       return {
+         instanceId, driverKind: DRIVER, continuationIdentity, displayName, accentColor, enabled,
+-        snapshot, adapter, textGeneration,
++        snapshot, adapter: { ...adapter, readNativeThread: input => Effect.tryPromise({
++          try: () => { if (!host.port.readHistory) throw Error("Original DSH reader unavailable"); return host.port.readHistory(input.threadId, input.cwd, config.agentPreset ?? "", input.checkpoint); },
++          catch: () => new ProviderAdapterRequestError({ provider: DRIVER, method: "session/page", detail: "Original DSH readonly history unavailable" }),
++        }) }, textGeneration,
+       } satisfies ProviderInstance;
+     }),
+ };
+diff --git a/apps/server/src/provider/Layers/CodexNativeChildRead.test.ts b/apps/server/src/provider/Layers/CodexNativeChildRead.test.ts
+index cc9ef486..e2f0f558 100644
+--- a/apps/server/src/provider/Layers/CodexNativeChildRead.test.ts
++++ b/apps/server/src/provider/Layers/CodexNativeChildRead.test.ts
+@@ -3,6 +3,22 @@ import * as Effect from "effect/Effect";
+ import { readCompleteNativeThread } from "./CodexNativeChildRead.ts";
+ 
+ describe("original native readonly history", () => {
++  it("reads only the original tail through the last synced turn and preserves chronological ordering", async () => {
++    const calls: string[] = [];
++    const client = { raw: { request: (method: string, params: any) => Effect.sync(() => {
++      calls.push(method);
++      if (method === "thread/read") return { thread: { id: "same", historyMode: "paginated" } };
++      if (method !== "thread/turns/list" || params.sortDirection !== "desc") throw Error("Unexpected native operation");
++      return { data: [{ id: "t3", items: [] }, { id: "t2", items: [] }, { id: "t1", items: [] }], nextCursor: "older" };
++    }) } };
++    const result: any = await Effect.runPromise(readCompleteNativeThread(client, "same", true, { afterTurnId: "t2" }));
++    expect(result.turns.map((t: any) => t.id)).toEqual(["t2", "t3"]);
++    expect(calls).toEqual(["thread/read", "thread/turns/list"]);
++  });
++  it("rejects a removed native checkpoint without resetting or mutating the original conversation", async () => {
++    const client = { raw: { request: (method: string) => Effect.succeed(method === "thread/read" ? { thread: { id: "same", historyMode: "paginated" } } : { data: [{ id: "new", items: [] }], nextCursor: null }) } };
++    await expect(Effect.runPromise(readCompleteNativeThread(client, "same", true, { afterTurnId: "gone" }))).rejects.toThrow(/checkpoint/);
++  });
+   it("takes every paginated turn and preserves user/tool/output/status fields without resume", async () => {
+     const calls: { method: string; params: any }[] = [];
+     const turns = [{ id: "t1", status: "completed", items: [{ type: "userMessage", id: "u1", content: [{ type: "text", text: "exact original task" }] }, { type: "commandExecution", id: "c1", command: "cat task-a.md", aggregatedOutput: "public fixture" }] }, { id: "t2", status: "interrupted", error: { message: "kept original error" }, items: [{ type: "agentMessage", id: "a2", text: "exact original reply", phase: "final_answer" }] }];
+diff --git a/apps/server/src/provider/Layers/CodexNativeChildRead.ts b/apps/server/src/provider/Layers/CodexNativeChildRead.ts
+index 152ff257..50402898 100644
+--- a/apps/server/src/provider/Layers/CodexNativeChildRead.ts
++++ b/apps/server/src/provider/Layers/CodexNativeChildRead.ts
+@@ -8,7 +8,7 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
+ 
+ /** Read the original native fields/items, including every paginated turn. Never loads/resumes a thread. */
+ export const readCompleteNativeThread = Effect.fn("readCompleteNativeThread")(function* (
+-  client: ReadClient, threadId: string, includeTurns: boolean,
++  client: ReadClient, threadId: string, includeTurns: boolean, checkpoint?: unknown,
+ ) {
+   const response = record(yield* client.raw.request("thread/read", { threadId, includeTurns: false }));
+   const thread = record(response?.thread);
+@@ -21,6 +21,24 @@ export const readCompleteNativeThread = Effect.fn("readCompleteNativeThread")(fu
+     if (!native || native.id !== threadId || !Array.isArray(native.turns)) return yield* fail("Invalid original native history.");
+     return yield* Schema.decodeUnknownEffect(Schema.Json)(native).pipe(Effect.mapError(() => fail("Invalid native JSON history.")));
+   }
++  const saved = record(checkpoint);
++  const afterTurnId = typeof saved?.afterTurnId === "string" ? saved.afterTurnId : undefined;
++  if (afterTurnId) {
++    const newest: unknown[] = [], visited = new Set<string | null>(); let cursor: string | null = null;
++    do {
++      if (visited.has(cursor)) return yield* fail("Original incremental native cursor repeated."); visited.add(cursor);
++      const page = record(yield* client.raw.request("thread/turns/list", { threadId, cursor, limit: 100, sortDirection: "desc", itemsView: "full" }));
++      if (!page || !Array.isArray(page.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")) return yield* fail("Invalid original incremental native page.");
++      for (const item of page.data) {
++        const turn = record(item);
++        if (!turn || typeof turn.id !== "string" || !Array.isArray(turn.items)) return yield* fail("Invalid original incremental native turn.");
++        newest.push(turn);
++        if (turn.id === afterTurnId) return yield* Schema.decodeUnknownEffect(Schema.Json)({ ...thread, turns: newest.reverse() }).pipe(Effect.mapError(() => fail("Invalid native incremental JSON history.")));
++      }
++      cursor = page.nextCursor;
++    } while (cursor !== null);
++    return yield* fail("Original incremental native checkpoint is no longer present.");
++  }
+   const turns: unknown[] = []; const cursors = new Set<string | null>();
+   let cursor: string | null = null;
+   do {
+diff --git a/apps/server/src/provider/Layers/DshAdapter.ts b/apps/server/src/provider/Layers/DshAdapter.ts
+index ab9b1fc1..4e8c969a 100644
+--- a/apps/server/src/provider/Layers/DshAdapter.ts
++++ b/apps/server/src/provider/Layers/DshAdapter.ts
+@@ -22,6 +22,7 @@ export interface DshHostPort {
+   /** I supplies this from the protected launcher and native model catalog. */
+   describe(): Promise<{ readonly installed: boolean; readonly authenticated: boolean;
+     readonly version: string | null; readonly models: readonly ServerProviderModel[] }>;
++  readHistory?(sessionId: string, cwd: string, preset: string, checkpoint?: unknown): Promise<unknown>;
+   create(sessionId: string, cwd: string, preset: string): Promise<void>;
+   /** Cold read only; no Agent activation. */
+   hasSession(sessionId: string, cwd: string, preset: string): Promise<boolean>;
+diff --git a/apps/server/src/provider/Layers/DshHostProtocol.ts b/apps/server/src/provider/Layers/DshHostProtocol.ts
+index 501ba135..7ea0799e 100644
+--- a/apps/server/src/provider/Layers/DshHostProtocol.ts
++++ b/apps/server/src/provider/Layers/DshHostProtocol.ts
+@@ -1,6 +1,7 @@
+ // @effect-diagnostics globalTimers:off cryptoRandomUUID:off -- This bounded native HTTP client owns its deadline and wire request IDs.
+ import type { ModelSelection, ServerProviderModel } from "@t3tools/contracts";
+ import type { DshHostPort } from "./DshAdapter.ts";
++import { readDshHistoryChunk } from "./DshNativeHistory.ts";
+ 
+ type DshMethod = "session/list" | "session/page" | "session/create" | "session/prompt" | "session/modelCatalog" | "session/selectModel" | "session/rename";
+ export interface DshSessionRpc { call(method: DshMethod, args: object): Promise<unknown> }
+@@ -144,6 +145,7 @@ async function readCatalog(rpc: DshSessionRpc) {
+ /** Native catalog capability must survive both wire schemas before any scoped selection. */
+ export function makeDshHostProtocol(rpc: DshSessionRpc): DshHostPort {
+   return {
++    readHistory: (sessionId, cwd, preset, checkpoint) => readDshHistoryChunk(rpc, sessionId, cwd, preset, checkpoint),
+     describe: async () => {
+       await listRows(rpc);
+       const catalog = await readCatalog(rpc);
+diff --git a/apps/server/src/provider/Layers/DshNativeHistory.ts b/apps/server/src/provider/Layers/DshNativeHistory.ts
+new file mode 100644
+index 00000000..f958eba8
+--- /dev/null
++++ b/apps/server/src/provider/Layers/DshNativeHistory.ts
+@@ -0,0 +1,57 @@
++// @effect-diagnostics globalDate:off -- Pure provider timestamp conversion; no host-clock substitute.
++import type { DshSessionRpc } from "./DshHostProtocol.ts";
++import { nativeVisibleText, object, type NativeHistory, type NativeTurn } from "../../orchestration/NativeSessionHistory.ts";
++
++/** Forward checkpoint in bounded event batches; each batch is read from the original, stable native head. */
++export async function readDshHistoryChunk(rpc: DshSessionRpc, sessionId: string, cwd: string, preset: string, checkpoint?: unknown): Promise<NativeHistory> {
++  const saved = object(checkpoint);
++  const afterSeq = Number.isSafeInteger(saved?.afterSeq) && saved!.afterSeq >= -1 ? saved!.afterSeq as number : -1;
++  const listed = object(await rpc.call("session/list", { _request: {} }));
++  const matches = Array.isArray(listed?.items) ? listed.items.filter(r => r.sessionId === sessionId) : [];
++  const row = matches[0], head = row?.projections?.asOfSeq;
++  if (matches.length !== 1 || row.cwd !== cwd || row.projections?.values?.agentPreset !== preset || row.parentSessionId || row.origin === "subagent" || !Number.isSafeInteger(head) || head < afterSeq || typeof row.running !== "boolean") throw Error("Original DSH history scope changed");
++  const throughSeq = Math.min(head, afterSeq + 256), events: any[] = [];
++  let beforeSeq: number | undefined;
++  while (throughSeq > afterSeq && (beforeSeq === undefined || beforeSeq > afterSeq + 1)) {
++    const page = object(await rpc.call("session/page", { request: { address: { kind: "session", sessionId }, throughSeq, maxMessages: 16, ...(beforeSeq === undefined ? {} : { beforeSeq }) } }));
++    const records = Array.isArray(page?.records) ? page.records.map(r => r?.type === "event" ? r.event : null) : [];
++    if (!records.length || records.some((e, i) => !object(e) || !Number.isSafeInteger(e.seq) || e.seq < 0 || i > 0 && e.seq !== records[i - 1].seq + 1) || records.at(-1).seq !== (beforeSeq ?? throughSeq + 1) - 1) throw Error("Original DSH history page sequence changed");
++    for (const event of records) if (event.seq > afterSeq) events.push(event);
++    beforeSeq = records[0].seq;
++  }
++  events.sort((a, b) => a.seq - b.seq);
++  if (events.length !== throughSeq - afterSeq || events.some((e, i) => e.seq !== afterSeq + 1 + i)) throw Error("Original DSH history checkpoint gap");
++  const turns: NativeTurn[] = [];
++  let active: NativeTurn | null = saved?.activeTurn ? structuredClone(saved.activeTurn) : null;
++  if (active) turns.push(active);
++  const pending = new Map<string, string>(Array.isArray(saved?.pending) ? saved.pending : []);
++  const stamp = (e: any) => {
++    if (!Number.isSafeInteger(e.time) || e.time < 0) throw Error("Original DSH timestamp unavailable");
++    return new Date(e.time).toISOString();
++  };
++  for (const e of events) {
++    const d = e.data;
++    if (e.type === "turn/start") {
++      if (active || !Number.isSafeInteger(d?.turn) || d.turn < 1) throw Error("Original DSH turn identity conflict");
++      active = { id: `turn:${d.turn}`, state: "running", startedAt: stamp(e), completedAt: null, messages: [] }; turns.push(active);
++    } else if (e.type === "turn/end") {
++      if (!active || active.id !== `turn:${d?.turn}`) throw Error("Original DSH terminal identity conflict");
++      active.state = d.reason?.kind === "completed" ? "completed" : ["aborted", "interrupted"].includes(d.reason?.kind) ? "interrupted" : "error";
++      active.completedAt = stamp(e); active = null; pending.clear();
++    } else if (e.type === "user/message" && d?.source?.kind === "user") {
++      if (!active || d.role !== "user" || typeof d.id !== "string" || typeof d.source.rpcId !== "string") throw Error("Original DSH human message identity conflict");
++      active.messages.push({ id: `dsh:${sessionId}:${e.seq}`, role: "user", text: nativeVisibleText(d.content), createdAt: stamp(e), sourceCommandId: d.source.rpcId });
++    } else if (e.type === "assistant/message") {
++      if (!active || active.id !== `turn:${d?.turn}` || d.message?.role !== "assistant" || typeof d.message.id !== "string") throw Error("Original DSH assistant identity conflict");
++      const text = nativeVisibleText(d.message.content);
++      if (text) active.messages.push({ id: `dsh:${sessionId}:${e.seq}`, role: "assistant", text, createdAt: stamp(e) });
++    } else if (e.type === "approval/asked" && typeof d?.id === "string") {
++      pending.set(d.id, "approval");
++    } else if (e.type === "approval/decided" && typeof d?.id === "string") pending.delete(d.id);
++  }
++  const complete = throughSeq === head;
++  if (complete && !!active !== row.running) throw Error("Original DSH lifecycle not yet consistent");
++  const observation = !complete ? "unknown" : pending.size ? [...pending.values()].some(k => k.includes("question")) ? "waiting_answer" : "waiting_approval" : active ? "running" : "ready";
++  // The active turn is small and carried across batches; completed older turns are never copied into this checkpoint.
++  return { nativeId: sessionId, cwd, turns, complete, observation, checkpoint: { afterSeq: throughSeq, activeTurn: active, pending: [...pending] } };
++}
+diff --git a/apps/server/src/provider/Services/ProviderAdapter.ts b/apps/server/src/provider/Services/ProviderAdapter.ts
+index e6273b5a..94ffcd7d 100644
+--- a/apps/server/src/provider/Services/ProviderAdapter.ts
++++ b/apps/server/src/provider/Services/ProviderAdapter.ts
+@@ -132,7 +132,7 @@ export interface ProviderAdapterShape<TError> {
+   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
+ 
+   /** Scoped callers validate durable parent/child ownership before invoking this read. */
+-  readonly readNativeThread?: (input: { readonly threadId: string; readonly cwd: string; readonly includeTurns: boolean }) => Effect.Effect<unknown, TError>;
++  readonly readNativeThread?: (input: { readonly threadId: string; readonly cwd: string; readonly includeTurns: boolean; readonly checkpoint?: unknown }) => Effect.Effect<unknown, TError>;
+ 
+   /**
+    * Roll back a provider thread by N turns.
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 5f329d79..d7dab0b8 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -284,7 +284,7 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
+ // NDJSON writers and is provided at the outer runtime layer so both
+ // `ProviderService` and the per-instance drivers read the same logger pair.
+ const ProviderLayerLive = ProviderServiceLive.pipe(
+-  Layer.provide(ProviderAdapterRegistryLive),
++  Layer.provideMerge(ProviderAdapterRegistryLive),
+   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
+ );
+ 
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 830bb35b..005bb24e 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -1,3 +1,4 @@
++import { attachNativeSessionSyncWatch } from "./orchestration/NativeSessionSync.ts";
+ import {
+   sameUsageLimitCommandCoverage,
+   withUsageLimitsCommands,
+@@ -344,6 +345,7 @@ export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract
+   OrchestrationEvent,
+   {
+     type:
++      | "thread.native-session-synced"
+       | "thread.message-sent"
+       | "thread.proposed-plan-upserted"
+       | "thread.activity-appended"
+@@ -353,6 +355,7 @@ export function isThreadDetailEvent(event: OrchestrationEvent): event is Extract
+   }
+ > {
+   return (
++    event.type === "thread.native-session-synced" ||
+     event.type === "thread.message-sent" ||
+     event.type === "thread.proposed-plan-upserted" ||
+     event.type === "thread.activity-appended" ||
+@@ -2185,6 +2188,8 @@ const makeWsRpcLayer = (
+           observeRpcStreamEffect(
+             ORCHESTRATION_WS_METHODS.subscribeThread,
+             Effect.gen(function* () {
++              const closeNativeWatch = attachNativeSessionSyncWatch(input.threadId);
++              yield* Effect.addFinalizer(() => Effect.sync(closeNativeWatch));
+               const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
+                 event.aggregateKind === "thread" &&
+                 event.aggregateId === input.threadId &&
+diff --git a/packages/client-runtime/src/state/threadReducer.ts b/packages/client-runtime/src/state/threadReducer.ts
+index 66f78a04..9c0044b0 100644
+--- a/packages/client-runtime/src/state/threadReducer.ts
++++ b/packages/client-runtime/src/state/threadReducer.ts
+@@ -14,7 +14,7 @@ import type {
+   TurnId,
+ } from "@t3tools/contracts";
+ import { threadPullRequestKeysEqual } from "@t3tools/shared/threadPullRequests";
+-import { isImportedAgentSessionMessageId } from "@t3tools/contracts";
++import { mergeNativeSessionSync, isImportedAgentSessionMessageId } from "@t3tools/contracts";
+ import { compareDateTimeStrings } from "@t3tools/shared/dateTime";
+ 
+ export type ThreadDetailReducerResult =
+@@ -386,6 +386,9 @@ export function applyThreadDetailEvent(
+     }
+ 
+     // ── Messages ────────────────────────────────────────────────────
++    case "thread.native-session-synced":
++      return { kind: "updated", thread: mergeNativeSessionSync(thread, event.payload, event.sequence) };
++
+     case "thread.message-sent": {
+       const message: OrchestrationMessage = {
+         id: event.payload.messageId,
+diff --git a/packages/contracts/src/orchestration.ts b/packages/contracts/src/orchestration.ts
+index 1e0de40f..280c04ca 100644
+--- a/packages/contracts/src/orchestration.ts
++++ b/packages/contracts/src/orchestration.ts
+@@ -1,3 +1,4 @@
++import * as Option from "effect/Option";
+ import * as Effect from "effect/Effect";
+ import * as Schema from "effect/Schema";
+ import * as SchemaIssue from "effect/SchemaIssue";
+@@ -790,7 +791,22 @@ export const ThreadPullRequestLink = Schema.Struct({
+ });
+ export type ThreadPullRequestLink = typeof ThreadPullRequestLink.Type;
+ 
++/** Readonly evidence about the original native session. This does not own its writer. */
++export const NativeSessionObservation = Schema.Struct({
++  provider: Schema.Literals(["codex", "dsh"]), nativeId: TrimmedNonEmptyString,
++  instanceId: ProviderInstanceId, status: Schema.Literals(["ready", "running", "waiting_approval", "waiting_answer", "unknown"]),
++  checkedAt: IsoDateTime, syncVersion: Schema.String,
++});
++export type NativeSessionObservation = typeof NativeSessionObservation.Type;
++export function nativeSessionObservationFromPayload(payload: unknown): NativeSessionObservation | null {
++  if (payload === null || typeof payload !== "object") return null;
++  const p = payload as Record<string, unknown>;
++  const result = Schema.decodeUnknownOption(NativeSessionObservation)({ ...p, status: p.observation });
++  return Option.getOrNull(result);
++}
++
+ export const OrchestrationThread = Schema.Struct({
++  nativeSessionObservation: Schema.optional(Schema.NullOr(NativeSessionObservation)),
+   id: ThreadId,
+   projectId: ProjectId,
+   title: TrimmedNonEmptyString,
+@@ -882,6 +898,7 @@ export const OrchestrationProjectShell = Schema.Struct({
+ export type OrchestrationProjectShell = typeof OrchestrationProjectShell.Type;
+ 
+ export const OrchestrationThreadShell = Schema.Struct({
++  nativeSessionObservation: Schema.optional(Schema.NullOr(NativeSessionObservation)),
+   id: ThreadId,
+   projectId: ProjectId,
+   title: TrimmedNonEmptyString,
+@@ -1581,6 +1598,32 @@ const ThreadMessageReasoningCompleteCommand = Schema.Struct({
+   createdAt: IsoDateTime,
+ });
+ 
++export const NativeSessionSyncPayload = Schema.Struct({
++  threadId: ThreadId, provider: Schema.Literals(["codex", "dsh"]), instanceId: ProviderInstanceId,
++  nativeId: TrimmedNonEmptyString, previousVersion: Schema.NullOr(Schema.String), syncVersion: Schema.String,
++  expectedBinding: Schema.String, checkedAt: IsoDateTime,
++  observation: Schema.Literals(["ready", "running", "waiting_approval", "waiting_answer", "unknown"]),
++  checkpoint: Schema.Json,
++  messages: Schema.Array(OrchestrationMessage),
++  turns: Schema.Array(Schema.Struct({ ...OrchestrationLatestTurn.fields, userMessageId: Schema.NullOr(MessageId) })),
++  latestTurn: Schema.NullOr(OrchestrationLatestTurn),
++});
++export type NativeSessionSyncPayload = typeof NativeSessionSyncPayload.Type;
++export function nativeSessionSyncActivity(p: NativeSessionSyncPayload): OrchestrationThreadActivity {
++  return { id: EventId.make(`native-sync:${p.threadId}`), turnId: p.latestTurn?.turnId ?? null, tone: p.observation === "unknown" ? "error" : "info", kind: "native.session.sync", summary: p.observation === "unknown" ? "原生会话暂未完成核验，已同步内容保留" : p.observation === "ready" ? "原生会话已同步" : "原生会话正在运行", payload: { provider: p.provider, instanceId: p.instanceId, nativeId: p.nativeId, checkpoint: p.checkpoint, syncVersion: p.syncVersion, observation: p.observation, checkedAt: p.checkedAt }, createdAt: p.checkedAt };
++}
++export function mergeNativeSessionSync(thread: OrchestrationThread, p: NativeSessionSyncPayload, sequence?: number): OrchestrationThread {
++  const updates = new Map(p.messages.map(m => [m.id, m]));
++  const messages = thread.messages.map(m => { const next = updates.get(m.id); updates.delete(m.id); return next ? { ...m, ...next } : m; });
++  messages.push(...updates.values()); messages.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
++  const activity = { ...nativeSessionSyncActivity(p), ...(sequence === undefined ? {} : { sequence }) };
++  const newlyActive = p.latestTurn !== null && (p.latestTurn.turnId !== thread.latestTurn?.turnId || p.latestTurn.state === "running");
++  return { ...thread, nativeSessionObservation: nativeSessionObservationFromPayload(activity.payload), ...(newlyActive ? { settledOverride: null, unsettledAt: p.checkedAt } : {}), messages, latestTurn: p.latestTurn ?? thread.latestTurn, activities: [...thread.activities.filter(a => a.id !== activity.id), activity], updatedAt: p.checkedAt };
++}
++const ThreadNativeSessionSyncCommand = Schema.Struct({ type: Schema.Literal("thread.native-session.sync"), commandId: CommandId, ...NativeSessionSyncPayload.fields });
++
++const ThreadNativeIdleReleaseCommand = Schema.Struct({ type: Schema.Literal("thread.native-session.release"), commandId: CommandId, threadId: ThreadId, expectedBinding: Schema.String, checkedAt: IsoDateTime });
++
+ const ThreadHistoryImportCommand = Schema.Struct({
+   type: Schema.Literal("thread.history.import"),
+   commandId: CommandId,
+@@ -1712,6 +1755,8 @@ const InternalOrchestrationCommand = Schema.Union([
+   ThreadMessageReasoningDeltaCommand,
+   ThreadMessageReasoningCompleteCommand,
+   ThreadHistoryImportCommand,
++  ThreadNativeSessionSyncCommand,
++  ThreadNativeIdleReleaseCommand,
+   ThreadMessageUserAppendCommand,
+   ThreadProposedPlanUpsertCommand,
+   ThreadTurnDiffCompleteCommand,
+@@ -1753,6 +1798,7 @@ export const OrchestrationEventType = Schema.Literals([
+   "thread.pull-request-synced",
+   "thread.runtime-mode-set",
+   "thread.interaction-mode-set",
++  "thread.native-session-synced",
+   "thread.message-sent",
+   "thread.turn-start-requested",
+   "thread.turn-interrupt-requested",
+@@ -2192,6 +2238,11 @@ export const OrchestrationEvent = Schema.Union([
+     type: Schema.Literal("thread.interaction-mode-set"),
+     payload: ThreadInteractionModeSetPayload,
+   }),
++  Schema.Struct({
++    ...EventBaseFields,
++    type: Schema.Literal("thread.native-session-synced"),
++    payload: NativeSessionSyncPayload,
++  }),
+   Schema.Struct({
+     ...EventBaseFields,
+     type: Schema.Literal("thread.message-sent"),

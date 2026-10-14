@@ -1,0 +1,96 @@
+--- a/packages/contracts/src/environmentHttp.ts
++++ b/packages/contracts/src/environmentHttp.ts
+@@ -522,7 +522,27 @@
+   status: OrchestrationCommandReceiptStatus,
+ }));
+ 
++const EnvironmentProviderModels = Schema.Struct({
++  providers: Schema.Array(Schema.Struct({
++    instanceId: TrimmedNonEmptyString,
++    driver: TrimmedNonEmptyString,
++    enabled: Schema.Boolean,
++    installed: Schema.Boolean,
++    status: Schema.Literals(["ready", "warning", "error", "disabled"]),
++    authStatus: Schema.Literals(["authenticated", "unauthenticated", "unknown"]),
++    checkedAt: IsoDateTime,
++    models: Schema.Array(Schema.Struct({ slug: TrimmedNonEmptyString, name: TrimmedNonEmptyString })),
++  })),
++});
++
+ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
++  .add(
++    HttpApiEndpoint.get("providerModels", "/api/orchestration/provider-models", {
++      headers: OptionalBearerHeaders,
++      success: EnvironmentProviderModels,
++      error: EnvironmentOrchestrationSnapshotErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
+   .add(
+     HttpApiEndpoint.get("snapshot", "/api/orchestration/snapshot", {
+       headers: OptionalBearerHeaders,
+--- a/apps/server/src/orchestration/http.ts
++++ b/apps/server/src/orchestration/http.ts
+@@ -2,6 +2,7 @@
+   AuthOrchestrationOperateScope,
+   AuthOrchestrationReadScope,
+   EnvironmentHttpApi,
++  ProviderInstanceId,
+ } from "@t3tools/contracts";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+@@ -22,6 +23,7 @@
+ import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
+ import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
+ import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
++import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
+ 
+ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
+   EnvironmentHttpApi,
+@@ -31,8 +33,27 @@
+     const commandReceipts = yield* OrchestrationCommandReceiptRepository;
+     const orchestrationEngine = yield* OrchestrationEngineService;
+     const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
++    const providerRegistry = yield* ProviderRegistry;
+ 
+     return handlers
++      .handle(
++        "providerModels",
++        Effect.fn("environment.orchestration.providerModels")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
++          const providers = yield* providerRegistry.refreshInstance(ProviderInstanceId.make("codex"));
++          return { providers: providers.map((provider) => ({
++            instanceId: provider.instanceId,
++            driver: provider.driver,
++            enabled: provider.enabled,
++            installed: provider.installed,
++            status: provider.status,
++            authStatus: provider.auth.status,
++            checkedAt: provider.checkedAt,
++            models: provider.models.map((model) => ({ slug: model.slug, name: model.name })),
++          })) };
++        }),
++      )
+       .handle(
+         "snapshot",
+         Effect.fn("environment.orchestration.snapshot")(function* (args) {
+--- a/apps/server/src/bin.test.ts
++++ b/apps/server/src/bin.test.ts
+@@ -42,6 +42,7 @@
+ import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+ import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
+ import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
++import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+ import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+ import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
+ import {
+@@ -376,6 +377,9 @@
+               discard: () => Effect.void,
+             }),
+           ),
++          Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({
++            refreshInstance: () => Effect.succeed([]),
++          })),
+         ),
+       ),
+       Layer.provide(environmentAuthenticatedAuthLayer),

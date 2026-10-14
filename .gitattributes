@@ -1,0 +1,3 @@
+# Preserve source bytes used by the engine/overlay SHA-256 locks on every host.
+# Nested third-party trees retain their own upstream attributes.
+* -text

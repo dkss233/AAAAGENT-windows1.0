@@ -1,0 +1,131 @@
+--- a/apps/server/src/provider/Layers/CodexSessionRuntime.ts
++++ b/apps/server/src/provider/Layers/CodexSessionRuntime.ts
+@@ -733,6 +733,24 @@
+   >;
+ }
+ 
++function verifyStrictOpenResponse<T>(
++  response: T,
++  runtimeMode: RuntimeMode,
++  cwd: string,
++  method: "thread/start" | "thread/resume",
++): Effect.Effect<T, CodexErrors.CodexAppServerRequestError> {
++  if (runtimeMode !== "approval-required") return Effect.succeed(response);
++  const value = response as Record<string, unknown> | null;
++  const sandbox = value?.sandbox as Record<string, unknown> | undefined;
++  if (value?.approvalPolicy !== "untrusted" || value.approvalsReviewer !== "user" ||
++      value.cwd !== cwd || sandbox?.type !== "readOnly" || sandbox.networkAccess === true) {
++    return Effect.fail(CodexErrors.CodexAppServerRequestError.invalidParams(
++      "Strict Codex approval policy was not active", undefined, { method },
++    ));
++  }
++  return Effect.succeed(response);
++}
++
+ export const openCodexThread = (input: {
+   readonly client: CodexThreadOpenClient;
+   readonly threadId: ThreadId;
+@@ -753,7 +771,9 @@
+   });
+ 
+   if (resumeThreadId === undefined) {
+-    return input.client.request("thread/start", startParams);
++    return input.client.request("thread/start", startParams).pipe(
++      Effect.flatMap((response) => verifyStrictOpenResponse(response, input.runtimeMode, input.cwd, "thread/start")),
++    );
+   }
+ 
+   // Older providers may still return history despite excludeTurns. Only the
+@@ -766,6 +786,7 @@
+       excludeTurns: true,
+     })
+     .pipe(
++      Effect.flatMap((response) => verifyStrictOpenResponse(response, input.runtimeMode, input.cwd, "thread/resume")),
+       Effect.flatMap((response) =>
+         decodeCodexThreadResumeMetadata(response).pipe(
+           Effect.mapError((error) =>
+@@ -786,7 +807,9 @@
+           resumeThreadId,
+           recoverable: true,
+           cause: error,
+-        }).pipe(Effect.andThen(input.client.request("thread/start", startParams))),
++        }).pipe(Effect.andThen(input.client.request("thread/start", startParams).pipe(
++          Effect.flatMap((response) => verifyStrictOpenResponse(response, input.runtimeMode, input.cwd, "thread/start")),
++        ))),
+       ),
+     );
+ };
+--- a/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
++++ b/apps/server/src/provider/Layers/CodexSessionRuntime.test.ts
+@@ -903,15 +903,18 @@
+   it.effect("omits explicit approval policy for strict start and resume", () =>
+     Effect.gen(function* () {
+       const calls: Array<{ method: string; payload: unknown }> = [];
++      const strictResponse = (threadId: string) => ({ ...makeThreadOpenResponse(threadId),
++        approvalPolicy: "untrusted", approvalsReviewer: "user", sandbox: { type: "readOnly", networkAccess: false },
++      }) as CodexRpc.ClientRequestResponsesByMethod["thread/start"];
+       const client = {
+         request: (method: string, payload: unknown) => {
+           calls.push({ method, payload });
+-          return Effect.succeed(makeThreadOpenResponse("started-thread"));
++          return Effect.succeed(strictResponse("started-thread"));
+         },
+         raw: {
+           request: (method: string, payload: unknown) => {
+             calls.push({ method, payload });
+-            return Effect.succeed(makeThreadOpenResponse("saved-thread"));
++            return Effect.succeed(strictResponse("saved-thread"));
+           },
+         },
+       };
+@@ -932,6 +935,50 @@
+         { method: "thread/resume", payload: { threadId: "saved-thread", cwd: "/tmp/project",
+           sandbox: "read-only", approvalsReviewer: "user", excludeTurns: true } },
+       ]);
++    }),
++  );
++
++  it.effect("fails closed on a downgraded strict start or resume response", () =>
++    Effect.gen(function* () {
++      for (const resumeThreadId of [undefined, "saved-thread"]) {
++        for (const override of [
++          { approvalPolicy: "on-request" },
++          { sandbox: { type: "workspaceWrite" } },
++          { cwd: "/tmp/other-project" },
++          { approvalsReviewer: "auto_review" },
++          { sandbox: { type: "readOnly", networkAccess: true } },
++        ]) {
++          const response = { ...makeThreadOpenResponse("saved-thread"), approvalPolicy: "untrusted",
++            approvalsReviewer: "user", sandbox: { type: "readOnly", networkAccess: false }, ...override } as unknown as
++            CodexRpc.ClientRequestResponsesByMethod["thread/start"];
++          const client = {
++            request: () => Effect.succeed(response),
++            raw: { request: () => Effect.succeed(response) },
++          };
++          const error = yield* openCodexThread({ client, threadId: ThreadId.make("thread-1"),
++            runtimeMode: "approval-required", cwd: "/tmp/project", requestedModel: undefined,
++            serviceTier: undefined, resumeThreadId }).pipe(Effect.flip);
++          NodeAssert.ok(isCodexAppServerRequestError(error));
++          NodeAssert.match(error.errorMessage, /Strict Codex approval policy/);
++        }
++      }
++    }),
++  );
++
++  it.effect("checks strict policy after an explicit fresh-start fallback", () =>
++    Effect.gen(function* () {
++      const client = {
++        request: () => Effect.succeed(makeThreadOpenResponse("fresh-thread")),
++        raw: { request: () => Effect.fail(new CodexErrors.CodexAppServerRequestError({
++          code: -32603, errorMessage: "thread not found",
++        })) },
++      };
++      const error = yield* openCodexThread({ client, threadId: ThreadId.make("thread-1"),
++        runtimeMode: "approval-required", cwd: "/tmp/project", requestedModel: undefined,
++        serviceTier: undefined, resumeThreadId: "old-thread", resumeFailurePolicy: "start-fresh",
++      }).pipe(Effect.flip);
++      NodeAssert.ok(isCodexAppServerRequestError(error));
++      NodeAssert.match(error.errorMessage, /Strict Codex approval policy/);
+     }),
+   );
+ 

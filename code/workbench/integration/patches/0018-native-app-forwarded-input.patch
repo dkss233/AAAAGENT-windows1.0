@@ -1,0 +1,67 @@
+diff --git a/apps/server/src/orchestration/NativeSessionHistory.test.ts b/apps/server/src/orchestration/NativeSessionHistory.test.ts
+index 12bd6ed9..a82f8116 100644
+--- a/apps/server/src/orchestration/NativeSessionHistory.test.ts
++++ b/apps/server/src/orchestration/NativeSessionHistory.test.ts
+@@ -73,6 +73,24 @@ describe("native message identity and original records", () => {
+   });
+ });
+ 
++describe("original App forwarded input", () => {
++  it("imports only the exact named App envelope, retaining source/body and skipping unrelated tool results", () => {
++    const source = "01a0759c-5c23-7f02-94a7-e9cbd4d54df3";
++    const forwarded = { type: "functionCallOutput", id: "fco-original", namespace: "codex_app", name: "send_message_to_thread", output: `<codex_delegation>\n<source_thread_id>${source}</source_thread_id>\n<input>exact original body</input>\n</codex_delegation>` };
++    const raw = { id: "native", cwd: "/fixture", createdAt: 1, updatedAt: 3, turns: [{ id: "app-turn", status: "completed", items: [
++      { ...forwarded, id: "not-app", namespace: "other" }, { ...forwarded, id: "not-send", name: "read_thread" },
++      { ...forwarded, id: "malformed", output: "private tool output" }, forwarded, { type: "agentMessage", id: "reply", text: "answer" },
++    ] }] };
++    const decoded = decodeCodexHistory(raw, "native", "/fixture");
++    expect(decoded.turns[0]?.messages.map(m => m.id)).toEqual(["fco-original", "reply"]);
++    expect(decoded.turns[0]?.messages[0]).toMatchObject({ role: "user", text: `[原生转发输入；来源会话：${source}]\nexact original body` });
++    const plan = planNativeHistory(decoded, "codex", [], []);
++    expect(plan.turns[0]?.userMessageId).toBe(plan.messages[0]?.id);
++    expect(plan.messages).toHaveLength(2);
++    expect(planNativeHistory(decoded, "codex", [], plan.messages, plan.aliases).messages).toHaveLength(0);
++  });
++});
++
+ describe("incremental DSH original history", () => {
+   const events = Array.from({ length: 700 }, (_, seq) => ({ seq, time: 1_800_000_000_000 + seq, type: "developer/message", data: {} as any }));
+   events[1] = { ...events[1]!, type: "turn/start", data: { turn: 1 } };
+diff --git a/apps/server/src/orchestration/NativeSessionHistory.ts b/apps/server/src/orchestration/NativeSessionHistory.ts
+index 8c3ad545..e8a7b3a8 100644
+--- a/apps/server/src/orchestration/NativeSessionHistory.ts
++++ b/apps/server/src/orchestration/NativeSessionHistory.ts
+@@ -39,6 +39,14 @@ export function nativeVisibleText(content: unknown) {
+   }).join("");
+ }
+ 
++/** Import the App's exact named forwarded-input record, with its original source visible. */
++export function nativeForwardedInput(item: Record<string, any>): string | undefined {
++  if (item.type !== "functionCallOutput" || item.namespace !== "codex_app" || item.name !== "send_message_to_thread" || typeof item.output !== "string" || item.output.includes("\0")) return undefined;
++  const match = /^<codex_delegation>\s*<source_thread_id>([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>$/.exec(item.output);
++  if (!match || match[2]!.length === 0) return undefined;
++  return `[原生转发输入；来源会话：${match[1]}]\n${match[2]}`;
++}
++
+ export function decodeCodexHistory(value: unknown, nativeId: string, cwd: string): NativeHistory {
+   const thread = object(value);
+   if (!thread || thread.id !== nativeId || thread.cwd !== cwd || !Array.isArray(thread.turns)) throw Error("Original Codex history scope changed");
+@@ -53,12 +61,15 @@ export function decodeCodexHistory(value: unknown, nativeId: string, cwd: string
+     const row: NativeTurn = { id: turn.id, state, startedAt, completedAt: state === "running" ? null : isoSeconds(turn.completedAt, isoSeconds(thread.updatedAt)), messages: [] };
+     for (const rawItem of turn.items) {
+       const item = object(rawItem);
+-      if (!item || !["userMessage", "agentMessage"].includes(item.type)) continue;
++      if (!item) continue;
++      const forwarded = nativeForwardedInput(item);
++      if (!["userMessage", "agentMessage"].includes(item.type) && forwarded === undefined) continue;
+       if (typeof item.id !== "string" || ids.has(item.id)) throw Error("Duplicate original Codex message identity");
+       ids.add(item.id);
+-      const text = item.type === "userMessage" ? nativeVisibleText(item.content) : item.text;
++      const text = forwarded ?? (item.type === "userMessage" ? nativeVisibleText(item.content) : item.text);
+       if (typeof text !== "string" || text.includes("\0")) throw Error("Invalid original Codex assistant text");
+-      row.messages.push({ id: item.id, role: item.type === "userMessage" ? "user" : "assistant", text, createdAt: item.type === "userMessage" ? startedAt : row.completedAt ?? startedAt });
++      const isInput = item.type === "userMessage" || forwarded !== undefined;
++      row.messages.push({ id: item.id, role: isInput ? "user" : "assistant", text, createdAt: isInput ? startedAt : row.completedAt ?? startedAt });
+     }
+     turns.push(row);
+   }

@@ -1,0 +1,3 @@
+导出: isOutside, isPrivateDirectorySync, isPrivateFileSync, restrictPrivatePathSync
+  ✅ restrictPrivatePathSync → undefined  (359ms)
+  ✅ isPrivateFileSync → false  (0ms)

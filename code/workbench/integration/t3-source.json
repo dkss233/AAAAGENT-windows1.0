@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/pingdotgg/t3code.git",
+  "commit": "c13f7d93fff0f578886985a3f673b4b21b7f6ac8",
+  "license": "MIT",
+  "licenseSha256": "935d8f2af0c703f9c39517ee57cc4930b19d02d533be930b63f0e82f93614b43",
+  "node": "24.13.1",
+  "pnpm": "11.10.0"
+}

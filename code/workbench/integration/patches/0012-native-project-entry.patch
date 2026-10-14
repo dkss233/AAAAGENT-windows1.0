@@ -1,0 +1,45 @@
+--- a/apps/web/src/routes/_chat.index.tsx
++++ b/apps/web/src/routes/_chat.index.tsx
+@@ -40,6 +40,7 @@
+  * end. Falls back to an add-project hero when no project exists yet.
+  */
+ function IndexDraftLanding() {
++  const { aaaProject, aaaEnvironment } = Route.useSearch();
+   const projects = useProjects();
+   const threads = useThreadShells();
+   const bootstrapped = useAllEnvironmentShellsBootstrapped();
+@@ -50,9 +51,11 @@
+   const mostRecentProject = useMemo(
+     () =>
+       bootstrapped
+-        ? (sortScopedProjectsForSidebar(projects, threads, "updated_at")[0] ?? null)
++        ? (aaaProject && aaaEnvironment
++            ? projects.find(p => p.id === aaaProject && p.environmentId === aaaEnvironment) ?? null
++            : sortScopedProjectsForSidebar(projects, threads, "updated_at")[0] ?? null)
+         : null,
+-    [bootstrapped, projects, threads],
++    [bootstrapped, projects, threads, aaaProject, aaaEnvironment],
+   );
+ 
+   useEffect(() => {
+@@ -70,6 +73,9 @@
+ 
+   if (!bootstrapped) {
+     return null;
++  }
++  if (aaaProject && aaaEnvironment && mostRecentProject === null) {
++    return <p role="alert">所选项目已变化，请从原入口重新打开。</p>;
+   }
+   if (mostRecentProject !== null) {
+     return startState.failed ? (
+@@ -110,6 +116,10 @@
+ }
+ 
+ export const Route = createFileRoute("/_chat/")({
++  validateSearch: (search: Record<string, unknown>): { aaaProject?: string; aaaEnvironment?: string } =>
++    typeof search.aaaProject === "string" && search.aaaProject.length > 0 && search.aaaProject.length <= 250 &&
++    typeof search.aaaEnvironment === "string" && search.aaaEnvironment.length > 0 && search.aaaEnvironment.length <= 250
++      ? { aaaProject: search.aaaProject, aaaEnvironment: search.aaaEnvironment } : {},
+   component: ChatIndexRouteView,
+ });
+ 
