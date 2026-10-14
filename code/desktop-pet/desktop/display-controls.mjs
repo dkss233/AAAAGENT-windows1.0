@@ -46,6 +46,10 @@ export function installDisplayControls({ get, shell, setFraming }) {
     // the model grows in place instead of drifting with the origin.
     const characterScale = Number.isFinite(value.characterScale) && value.characterScale > 0 ? value.characterScale : 1;
     get('character').style.transform = characterScale === 1 ? 'translateX(-50%)' : 'translateX(-50%) scale(' + characterScale + ')';
+    // The status text lives inside #character, so the scale above would enlarge it too and push it
+    // past the window edge (measured: a 1.6x model made the indicator 164x66 and put its top at
+    // -64px). Publish the factor so those labels can cancel it out; see .scale-invariant in style.css.
+    document.documentElement.style.setProperty('--character-scale', String(characterScale));
     handle.style.right = `calc(50% - ${value.modelWidth / 2}px)`;
     get('drawer').style.maxHeight = `${value.drawerHeight}px`;
     get('drawer').style.height = `${value.drawerHeight}px`;
@@ -132,5 +136,25 @@ export function installDisplayControls({ get, shell, setFraming }) {
     shell({ type: 'resize_model', phase: 'commit', width: config.preferredWidth + step });
   };
   receive(config);
+  keepOutsideModelScale(get);
   return { receive, cancel, get mode() { return config.mode } };
+}
+
+/**
+ * The waiting chip is markup inside #character in index.html, but #character receives a CSS
+ * `scale()` for movement-mode zoom, and a transform scales every descendant: measured, a 1.6x model
+ * turned the chip from 102x41 into 164x66 and lifted its top edge from 24px to -64px, so it was cut
+ * off by the window. Moving it under #pet keeps it in a coordinate space the model scale never
+ * touches, which is why the size and the distance from the window edge are now constant instead of
+ * being divided back out with a counter-transform. #pet has no transform of its own.
+ *
+ * Runs once, and is skipped if the markup already places the chip there.
+ */
+function keepOutsideModelScale(get) {
+  const chip = get('thinking-indicator');
+  const pet = get('pet');
+  if (!chip || !pet || chip.parentElement === pet) return;
+  // #pet is position:relative, so the chip's absolute top/right resolve against the window-fitted
+  // pet box, exactly as the corner buttons beside it do.
+  pet.appendChild(chip);
 }

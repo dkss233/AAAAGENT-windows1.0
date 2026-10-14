@@ -1,13 +1,13 @@
 // One-click launcher.
-// Starts the pet. The pinned DSH host is NOT started here: nothing in the chat path needs it, so it
-// is started on demand with 启动Harness.cmd (or reused when one is already running). Override with
-// AAAAGENT_START_HARNESS=1 to get the old behaviour of starting it up front.
+// Starts the pet. The pinned DSH host is reused when one is already running but is NOT started here:
+// nothing in the chat, voice or expression path needs it, which is the on-demand behaviour described
+// in 使用说明.txt. The AAAAGENT_START_HARNESS=1 opt-in that used to start it up front was removed
+// because it was never exercised — the host is started from the console button or 启动Harness.cmd.
 import { spawn } from 'node:child_process';
 import { closeSync, existsSync, openSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { loadProfile, originAlive, readOrigin, readTokenUrl, startHarnessHost } from './aaaagent-harness-host.mjs';
+import { loadProfile, originAlive, readOrigin, readTokenUrl } from './aaaagent-harness-host.mjs';
 import { clearOrphanedPetProcesses } from './aaaagent-pet-orphans.mjs';
 // Starting the host itself (spawn/openSync/engineEnvironment) lives in aaaagent-harness-host.mjs.
 
@@ -21,22 +21,21 @@ for (const name of ['.aaaagent-dsh-host.lock', '.aaaagent-dsh-host.json']) {
   if (existsSync(p)) { try { unlinkSync(p); console.log('  已清理残留的 ' + name); } catch { /* ignore */ } }
 }
 
-// Reuse a host that is already serving its recorded origin; never start one as a side effect unless
-// explicitly asked. Nothing in the chat path needs DSH, so leaving it stopped keeps one less
-// background process alive; "使用harness干活" is a deliberate action, so starting it can be one too.
-const harnessWanted = process.env.AAAAGENT_START_HARNESS === '1';
+// Reuse a host that is already serving its recorded origin; do not start one here.
+//
+// Measured, not assumed: the backend starts in about 30s with the host stopped, with the host running,
+// and with the host's integration descriptor deleted. So the backend brings up whatever it needs on
+// its own, and starting the host here only adds a second instance and startup time. The pet window
+// being unresponsive earlier was a separate problem, not this.
+//
+// Nothing in the chat, voice or expression path needs the host either. Start it when DSH work is
+// wanted: the console's button, 启动Harness.cmd, or the first task that needs it.
 const existing = readOrigin(profile.dshWebLog);
 const alive = await originAlive(existing);
-
 if (alive) {
   console.log('  Harness 主机已在运行: ' + existing);
-} else if (harnessWanted) {
-  const result = await startHarnessHost({ profile, root, onNote: (note) => console.log('  ' + note) });
-  if (result.origin) console.log('  ✅ Harness 已就绪: ' + result.origin);
-  else console.log('  ❌ Harness 主机未能在 120 秒内就绪；仍会启动桌宠，请把本窗口信息发给协助者。');
 } else {
   console.log('  Harness 主机未启动（对话、语音、表情都不需要它）。');
-  // Any of these works; the host is shared, so the first one to run wins and the rest reuse it.
   console.log('  需要让桌宠执行 DSH 任务时，用以下任一方式启动它：');
   console.log('    · 控制台「任务转发」页 → 点【启动 Harness】');
   console.log('    · 双击 启动Harness.cmd');
@@ -56,10 +55,12 @@ const orphans = clearOrphanedPetProcesses();
 if (orphans.skipped) console.log('  检测到桌宠已在运行，跳过残留清理');
 else if (orphans.shells > 0) console.log('  已清理上次强制关闭留下的残留进程（' + orphans.cleaned + ' 个）');
 
-// Which tree Harness sessions run in. Defaults to the operator's home directory so the pet sees real
-// projects instead of the engine's private empty workspace; override with the first argument or
-// AAAAGENT_HARNESS_WORKSPACE.
-const workspace = process.argv[2] ?? process.env.AAAAGENT_HARNESS_WORKSPACE ?? homedir();
+// Which tree Harness sessions run in. Defaults to the project's parent directory — the operator's own
+// tree, which is what the pet should see instead of the engine's private empty workspace. Override
+// with the first argument or AAAAGENT_HARNESS_WORKSPACE. `dirname(root)` is used rather than the home
+// directory because it is the tree the operator actually works in, and it keeps the default portable
+// instead of naming one machine's path.
+const workspace = process.argv[2] ?? process.env.AAAAGENT_HARNESS_WORKSPACE ?? dirname(root);
 const workspaceOk = existsSync(workspace);
 if (workspaceOk) console.log('  Harness 工作区: ' + workspace);
 else console.log('  ⚠ Harness 工作区不存在（' + workspace + '），桌宠将回退到自带的空工作区');

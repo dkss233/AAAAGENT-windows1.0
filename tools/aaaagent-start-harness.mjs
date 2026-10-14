@@ -4,17 +4,17 @@
 // the host is started by an explicit action instead of on every pet launch. Safe to run repeatedly:
 // an already-running host is reused and reported.
 //
-// The DSH working directory defaults to the operator's home directory so pet-initiated sessions see
-// real projects. Override with the first argument or AAAAGENT_HARNESS_WORKSPACE.
+// The DSH working directory defaults to the project's parent directory — the tree the operator works
+// in — rather than naming one machine's path. Override with the first argument or
+// AAAAGENT_HARNESS_WORKSPACE.
 import { dirname, resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { loadProfile, originAlive, readOrigin, readTokenUrl, startHarnessHost } from './aaaagent-harness-host.mjs';
 
 // tools/ sits directly under the project root, so derive it instead of hard-coding an install path.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const profile = loadProfile(root);
-const workspace = process.argv[2] ?? process.env.AAAAGENT_HARNESS_WORKSPACE ?? homedir();
+const workspace = process.argv[2] ?? process.env.AAAAGENT_HARNESS_WORKSPACE ?? dirname(root);
 
 console.log('=== 启动 Harness 主机 ===');
 console.log('  工作区（DSH 会话运行目录）: ' + workspace);
