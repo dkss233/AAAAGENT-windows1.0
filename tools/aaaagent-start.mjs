@@ -4,21 +4,73 @@
 // in 使用说明.txt. The AAAAGENT_START_HARNESS=1 opt-in that used to start it up front was removed
 // because it was never exercised — the host is started from the console button or 启动Harness.cmd.
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, openSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadProfile, originAlive, readOrigin, readTokenUrl } from './aaaagent-harness-host.mjs';
 import { clearOrphanedPetProcesses } from './aaaagent-pet-orphans.mjs';
+// aaaagent-harness-host.mjs is imported dynamically, after the preflight below. Its import chain reaches
+// `desktop-pet/dist/harness/preset.js`, which does not exist until the project is built, so a static
+// import would abort with an ESM resolution error before the preflight could explain what is missing.
 // Starting the host itself (spawn/openSync/engineEnvironment) lives in aaaagent-harness-host.mjs.
 
 // tools/ sits directly under the project root, so derive it instead of hard-coding an install path.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const profile = loadProfile(root);
+const repo = join(root, 'code', 'desktop-pet');
 
-// A stale lock from an earlier attempt makes the project refuse a new host; clear only ours.
-for (const name of ['.aaaagent-dsh-host.lock', '.aaaagent-dsh-host.json']) {
-  const p = join(profile.home, name);
-  if (existsSync(p)) { try { unlinkSync(p); console.log('  已清理残留的 ' + name); } catch { /* ignore */ } }
+// Preflight, before anything is imported from the build output. A fresh download of the source tree has
+// no build output, and the failure that produces is an ESM resolution error from deep inside the code —
+// `Cannot find module .../dist/harness/preset.js` — which tells the reader nothing about what to do.
+// Check what the launch needs and say so plainly. The engine runtime is deliberately not checked: the
+// pet starts without it, only DSH tasks need it.
+const missing = [
+  ['未安装依赖 (node_modules)', join(repo, 'node_modules')],
+  ['未编译后端 (dist)', join(repo, 'dist', 'app', 'trial-launcher.js')],
+  ['未打包界面 (desktop/build)', join(repo, 'desktop', 'build', 'renderer.js')],
+].filter(([, path]) => !existsSync(path));
+
+if (missing.length > 0) {
+  const lines = [
+    '',
+    '  ============================================',
+    '   还不能直接运行 —— 这是源码，需要先编译',
+    '  ============================================',
+    '',
+    '  缺少：',
+    ...missing.map(([label]) => '      · ' + label),
+    '',
+    '  请在  命令提示符(cmd)  里依次执行这四条命令：',
+    '',
+    '      cd /d "' + repo + '"',
+    '      npm ci',
+    '      npm run build',
+    '      npm run build:desktop',
+    '',
+    '  前提：已安装 Node.js（自带 npm）。',
+    '  完成后重新双击  启动桌宠.cmd  即可。',
+    '',
+    '  详细说明：docs/SETUP.md 、 README-WINDOWS.md',
+    '',
+  ];
+  for (const line of lines) console.log(line);
+  process.exit(1);
+}
+
+// Safe to load now: the build output the chain needs is present.
+const { loadProfile, originAlive, readOrigin, readTokenUrl } = await import('./aaaagent-harness-host.mjs');
+
+// The engine profile is optional here. Everything that uses it concerns DSH, and the pet's own
+// features — chat, voice, expressions, cursor following, pointer lock — do not need DSH at all. The
+// engine runtime is a large separate download, so requiring it would stop a built tree from starting
+// the pet. 启动Harness.cmd and the console's button still require it and say so themselves.
+let profile;
+try { profile = loadProfile(root); }
+catch { profile = undefined; }
+if (profile) {
+  // A stale lock from an earlier attempt makes the project refuse a new host; clear only ours.
+  for (const name of ['.aaaagent-dsh-host.lock', '.aaaagent-dsh-host.json']) {
+    const p = join(profile.home, name);
+    if (existsSync(p)) { try { unlinkSync(p); console.log('  已清理残留的 ' + name); } catch { /* ignore */ } }
+  }
 }
 
 // Reuse a host that is already serving its recorded origin; do not start one here.
@@ -30,23 +82,27 @@ for (const name of ['.aaaagent-dsh-host.lock', '.aaaagent-dsh-host.json']) {
 //
 // Nothing in the chat, voice or expression path needs the host either. Start it when DSH work is
 // wanted: the console's button, 启动Harness.cmd, or the first task that needs it.
-const existing = readOrigin(profile.dshWebLog);
-const alive = await originAlive(existing);
-if (alive) {
-  console.log('  Harness 主机已在运行: ' + existing);
+if (!profile) {
+  console.log('  Harness 主机未启动，本机也没有引擎运行时（artifacts/runtime）。');
+  console.log('  对话、语音、表情、注视都不需要引擎，桌宠会照常启动。');
+  console.log('  需要让桌宠执行 DSH 任务时，请先按 README-WINDOWS.md 准备引擎运行时。');
 } else {
-  console.log('  Harness 主机未启动（对话、语音、表情都不需要它）。');
-  console.log('  需要让桌宠执行 DSH 任务时，用以下任一方式启动它：');
-  console.log('    · 控制台「任务转发」页 → 点【启动 Harness】');
-  console.log('    · 双击 启动Harness.cmd');
-  console.log('    · 直接下达任务 —— 确认执行时会自动启动');
+  const existing = readOrigin(profile.dshWebLog);
+  const alive = await originAlive(existing);
+  if (alive) {
+    console.log('  Harness 主机已在运行: ' + existing);
+  } else {
+    console.log('  Harness 主机未启动（对话、语音、表情都不需要它）。');
+    console.log('  需要让桌宠执行 DSH 任务时，用以下任一方式启动它：');
+    console.log('    · 控制台「任务转发」页 → 点【启动 Harness】');
+    console.log('    · 双击 启动Harness.cmd');
+    console.log('    · 直接下达任务 —— 确认执行时会自动启动');
+  }
+
+  // The token URL the browser needs, because the pet opens a token-free address on purpose.
+  const tokenUrl = readTokenUrl(profile.dshWebLog);
+  if (alive && tokenUrl) console.log('  Harness 界面地址（含 token，可粘贴到浏览器）: ' + tokenUrl);
 }
-
-// The token URL the browser needs, because the pet opens a token-free address on purpose.
-const tokenUrl = readTokenUrl(profile.dshWebLog);
-if (alive && tokenUrl) console.log('  Harness 界面地址（含 token，可粘贴到浏览器）: ' + tokenUrl);
-
-const repo = join(root, 'code\\desktop-pet');
 
 // A pet that was force-killed instead of exited leaves its backend and `cmd.exe /c npm start` wrapper
 // behind with no window. Those leftovers hold the state this launch needs, so the new pet silently
@@ -80,8 +136,13 @@ else console.log('  ⚠ Harness 工作区不存在（' + workspace + '），桌�
 // to exit so it can release the backend lock — and it shuts the whole pet down on SIGTERM. Ending it
 // here killed the pet right after it reported ready, so it must outlive this script. stdout/stderr go
 // to files rather than pipes, because a live pipe would keep this script alive after its work is done.
-const logFd = openSync(join(root, '.local', 'pet-launch.log'), 'w');
-const errFd = openSync(join(root, '.local', 'pet-launch.err.log'), 'w');
+// The pet writes its logs and session data under .local, which does not exist in a fresh download, so
+// create it before opening the log files. Without this the launcher dies with a bare ENOENT on the log
+// path even though everything else is ready.
+const localDir = join(root, '.local');
+try { mkdirSync(localDir, { recursive: true, mode: 0o700 }); } catch { /* the open below reports it */ }
+const logFd = openSync(join(localDir, 'pet-launch.log'), 'w');
+const errFd = openSync(join(localDir, 'pet-launch.err.log'), 'w');
 let pet;
 try {
   pet = spawn(process.execPath, [join(repo, 'dist', 'app', 'trial-launcher.js')], {

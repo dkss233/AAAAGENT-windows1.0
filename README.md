@@ -27,13 +27,18 @@ Windows 使用独立的 `windows/code/desktop-pet/` 源码、Electron 窗口和 
 
 ## 开始使用
 
+> **下载的源码不能直接双击 `.cmd` 运行。** 仓库不含 `dist/`、`node_modules/` 等构建产物，必须先安装依赖并编译；未编译时启动器会直接列出缺少的产物和要执行的命令。完整步骤见 [安装与配置](docs/SETUP.md)。
+
 准备 Windows x64、Node.js 22.12 或更高版本，以及有权使用的桌宠素材与所需 SDK。从仓库根目录运行：
 
 ```powershell
 cd windows/code/desktop-pet
 npm.cmd ci
-npm.cmd run dev
+npm.cmd run build
+npm.cmd run build:desktop
 ```
+
+首次配置用 `npm.cmd run configure-local`（打开设置网页），之后用 `npm.cmd start` 启动桌宠。引擎运行时（`artifacts/runtime`，约 1.3 GB）不随仓库提供，只有让桌宠执行 DSH 任务时才需要，对话、语音、表情与注视都不依赖它。
 
 也可使用 `windows/Start-Windows.cmd`。预览需要自行准备兼容资源，文字只做离线回显，不等于真实模型对话。实际服务配置与资源位置见 [Windows 安装指南](README-WINDOWS.md)。
 
