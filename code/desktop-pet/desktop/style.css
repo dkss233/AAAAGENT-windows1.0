@@ -232,6 +232,7 @@ body[data-pet-collapsed="true"] #video-pet-effect,body[data-pet-collapsed="true"
    clicked to unlock; the native side restores click delivery while the pointer is over it. */
 body[data-pointer-locked="true"] #model-resize,
 body[data-pointer-locked="true"] #model-move,
+body[data-pointer-locked="true"] #model-look,
 body[data-pointer-locked="true"] #pet-collapse,
 body[data-pointer-locked="true"] #open,
 body[data-pointer-locked="true"] #work-badge,
