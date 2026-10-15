@@ -38,6 +38,17 @@ npm.cmd run build
 npm.cmd run build:desktop
 ```
 
+**国内网络**：`npm ci` 需要从 GitHub 下载 `better-sqlite3`、`electron` 的预编译二进制，容易超时；超时后会退回本地编译，而那需要 Python 与 Visual Studio C++ 生成工具。用国内镜像可跳过这两项依赖 —— 双击仓库根目录的 **`安装-国内镜像.cmd`**，或手动设置：
+
+```powershell
+$env:npm_config_registry='https://registry.npmmirror.com'
+$env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'
+$env:better_sqlite3_binary_host_mirror='https://registry.npmmirror.com/-/binary/better-sqlite3'
+npm.cmd ci; npm.cmd run build; npm.cmd run build:desktop
+```
+
+镜像的预编译二进制覆盖 Node 22 / 24 / 25 / 26，其他版本仍会退回编译，因此请使用 Node 22 或 24 的 LTS 版。
+
 首次配置用 `npm.cmd run configure-local`（打开设置网页），之后用 `npm.cmd start` 启动桌宠。引擎运行时（`artifacts/runtime`，约 1.3 GB）不随仓库提供，只有让桌宠执行 DSH 任务时才需要，对话、语音、表情与注视都不依赖它。
 
 也可使用 `windows/Start-Windows.cmd`。预览需要自行准备兼容资源，文字只做离线回显，不等于真实模型对话。实际服务配置与资源位置见 [Windows 安装指南](README-WINDOWS.md)。

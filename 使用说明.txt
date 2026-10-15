@@ -25,6 +25,35 @@
   如果没编译就双击启动，启动器会直接告诉你缺什么、要执行哪几条命令，
   不会只抛一个看不懂的报错。
 
+  ------------------------------------------------------------------
+  如果 npm ci 报错（下载超时 / 编译失败）
+  ------------------------------------------------------------------
+
+  典型报错：
+    · prebuild-install warn install Request timed out
+    · gyp ERR! find Python  You need to install the latest version of Python
+    · npm error code EPERM
+
+  原因：npm 要从 GitHub 下载预编译二进制，国内容易超时；超时后会改为本地
+        编译，而本地编译需要 Python 和 Visual Studio C++ 生成工具。
+
+  最省事的办法 —— 双击  安装-国内镜像.cmd
+    它会用 npmmirror（阿里云公共镜像）下载，不需要 Python，也不需要
+    Visual Studio。约 2 分钟完成安装、编译并启动桌宠。
+
+  自己手动做也可以（在 cmd 里逐条执行）：
+    cd /d "解压出来的路径\code\desktop-pet"
+    set npm_config_registry=https://registry.npmmirror.com
+    set ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+    set better_sqlite3_binary_host_mirror=https://registry.npmmirror.com/-/binary/better-sqlite3
+    npm ci
+    npm run build
+    npm run build:desktop
+
+  注意：镜像提供的预编译二进制只覆盖 Node 22 / 24 / 25 / 26。
+        用其他版本（如 Node 20）仍会退回编译。所以请装 Node 22 或 24 的
+        LTS 版：https://nodejs.org/
+
   详细说明见  docs/SETUP.md  和  README-WINDOWS.md。
 
 
