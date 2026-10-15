@@ -29,6 +29,9 @@ export interface MemorySemanticAttempt {
   readonly reasoningEffort?: 'high';
   readonly dynamics?: boolean;
   readonly managementTarget?: import('../contracts/memory-lifecycle.js').SourceVersion;
+  /** Per-request ceiling. Callers pass the registered limit for the operation they serve; the
+   *  module default applies to evaluation calls that have no registered configuration. */
+  readonly inputLimit?: number;
 }
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
 
@@ -114,7 +117,9 @@ export async function runMemorySemanticAttempt(args: MemorySemanticAttempt): Pro
     const endpoint = new URL(config.endpoint);
     if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw new Error('Explicit HTTPS provider endpoint required');
     const format = buildMemorySemanticFormat(snapshot.input,args.dynamics,args.managementTarget);
-    if (format.inputUpperBound > MEMORY_SEMANTIC_INPUT_LIMIT) throw new Error('Semantic request exceeds input budget');
+    const inputLimit=args.inputLimit??MEMORY_SEMANTIC_INPUT_LIMIT;
+    if(!Number.isSafeInteger(inputLimit)||inputLimit<1)throw new Error('Invalid semantic input limit');
+    if (format.inputUpperBound > inputLimit) throw new Error(`Semantic request exceeds input budget (${format.inputUpperBound} > ${inputLimit})`);
     const body = buildSemanticRequestBody(format, args.reasoningEffort);
     const request = { ...body, model: config.model }, requestJson = JSON.stringify(request);
     stage = 'request_evidence';

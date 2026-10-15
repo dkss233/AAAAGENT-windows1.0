@@ -83,6 +83,15 @@ test('inactive, tampered and incomplete real trial configurations fail before re
   assert.throws(() => validateTrialConfiguration({ ...f.c, limitMicros: 10000000 }), /记账模式与共享账目配置/);
   assert.throws(() => validateTrialConfiguration({ ...f.c, memory: { mode: 'legacy' } }), /不能回退/);
   assert.throws(() => validateTrialConfiguration({ ...f.c, models: { ...f.c.models, memory_turn: { ...f.c.models.memory_turn, reservationMicros: 1000000 } } }), /最坏费用/);
+  // The strict memory model keeps its own registered ceiling: one management forget must review the
+  // whole source closure, so it is not held to the background-turn figure, but it must stay declared.
+  const memoryTurn = (patch: Partial<TrialModel>) => ({ ...f.c, models: { ...f.c.models, memory_turn: { ...f.c.models.memory_turn, ...patch } } });
+  assert.doesNotThrow(() => validateTrialConfiguration(memoryTurn({ inputTokenLimit: 131072 })), 'the registered strict-memory ceiling is allowed');
+  assert.throws(() => validateTrialConfiguration(memoryTurn({ inputTokenLimit: 262144 })), /严格记忆模型/);
+  const { contextWindowTokens: _omitted, ...memoryTurnWithoutWindow } = f.c.models.memory_turn;
+  assert.throws(() => validateTrialConfiguration({ ...f.c, models: { ...f.c.models, memory_turn: memoryTurnWithoutWindow as TrialModel } }), /严格记忆模型/);
+  assert.throws(() => validateTrialConfiguration(memoryTurn({ contextWindowTokens: 65536 })), /严格记忆模型/);
+  assert.throws(() => validateTrialConfiguration(memoryTurn({ model: 'deepseek-flash' })), /严格记忆模型/);
 });
 
 test('trial reservations preserve previous spending and serialize simultaneous calls against the shared ceiling', async t => {

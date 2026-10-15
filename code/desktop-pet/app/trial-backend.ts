@@ -154,7 +154,9 @@ export class StrictTrialMemoryProvider implements MemoryTurnProvider {
   constructor(private readonly store: SqliteMemoryStore, private readonly config: EndpointConfig,
     private readonly transport: ProviderTransport, private readonly runId: string,
     private readonly evidence: (event: SemanticAttemptEvent) => Promise<void>, private readonly thinking?: 'high',
-    private readonly provenanceKind: 'real_provider' | 'controlled_stub' = 'real_provider') {}
+    private readonly provenanceKind: 'real_provider' | 'controlled_stub' = 'real_provider',
+    /** The registered input ceiling. Undefined keeps the adapter default for controlled fixtures. */
+    private readonly inputLimit?: number) {}
   plan(input: MemoryTurnInput, signal: AbortSignal): Promise<MemoryTurnPlan> {
     return this.planWithMode(input,signal);
   }
@@ -184,7 +186,7 @@ export class StrictTrialMemoryProvider implements MemoryTurnProvider {
       }
       const result = await runMemorySemanticAttempt({ snapshot,
         config: this.config, transport: this.transport, provenance: { kind: this.provenanceKind, runId: this.runId, attemptId: randomUUID() },
-        signal, evidence: this.evidence, dynamics:true, ...(managementTarget?{managementTarget}:{}), ...(this.thinking ? { reasoningEffort: this.thinking } : {}) });
+        signal, evidence: this.evidence, dynamics:true, ...(this.inputLimit===undefined?{}:{inputLimit:this.inputLimit}), ...(managementTarget?{managementTarget}:{}), ...(this.thinking ? { reasoningEffort: this.thinking } : {}) });
       if (result.compiled.status === 'ready') return result.compiled.plan;
       if (result.compiled.status === 'needs_sources' && result.compiled.readProbe) return result.compiled.readProbe;
       throw new Error('Strict memory semantics are incomplete; no update was committed');
@@ -286,7 +288,8 @@ export async function startTrialBackend(environment: NodeJS.ProcessEnv = process
       await readPresentationCatalog(configuration.projectRoot), policy => process.stdout.write(JSON.stringify({ channel: 'presentation_policy', policy }) + '\n'));
     const {dialogue,foregroundBudget}=selectTrialDialogue(configuration,()=>endpoint('dialogue'),transport,
       ()=>presentation.allowedIntent(),settings.effective.context.targetInputTokens,settings.effective.providers.dialogue.temperature);
-    const strictProvider=new StrictTrialMemoryProvider(store, endpoint('memory_turn'), transport, configuration.phaseId, evidence, configuration.models.memory_turn.thinking);
+    const strictProvider=new StrictTrialMemoryProvider(store, endpoint('memory_turn'), transport, configuration.phaseId, evidence, configuration.models.memory_turn.thinking,
+      'real_provider', configuration.models.memory_turn.contextWindowTokens);
     const memory = new ObservedTrialMemory(store, {
       context: { inputTokenBudget: foregroundBudget.effectiveInputTokens,budgetInfo:foregroundBudget,currentEmotionReserveTokens:settings.effective.context.currentEmotionReserveTokens??DEFAULT_CURRENT_EMOTION_RESERVE_TOKENS, maxRecentMessages: settings.effective.context.maxRecentMessages, maxMemories: settings.effective.context.maxMemories,
         summaryLimit: settings.effective.context.summaryLimit, countTokens: dialogue.countContext.bind(dialogue), relevance: () => 1 },

@@ -5,6 +5,7 @@ import {mkdir} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
 import {fixture} from './helpers.js';
 import {scope,message,change,NOW} from '../memory/sqlite-fixture.js';
+import {fixture as sqliteFixture} from '../memory/sqlite-fixture.js';
 import {lifecycle} from '../memory/lifecycle-fixture.js';
 import {SqliteMemoryStore,CONFIRMED_RETENTION} from '../../memory/sqlite-store.js';
 import {confirmedInvitationPolicy} from '../../companion/invitations.js';
@@ -17,9 +18,9 @@ import {StrictTrialMemoryProvider} from '../../app/trial-backend.js';
 import {ProviderTransport} from '../../providers/transport.js';
 import {buildMemorySemanticFormat} from '../../app/memory-semantic-format.js';
 const action={characterId:'companion' as const,id:'tea',expectedVersion:1,operationId:'web-forget',reason:'请遗忘红茶'};
-async function setup(t:any){
+async function setup(t:any, sharedText='我喜欢红茶；我养的猫叫团子'){
  const f=await fixture(t),store=new SqliteMemoryStore({filename:f.c.database,retention:CONFIRMED_RETENTION,invitations:confirmedInvitationPolicy('Asia/Shanghai'),clock:()=>NOW});t.after(()=>store.close());
- store.append(scope(),[message('raw','我喜欢红茶；我养的猫叫团子')]);
+ store.append(scope(),[message('raw',sharedText)]);
  store.apply(change({type:'add',id:'tea',text:'喜欢红茶',sourceIds:['raw']},'tea'));
  store.apply(change({type:'add',id:'cat',text:'猫叫团子',sourceIds:['raw']},'cat'));
  let calls=0,mode='valid';
@@ -43,7 +44,7 @@ async function setup(t:any){
  const server=await startManagementServer({uiRoot:resolve('management/ui'),settings,memory,snapshot:()=>({apiVersion:1,runtime:runtime.identity(),modules:runtime.modules(),events:[],settings:settings.snapshot(),adapters:[],credentials:[],characters:memory.characters()})});t.after(()=>server.close());
  const headers={Authorization:'Bearer '+server.token,Origin:server.origin,'Content-Type':'application/json'};
  const send=(a=action)=>fetch(server.origin+'/api/memory/forget',{method:'POST',headers,body:JSON.stringify(a)});
- return {store,forget,server,send,calls:()=>calls,mode:(m:string)=>{mode=m;}};
+ return {store,forget,server,send,provider,calls:()=>calls,mode:(m:string)=>{mode=m;}};
 }
 test('real HTTP, strict semantic adapter and SQLite share one atomic mixed-source forget and model-free retry',async t=>{
  const f=await setup(t),before=f.store.revision(scope());
@@ -55,11 +56,45 @@ test('real HTTP, strict semantic adapter and SQLite share one atomic mixed-sourc
  assert.equal((await f.send({...action,reason:'changed'})).status,409);
 });
 test('failed plan, racing source update and shutdown do not report successful forgetting',async t=>{
- const f=await setup(t),before=f.store.revision(scope());f.mode('failure');assert.equal((await f.send()).status,503);assert.equal(f.store.revision(scope()),before);assert.equal(f.store.inspect(scope(),'tea')!.state,'active');
+ const f=await setup(t),before=f.store.revision(scope());f.mode('failure');
+ const failed=await f.send();assert.equal(failed.status,503);
+ // The operator must see why it failed. A fixed "not finished, retry later" text hid a permanent
+ // input-budget rejection and invited pointless retries.
+ const body=await failed.json();
+ assert.match(String(body?.error?.message),/诊断/);assert.match(String(body?.error?.message),/controlled model failure/);
+ assert.equal(f.store.revision(scope()),before);assert.equal(f.store.inspect(scope(),'tea')!.state,'active');
  f.mode('bad-dynamics');assert.equal((await f.send()).status,503);assert.equal(f.store.revision(scope()),before);assert.equal(f.store.inspect(scope(),'tea')!.state,'active');
  f.mode('stale');assert.equal((await f.send()).status,409);assert.equal(f.store.inspect(scope(),'tea')!.state,'active');
  f.mode('valid');const p=f.send();await new Promise(r=>setTimeout(r,10));f.forget.close();assert.equal((await p).status,503);assert.equal(f.store.inspect(scope(),'tea')!.state,'active');
 });
+test('the registered ceiling lets one forget review a closure the old background-turn figure refused',async t=>{
+ // The strict path must review the whole source closure, and that closure grows with the material a
+ // memory cites. At the old 32768 background figure this request was refused at preparation time,
+ // which is what made early memories permanently un-forgettable from the page.
+ const f=sqliteFixture(CONFIRMED_RETENTION.transcriptMaxBytes,'memory-dynamics-01');
+ t.after(()=>f.cleanup());
+ const store=f.open();t.after(()=>store.close());
+ const shared='共享来源正文。'.repeat(2600);
+ store.append(scope(),[message('raw',shared)]);
+ store.apply(change({type:'add',id:'tea',text:'喜欢红茶',sourceIds:['raw']},'tea'));
+ let reached=0;
+ const make=(inputTokenBudget:number)=>{
+  const provider=new StrictTrialMemoryProvider(store,{endpoint:'https://controlled.invalid',model:'controlled',apiKey:()=>'synthetic',authorizer:{async authorize(){return {async settle(){}};}}},
+   new ProviderTransport(async()=>{reached++;throw Error('reached the semantic transport');}),'controlled-measure',async()=>{},undefined,'controlled_stub');
+  return new StrictManagementForget(store,store.lifecycle,{inputTokenBudget,countTokens:i=>buildMemorySemanticFormat(i,true).inputUpperBound},
+   (i,s,a)=>provider.planManagement(i,s,{id:a.id,version:a.expectedVersion}));
+ };
+ const narrow=make(32768),wide=make(131072);
+ t.after(async()=>{narrow.close();wide.close();await narrow.drain();await wide.drain();});
+ // The closure is larger than the old figure, so preparation refuses before any model request.
+ await assert.rejects(()=>narrow.forget({...action,operationId:'narrow-probe'}),/超出单次严格来源处理的输入上限/);
+ assert.equal(reached,0,'a refused closure must not reach the provider');
+ // The same closure passes at the registered ceiling and then reaches the transport.
+ await assert.rejects(()=>wide.forget({...action,operationId:'wide-probe'}),/reached the semantic transport/);
+ assert.equal(reached,1);
+ assert.equal(store.inspect(scope(),'tea')!.state,'active');
+});
+
 test('actual memory page reads SQLite, previews now without mutation, then performs strict shared-source forgetting',{skip:!process.env.PLAYWRIGHT_MODULE},async t=>{
  const f=await setup(t);const {chromium}=await import(pathToFileURL(process.env.PLAYWRIGHT_MODULE!).href);const browser=await chromium.launch({headless:true});t.after(()=>browser.close());
  const page=await browser.newPage({viewport:{width:1280,height:960}});page.setDefaultTimeout(6000);const errors:string[]=[];page.on('pageerror',(e:Error)=>errors.push(e.message));

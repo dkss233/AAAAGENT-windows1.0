@@ -14,7 +14,7 @@ export async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const chat: TrialModel = { provider: 'dashscope', model: 'qwen-plus-2025-12-01', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
     credentialFile: '/nonexistent-external-trial-key', reservationMicros: 100000, inputTokenLimit: 32768, outputTokenLimit: 32768, inputMicrosPerToken: .8, outputMicrosPerToken: 2 };
   const memory: TrialModel = { ...chat, provider: 'deepseek', credentialFile: '/nonexistent-external-deepseek-key', model: 'deepseek-v4-pro', endpoint: 'https://api.deepseek.com/chat/completions',
-    reservationMicros: 11000000, inputMicrosPerToken: 9, outputMicrosPerToken: 27, outputTokenLimit: 393216, thinking: 'high' };
+    reservationMicros: 11000000, inputMicrosPerToken: 9, outputMicrosPerToken: 27, outputTokenLimit: 393216, contextWindowTokens: 1048576, thinking: 'high' };
   const c: TrialConfiguration = { version: 1, product: 'companion-v1', phaseId: 'local-trial-controlled', purpose: 'user-trial', projectRoot, sourceRevision: 'a'.repeat(40),
     runtimeFiles: Object.fromEntries(['dist/app/trial-backend.js', 'dist/app/trial-launcher.js', 'desktop/build/renderer.js',
       'desktop/build/星月陪伴.app/Contents/MacOS/DesktopPet'].map(p => [`code/desktop-pet/${p}`, hash('controlled')])),

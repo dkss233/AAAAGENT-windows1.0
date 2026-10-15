@@ -5,8 +5,12 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import { isQwenAudioTtsModel } from '../providers/qwen-audio-tts.js';
 import { validateLocalSpeech, type LocalSpeechConfiguration } from '../providers/local-speech.js';
 import { validateLocalDialogue, type LocalDialogueConfiguration } from '../providers/local-dialogue.js';
+import { MEMORY_SEMANTIC_INPUT_LIMIT } from './memory-semantic-format.js';
 
 export const TRIAL_CONFIG_VERSION = 1;
+/** The registered ceiling for the strict memory model. Shared with the adapter so the startup gate
+ *  and the request-time check can never disagree. */
+export const MEMORY_TURN_INPUT_CEILING = MEMORY_SEMANTIC_INPUT_LIMIT;
 const workbenchRuntimePaths = new Set([
   'code/workbench/integration/t3-local-service.mjs',
   'code/workbench/integration/t3-http-client.mjs',
@@ -220,6 +224,10 @@ export function validateTrialConfiguration(value: unknown): TrialConfiguration {
       && (m.model !== 'deepseek-flash' || m.inputMicrosPerToken !== 2 || m.outputMicrosPerToken !== 8
         || m.inputTokenLimit > (operation === 'dialogue' ? 1048576 : 32768) || m.outputTokenLimit > 393216
         || m.contextWindowTokens !== undefined && m.contextWindowTokens !== 1048576)) fail('DeepSeek文本需要当前登记的Flash型号和保守计费边界。');
+    // The strict memory model is registered separately: one management forget must review the entire
+    // source closure, so its ceiling is not the background-turn figure. It still has to be declared.
+    if (operation === 'memory_turn' && (m.model !== 'deepseek-v4-pro' || m.contextWindowTokens !== 1048576
+      || m.inputTokenLimit > MEMORY_TURN_INPUT_CEILING)) fail('严格记忆模型需要已登记的型号、上下文容量与保守输入上限。');
     if (![m.inputMicrosPerToken, m.outputMicrosPerToken].every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0)) fail('模型计费口径未配置。');
     // DashScope publishes this model without a date suffix; the dated name is rejected with
     // model_not_found, which broke every voice turn at the transcription step. Kept in step with

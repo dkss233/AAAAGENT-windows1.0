@@ -96,7 +96,11 @@ export function validateManagedSettings(value: unknown, base: TrialConfiguration
 export function effectiveTrialConfiguration(base: TrialConfiguration, settings: ManagedSettings, credentials = credentialRegistry(base), draftOnly = false): TrialConfiguration {
   const models = Object.fromEntries(PROVIDER_SLOTS.filter(slot=>settings.providers[slot]).map(slot => {
     const { adapterId: _adapter, credentialRef, voice: _voice, language: _language, temperature: _temperature, ...model } = settings.providers[slot]!;
-    return [slot, { ...model, credentialFile: credentials.file(credentialRef, model.provider),...(slot==='dialogue'?{targetInputTokens:settings.context.targetInputTokens??DEFAULT_FOREGROUND_INPUT_TOKENS,reservationMicros:dialogueReservation(model,settings.context.targetInputTokens??DEFAULT_FOREGROUND_INPUT_TOKENS)}:{}) }];
+    // Registered model capacity is provider metadata, not an operator setting: the settings draft never
+    // carries it, so it has to travel with the model it belongs to. The strict memory registration
+    // requires it, and a settings page cannot measure it by itself.
+    const capacity = base.models[slot]?.contextWindowTokens;
+    return [slot, { ...model, ...(capacity === undefined ? {} : { contextWindowTokens: capacity }), credentialFile: credentials.file(credentialRef, model.provider),...(slot==='dialogue'?{targetInputTokens:settings.context.targetInputTokens??DEFAULT_FOREGROUND_INPUT_TOKENS,reservationMicros:dialogueReservation(model,settings.context.targetInputTokens??DEFAULT_FOREGROUND_INPUT_TOKENS)}:{}) }];
   })) as TrialConfiguration['models'];
   const candidate = { ...base, models, memory: { ...base.memory, timeoutMs: settings.context.timeoutMs } };
   return draftOnly ? candidate : validateTrialConfiguration(candidate);
