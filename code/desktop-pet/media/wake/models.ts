@@ -21,8 +21,8 @@ export const WAKE_MODEL_FILES = {
     "sha256": "2d3f32311f9b692b964da3c90e830258d3e78e013cb0c992dbfb15cd5a1a71b0"
   },
   "silero_vad.onnx": {
-    "bytes": 212860,
-    "sha256": "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20"
+    "bytes": 643854,
+    "sha256": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
   }
 } as const;
 export async function verifyWakeModels(directory: string): Promise<void> {

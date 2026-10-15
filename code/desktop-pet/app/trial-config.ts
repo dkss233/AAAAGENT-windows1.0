@@ -221,7 +221,10 @@ export function validateTrialConfiguration(value: unknown): TrialConfiguration {
         || m.inputTokenLimit > (operation === 'dialogue' ? 1048576 : 32768) || m.outputTokenLimit > 393216
         || m.contextWindowTokens !== undefined && m.contextWindowTokens !== 1048576)) fail('DeepSeek文本需要当前登记的Flash型号和保守计费边界。');
     if (![m.inputMicrosPerToken, m.outputMicrosPerToken].every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0)) fail('模型计费口径未配置。');
-    if (operation === 'asr' && (m.model !== 'qwen3-asr-flash-2026-02-10' || m.audioMicrosPerSecond !== 220 || m.inputMicrosPerToken !== 0 || m.outputMicrosPerToken !== 0)) fail('语音转写型号与音频时长费率未登记。');
+    // DashScope publishes this model without a date suffix; the dated name is rejected with
+    // model_not_found, which broke every voice turn at the transcription step. Kept in step with
+    // QWEN_ASR_MODEL in providers/qwen-asr.ts.
+    if (operation === 'asr' && (m.model !== 'qwen3-asr-flash' || m.audioMicrosPerSecond !== 220 || m.inputMicrosPerToken !== 0 || m.outputMicrosPerToken !== 0)) fail('语音转写型号与音频时长费率未登记。');
     if (operation !== 'tts' && operation !== 'asr') {
       if (!positive(m.inputTokenLimit) || !positive(m.outputTokenLimit)) fail('模型输入输出硬上限未登记。');
       const maximum = operation==='dialogue' ? dialogueReservation(m) : Math.ceil(m.inputTokenLimit * m.inputMicrosPerToken + m.outputTokenLimit * m.outputMicrosPerToken);

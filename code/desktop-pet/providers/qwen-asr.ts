@@ -4,7 +4,12 @@ import { inspectPcmWav } from '../media/wav.js';
 import { isOmniEmotion, type OmniEmotion } from './omni-seven-emotion.js';
 import { object, ProviderTransport, type EndpointConfig, type JsonRecord } from './transport.js';
 
-export const QWEN_ASR_MODEL = 'qwen3-asr-flash-2026-02-10';
+// DashScope publishes this model without a date suffix. The previous value carried '-2026-02-10',
+// which the API rejects with model_not_found, so every voice turn failed at transcription: the audio
+// was recorded, no transcript came back, and the turn ended with "这一轮没有完成，请稍后再试".
+// Verified against the live endpoint with a correct key: 'qwen3-asr-flash' returns 200, the dated
+// name returns the same 404 as an invented name, and a bad key returns 401.
+export const QWEN_ASR_MODEL = 'qwen3-asr-flash';
 const mapped: Record<OmniEmotion, PerceivedEmotion> = {
   neutral: 'neutral', happy: 'happy', sad: 'sad', angry: 'angry', fearful: 'fear', disgusted: 'disgust', surprised: 'surprise',
 };
