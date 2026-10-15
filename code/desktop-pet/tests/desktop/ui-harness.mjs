@@ -31,17 +31,41 @@ const built=await build({entryPoints:['desktop/main.mjs'],bundle:true,write:fals
 }]});
 export async function app({explicitRouting=false}={}){
  const nodes=new Map(),created=[],listeners=new Map();
- const element=()=>{let ownText='';const e={id:'',hidden:false,disabled:false,textContent:'',value:'',children:[],dataset:{},style:{},className:'',getClientRects(){return this.hidden?[]:[this.getBoundingClientRect()]},getBoundingClientRect(){return {left:0,top:0,right:300,bottom:100,width:300,height:100}},
+ const element=()=>{let ownText='',ownClass='',ownStyle={};const e={id:'',hidden:false,disabled:false,textContent:'',value:'',children:[],dataset:{},
+   // A real CSSStyleDeclaration carries assignments and setProperty alike; the renderer publishes the
+   // model scale with setProperty on documentElement, and sets plain properties elsewhere.
+   style:{getPropertyValue(name){return ownStyle[name]??''},setProperty(name,value){ownStyle[name]=String(value)},removeProperty(name){delete ownStyle[name]},get cssText(){return Object.entries(ownStyle).map(([k,v])=>k+':'+v).join(';')}},
+   get className(){return ownClass},set className(value){ownClass=String(value)},
+   // The renderer queries inside nodes: display-controls looks for the drawer header, and work-records
+   // collects focusable buttons. Only appended children are searched; an unmatched query returns null
+   // or an empty list, which every caller already guards for.
+   querySelector(selector){return queryWithin(this,selector)[0]??null},
+   querySelectorAll(selector){return queryWithin(this,selector)},
+   closest(selector){return matchesSelector(this,selector)?this:null},
+   getClientRects(){return this.hidden?[]:[this.getBoundingClientRect()]},getBoundingClientRect(){return {left:0,top:0,right:300,bottom:100,width:300,height:100}},
    after(n){created.push(n);if(n.id)nodes.set(n.id,n)},append(...items){this.children.push(...items)},appendChild(n){this.append(n);return n},contains(n){return this===n||this.children.some(c=>typeof c==='object'&&c.contains?.(n))},replaceChildren(...items){if(this.id==='reply')harness.replyRenders=(harness.replyRenders??0)+1;this.textContent='';this.children=items},
    setPointerCapture(id){this.captured=id},hasPointerCapture(id){return this.captured===id},releasePointerCapture(){this.captured=null},setAttribute(name,value){this[name]=value;if(this.id==='capture-wave-path'&&name==='d')harness.waveWrites=(harness.waveWrites??0)+1},addEventListener(name,fn){(this.listeners??=new Map()).set(name,fn)},focus(){context.document.activeElement=this},blur(){if(context.document.activeElement===this)context.document.activeElement=null},show(){this.open=true},showModal(){this.open=true},close(){this.open=false}};Object.defineProperty(e,'textContent',{get(){return ownText+this.children.map(x=>typeof x==='string'?x:x.textContent).join(' ')},set(value){ownText=String(value);this.children=[]}});return e};
  const find=(e,id)=>e.id===id?e:e.children?.map(c=>typeof c==='object'?find(c,id):null).find(Boolean);
+ // Selector support for the queries the renderer makes. Each comma-separated part is reduced to the
+ // tag, #id and .class it names; pseudo-classes such as :not([disabled]) are dropped, so
+ // 'button:not([disabled])' matches any button. This is enough for the harness, which supplies no
+ // attributes or pseudo-state of its own.
+ const selectorParts=selector=>String(selector).split(',').map(part=>{
+  const cleaned=part.trim().replace(/::?[\w-]+(\([^)]*\))?/g,'');
+  return {tag:(cleaned.match(/^[a-zA-Z][\w-]*/)??[])[0]?.toUpperCase(),id:(cleaned.match(/#([\w-]+)/)??[])[1],classes:[...cleaned.matchAll(/\.([\w-]+)/g)].map(m=>m[1])};
+ });
+ const matchesSelector=(e,selector)=>typeof e==='object'&&!!e&&selectorParts(selector).some(part=>
+  (!part.tag||e.tagName?.toUpperCase()===part.tag)&&(!part.id||e.id===part.id)&&part.classes.every(name=>String(e.className??'').split(/\s+/).includes(name)));
+ const queryWithin=(root,selector)=>{const out=[];(function walk(node){for(const child of node.children??[]){if(typeof child!=='object'||!child)continue;if(matchesSelector(child,selector))out.push(child);walk(child)}})(root);return out};
  const node=id=>{const actual=[...nodes.values(),...created].map(e=>find(e,id)).find(Boolean);if(actual)return actual;if(!nodes.has(id)){const e=element();e.id=id;nodes.set(id,e)}return nodes.get(id)};
  const emit=(el,type,value={})=>{const e={preventDefault(){},...value};el['on'+type]?.(e);el.listeners?.get(type)?.(e)};
  const read=e=>e.textContent+' '+e.children.map(x=>typeof x==='string'?x:read(x)).join(' ');
  const renderedText=()=>[...nodes.values(),...created].map(read).join(' ');
  const frames=[],messages=[],timers=new Map(),harness={resets:0,playStops:0,playOpens:0,captureOpens:0,order:[]};let timer=0;
  const context={harness,console,structuredClone,AbortController,URL,Uint8Array,Float32Array,DataView,Date,performance,crypto:globalThis.crypto,atob,btoa,isSecureContext:true,navigator:{userAgent:'controlled DOM'},location:{origin:'pet://app'},
-  document:{hidden:false,body:node('body'),getElementById:node,createElement:()=>element(),addEventListener(name,fn){listeners.set(name,fn)}},
+  // documentElement is present because the renderer publishes the model scale as a CSS custom property
+  // on it (display-controls sets --character-scale) so labels nested in the scaled model can cancel it.
+  document:{hidden:false,body:node('body'),documentElement:element(),getElementById:node,createElement:()=>element(),addEventListener(name,fn){listeners.set(name,fn)}},
   window:{webkit:{messageHandlers:Object.fromEntries(['desktop','shell','diagnostic'].map(name=>[name,{postMessage(value){if(name==='desktop'&&value.message?.command?.type==='start_voice')harness.startReplyRenders=harness.replyRenders??0;if(name==='desktop'&&value.message?.command)harness.order.push('command:'+value.message.command.type);if(name==='desktop'&&value.message.command?.type==='start_voice')harness.feedbackAtSend={hidden:node('capture-feedback').hidden,phase:node('capture-feedback').dataset.phase};messages.push({name,value})}}]))},addEventListener(name,fn){listeners.set('window:'+name,fn)}},
   requestAnimationFrame(fn){frames.push(fn)},setInterval(){},setTimeout(fn){timers.set(++timer,fn);return timer},clearTimeout(id){timers.delete(id)}};
  await vm.runInNewContext('(async()=>{'+built.outputFiles[0].text+'})()',context);
