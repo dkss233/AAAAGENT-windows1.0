@@ -1,6 +1,14 @@
 /** Local wake transport/clip ownership. Never persists or logs PCM. Device driver is injected. */
+// Backlog allowed before the session is closed. Measured on a live install: the detector round trip
+// averages 9 ms against a 32 ms per-frame budget, but the slowest frame reached 452 ms, because the
+// renderer's main thread also draws the model and a long task there blocks it. The audio worklet may
+// hand over up to 16 blocks at once, and one 452 ms task alone accounts for 14 frames, so the previous
+// 16000-sample ceiling (31 frames) left barely twice the worst single stall as margin and the session
+// ended after about five seconds. 64000 samples keeps the fail-closed contract — a backlog that keeps
+// growing still stops the session — while giving transient stalls four seconds of room.
+const WAKE_BACKLOG_LIMIT = 64000;
 export class WakeController {
- constructor({createCapture,send,onState=()=>{},onLevel=()=>{},onWake,onFinish,onCancel=()=>{}}){Object.assign(this,{createCapture,send,onState,onLevel,onWake,onFinish,onCancel});this.generation=-1;this.sequence=0;this.run=0;this.enabled=false;this.phase='off';this.manual=false;this.playing=false;this.queue=[];this.queued=0;}
+ constructor({createCapture,send,onState=()=>{},onLevel=()=>{},onWake,onFinish,onCancel=()=>{}}){Object.assign(this,{createCapture,send,onState,onLevel,onWake,onFinish,onCancel});this.generation=-1;this.sequence=0;this.run=0;this.enabled=false;this.phase='off';this.manual=false;this.playing=false;this.queue=[];this.queued=0;this.acked=0;this.totalMs=0;this.slowestMs=0;}
  state(phase,detail){const changed=this.phase!==phase;this.phase=phase;const value={generation:this.generation,enabled:this.enabled,phase,...(this.echoCancellation===undefined?{}:{echoCancellation:this.echoCancellation}),...(detail?{detail}:{})};this.onState(value);if(changed||detail||this.sentGeneration!==this.generation){this.sentGeneration=this.generation;this.send({channel:'wake_status',generation:this.generation,phase,...(this.echoCancellation===undefined?{}:{echoCancellation:this.echoCancellation}),...(detail?{detail}:{})});}}
  control(message){
   if(!Number.isSafeInteger(message.generation)||message.generation<=this.generation||typeof message.enabled!=='boolean')return;
@@ -12,32 +20,42 @@ export class WakeController {
  async open(){
   if(!this.enabled||this.manual||this.driver||this.opening)return;
   const run=++this.run,controller=new AbortController();this.abort=controller;this.opening=true;this.state('connecting');
-  try{const driver=await this.createCapture({onPCM:samples=>this.pcm(run,samples),onLevel:level=>{if(this.current(run))this.onLevel(level);},onError:()=>{if(this.current(run))this.fail();}});
+  try{const driver=await this.createCapture({onPCM:samples=>this.pcm(run,samples),onLevel:level=>{if(this.current(run))this.onLevel(level);},onError:error=>{if(this.current(run))this.fail(error?.message);}});
    if(!this.current(run)){driver.close();return;}this.driver=driver;
    const result=await driver.open(controller.signal);if(!this.current(run)){driver.close();return;}
    if(result?.echoCancellation!==true)throw Error('Echo cancellation not active');this.echoCancellation=true;
    // The driver resolves only after actual PCM. Do not infer readiness from a request acknowledgement.
    this.opening=false;this.state(this.clip?'listening':'waiting');this.flush();
-  }catch(e){if(this.current(run))this.fail();}finally{if(run===this.run)this.opening=false;}
+   // Carry the driver's own message through. Discarding it left the operator with "本地唤醒或回声消除不可用"
+   // and no way to tell a missing device from a failed worklet or an unsupported sample rate.
+  }catch(e){if(this.current(run))this.fail(e?.message);}finally{if(run===this.run)this.opening=false;}
  }
  current(run){return run===this.run&&this.enabled&&!this.manual;}
  pcm(run,samples){
   if(!this.current(run)){samples?.fill?.(0);return;}
   if(!(samples instanceof Float32Array)||samples.length===0||samples.length>3200||samples.some(v=>!Number.isFinite(v))){samples?.fill?.(0);this.fail();return;}
-  if(this.queued+samples.length>16000){samples.fill(0);this.fail('本地唤醒处理跟不上输入，监听已停止。请重新开启。');return;}
+  if(this.queued+samples.length>WAKE_BACKLOG_LIMIT){
+   // Carry the measured pacing in the failure itself, because the manager forwards the detail of an
+   // error phase. The detector alone needs ~0.1 ms per 32 ms frame, so a backlog means the round trip
+   // through the backend is far slower in the live app; this says by how much.
+   const pace=this.acked?Math.round(this.totalMs/this.acked)+' ms average, '+Math.round(this.slowestMs)+' ms slowest over '+this.acked+' frames':'no completed round trip yet';
+   samples.fill(0);this.fail('检测处理跟不上输入（'+this.queued+' 样本积压，每帧往返 '+pace+'）。请重新开启。');return;
+  }
   this.queue.push(samples);this.queued+=samples.length;this.flush();
  }
  flush(){
   if(!this.enabled||this.manual||this.opening||this.inflight||!this.queue.length)return;
   const samples=this.queue.shift();this.queued-=samples.length;const bytes=new Uint8Array(samples.length*2),data=new DataView(bytes.buffer);
   for(let i=0;i<samples.length;i++)data.setInt16(i*2,Math.max(-32768,Math.min(32767,Math.round(samples[i]*32768))),true);
-  const sequence=++this.sequence;this.inflight={sequence,samples:samples.length,run:this.run};samples.fill(0);
+  const sequence=++this.sequence;this.inflight={sequence,samples:samples.length,run:this.run,sentAt:Date.now()};samples.fill(0);
   let text='';for(const byte of bytes)text+=String.fromCharCode(byte);bytes.fill(0);
   this.send({channel:'wake_pcm',generation:this.generation,sequence,pcm16Base64:btoa(text)});
  }
  result(message){
   const frame=this.inflight;if(!this.enabled||this.manual||message.generation!==this.generation||!frame||frame.sequence!==message.sequence||frame.run!==this.run)return;
   this.inflight=null;
+  // Record the round trip so the operator's report carries measured pacing rather than a guess.
+  if(typeof frame.sentAt==='number'){const ms=Date.now()-frame.sentAt;this.acked++;this.totalMs+=ms;if(ms>this.slowestMs)this.slowestMs=ms;}
   if(message.samples!==frame.samples||typeof message.speech!=='boolean'){this.fail();return;}
   if(!this.clip&&['waiting','replying'].includes(this.phase)&&message.keyword===this.settings.keyword){
    try{const session=this.driver.beginCapture();this.clip={session,run:this.run,ready:false,silence:0,finished:false};this.state('listening');this.onWake({generation:message.generation,sequence:message.sequence});}catch{this.fail();return;}
@@ -58,7 +76,7 @@ export class WakeController {
  observe({busy,playing}){this.playing=playing;if(this.manual&&!busy&&!playing){this.manual=false;if(this.enabled)void this.open();}else if(this.enabled&&!this.manual&&!this.clip&&this.phase==='replying'&&!busy&&!playing)this.state('waiting');}
  pause(){this.manual=true;this.clear(false);if(this.enabled)this.state('paused');}
  clear(cancel){const hadClip=!!this.clip;++this.run;this.abort?.abort();this.abort=null;this.driver?.close();this.driver=null;this.opening=false;this.clip?.session.stop();this.clip=null;this.queue.forEach(s=>s.fill(0));this.queue=[];this.queued=0;this.inflight=null;if(cancel&&hadClip)this.onCancel();}
- fail(detail='本地唤醒已停止，请检查麦克风和本地模块后重新开启。'){this.enabled=false;this.clear(true);this.state('error',detail);}
+ fail(detail){const reason=typeof detail==='string'&&detail.trim()?detail.trim():'';this.enabled=false;this.clear(true);this.state('error',reason?'唤醒未能开启：'+reason+'（按键录音仍可使用）':'本地唤醒已停止，请检查麦克风和本地模块后重新开启。');}
  error(message){if(message.generation===this.generation)this.fail();}
  disconnect(){this.enabled=false;this.manual=false;this.clear(true);this.generation=-1;this.echoCancellation=undefined;this.phase='off';this.onState({generation:-1,enabled:false,phase:'off'});}
 }

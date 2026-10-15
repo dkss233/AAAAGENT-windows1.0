@@ -113,7 +113,10 @@ export class WakeManager implements WakeManagement {
     if(v.channel==='wake_status'){
       const phase=v.phase as WakePhase;
       if(!['connecting','waiting','listening','submitting','replying','paused','error','off'].includes(phase))return true;
-      if(phase==='error'||phase==='off'){void this.fail(phase==='error'?'本地唤醒或回声消除不可用，监听已关闭，按键录音仍可使用。':'监听已结束，请手动重新开启。');return true;}
+      // Prefer the controller's own reason. Replacing it with a fixed sentence meant every distinct
+      // failure — no device, failed worklet, unsupported sample rate, no PCM — reached the operator as
+      // the same "本地唤醒或回声消除不可用", which cannot be acted on or reported.
+      if(phase==='error'||phase==='off'){const own=typeof v.detail==='string'&&v.detail.trim()?v.detail.trim():'';void this.fail(own||(phase==='error'?'本地唤醒或回声消除不可用，监听已关闭，按键录音仍可使用。':'监听已结束，请手动重新开启。'));return true;}
       if(v.echoCancellation!==undefined)this.echoCancellation=v.echoCancellation===true;
       if(['waiting','listening'].includes(phase)&&this.echoCancellation!==true){void this.fail('当前麦克风未提供回声消除，语音唤醒未开启；按键录音仍可使用。');return true;}
       if(phase!==this.phase){
