@@ -35,7 +35,10 @@ function fixture(): TrialConfiguration {
         inputMicrosPerToken: 9, outputMicrosPerToken: 27, reservationMicros: 11000000, thinking: 'high' },
       perception: { ...chat, model: 'qwen3.5-omni-flash-2026-03-15', inputTokenLimit: 196608,
         outputTokenLimit: 65536, inputMicrosPerToken: 18, outputMicrosPerToken: 13.3, reservationMicros: 4500000 },
-      tts: { ...chat, model: 'qwen3-tts-instruct-flash-2026-01-26',
+      // The fixture records the registered baseline, so it must name a model this endpoint actually
+      // serves. 'qwen3-tts-instruct-flash-2026-01-26' answers model_not_found, so the fixture used to
+      // describe a configuration an operator could never hold.
+      tts: { ...chat, model: 'qwen3-tts-flash',
         endpoint: 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
         inputTokenLimit: 0, outputTokenLimit: 0, inputMicrosPerToken: 0, outputMicrosPerToken: 0, characterMicros: 80 } } };
 }
@@ -150,7 +153,7 @@ test('Omni Plus sends this turn audio and image bytes through the existing perce
 
 test('supported TTS voice changes the existing request and returns WAV without playing audio', async () => {
   const catalog = managementAdapterCatalog(fixture()), descriptor = catalog.find(adapter => adapter.id === 'qwen-tts-instruct')!;
-  const selected = { ...chosen('tts', 'qwen3-tts-instruct-flash'), voice: 'Serena' };
+  const selected = { ...chosen('tts', 'qwen3-tts-flash'), voice: 'Serena' };
   assert.ok(descriptor.choices!.every(choice => choice.voices?.some(voice => voice.id === selected.voice)));
   assert.equal(descriptor.capabilities.cloning, false);
   assert.match(descriptor.note, /同系列/);

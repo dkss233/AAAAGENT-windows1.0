@@ -26,7 +26,10 @@ export function firstRunDraft(projectRoot:string,credentialDirectory=managedCred
   memory_turn:{provider:'deepseek',model:'deepseek-v4-pro',endpoint:text.endpoint,credentialFile:deepseek,reservationMicros:11000000,inputTokenLimit:32768,outputTokenLimit:393216,inputMicrosPerToken:9,outputMicrosPerToken:27,thinking:'high'},
   asr:{provider:'dashscope',model:'qwen3-asr-flash',endpoint:chat,credentialFile:dashscope,reservationMicros:220,inputTokenLimit:0,outputTokenLimit:0,inputMicrosPerToken:0,outputMicrosPerToken:0,audioMicrosPerSecond:220},
   perception:{provider:'dashscope',model:'qwen3.5-omni-flash-2026-03-15',endpoint:chat,credentialFile:dashscope,reservationMicros:1304167,inputTokenLimit:196608,outputTokenLimit:65536,inputMicrosPerToken:2.2,outputMicrosPerToken:13.3},
-  tts:{provider:'dashscope',model:'qwen3-tts-instruct-flash-2026-01-26',endpoint:'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',credentialFile:dashscope,reservationMicros:100000,inputTokenLimit:0,outputTokenLimit:0,inputMicrosPerToken:0,outputMicrosPerToken:0,characterMicros:80}
+  // Default to the model that this endpoint actually serves. The previous value,
+  // 'qwen3-tts-instruct-flash-2026-01-26', answers model_not_found, so a fresh install would record an
+  // unusable default and every spoken reply would fail until it was changed by hand.
+  tts:{provider:'dashscope',model:'qwen3-tts-flash',endpoint:'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',credentialFile:dashscope,reservationMicros:100000,inputTokenLimit:0,outputTokenLimit:0,inputMicrosPerToken:0,outputMicrosPerToken:0,characterMicros:80}
  }};
 }
 async function exists(file:string):Promise<boolean>{try{await lstat(file);return true;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}}

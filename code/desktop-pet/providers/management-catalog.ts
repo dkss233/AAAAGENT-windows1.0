@@ -89,13 +89,19 @@ export function managementAdapterCatalog(base: TrialConfiguration, registeredVoi
     const original = deepseek ? { ...baseline(slot, (slot==='dialogue'?deepseekFlashDialogueModel:deepseekFlashModel)(model.credentialFile)), adapterId: id } : { ...baseline(slot, model), adapterId: id };
     const choices: Choice[] = [{ label: `${original.model}（已登记基线）`, configuration: original,
       ...(slot === 'tts' ? { voices: voices() } : {}) }];
+    // Only models that exist at this endpoint belong here. The previous list also offered
+    // 'qwen3-tts-instruct-flash-2026-01-26' and 'qwen3-tts-instruct-flash'; both answer
+    // model_not_found, exactly like an invented name, so selecting either made every synthesised turn
+    // fail. The instruction-capable models do exist, but as qwen-audio-3.0-tts-flash / -plus on
+    // .../audio/tts/SpeechSynthesizer with their own voices, which speech() does not describe — see the
+    // note in providers/qwen-audio-tts.ts before offering them here.
     const reviewed = deepseek ? [] : slot === 'tts'
-      ? [speech('qwen3-tts-flash'), speech('qwen3-tts-instruct-flash-2026-01-26'), speech('qwen3-tts-instruct-flash')]
+      ? [speech('qwen3-tts-flash')]
       : slot === 'perception' ? [omni(false, !!base.models.asr), omni(true, !!base.models.asr)]
       : slot === 'memory_turn' || slot === 'asr' ? [] : [chat(id, false), chat(id, true)];
     for (const configuration of reviewed) {
       if (choices.some(choice => choice.configuration.model === configuration.model)) continue;
-      choices.push({ label: (configuration.model === 'qwen3-tts-instruct-flash' || configuration.model === 'qwen3-tts-flash')
+      choices.push({ label: configuration.model === 'qwen3-tts-flash'
         ? `${configuration.model}（同系列滚动别名）` : configuration.model, configuration,
       ...(slot === 'tts' ? { voices: voices() } : {}) });
     }
