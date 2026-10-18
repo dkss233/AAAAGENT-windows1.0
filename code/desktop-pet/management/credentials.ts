@@ -1,4 +1,4 @@
-import { isOutside, isPrivateFileSync } from '../core/platform-files.js';
+import { arePrivateFilesSync, isOutside } from '../core/platform-files.js';
 import { createHash } from 'node:crypto';
 import { ManagedCredentialStore, managedCredentialId } from './credential-store.js';
 import { realpathSync, statSync } from 'node:fs';
@@ -24,13 +24,21 @@ export function credentialRegistry(configuration: TrialConfiguration, managed = 
       if (!entry || entry.provider !== provider) throw new Error('Unknown credential reference'); return entry.file;
     },
     list(): CredentialInfo[] {
-      return [...all()].map(([id, entry]) => {
+      // One ACL pass for the whole registry: on Windows each check starts a powershell process, and
+      // asking per credential pushed the management snapshot past the console's fetch deadline.
+      const listed = [...all()];
+      // `managed` marks the entries that came from this install's credential store rather than from
+      // a path named by the configuration.
+      const stored = new Set(managed.entries().map(entry => entry.id));
+      const admitted = arePrivateFilesSync(listed.map(([, entry]) => entry.file));
+      const root = realpathSync(configuration.projectRoot);
+      return listed.map(([id, entry], index) => {
         let status: CredentialInfo['status'] = 'unavailable';
         try {
-          const actual = realpathSync(entry.file), info = statSync(actual), local = relative(realpathSync(configuration.projectRoot), actual);
-          if (isAbsolute(entry.file) && isOutside(realpathSync(configuration.projectRoot), actual) && isPrivateFileSync(actual,info)) status = 'configured';
+          const actual = realpathSync(entry.file), info = statSync(actual), local = relative(root, actual);
+          if (isAbsolute(entry.file) && isOutside(root, actual) && admitted[index]) status = 'configured';
         } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') status = 'missing'; }
-        return { id, provider:entry.provider as 'dashscope'|'deepseek', managed:!entries.has(id), label: (entry.provider === 'dashscope' ? '百炼凭据' : 'DeepSeek凭据') + ' · ' + id.slice(-6), status, masked: '••••••••' };
+        return { id, provider: entry.provider as string, managed:stored.has(id), label: (entry.provider === 'dashscope' ? '百炼凭据' : 'DeepSeek凭据') + ' · ' + id.slice(-6), status, masked: '••••••••' };
       });
     },
   };

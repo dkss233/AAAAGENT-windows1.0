@@ -1,12 +1,15 @@
 import { normalizeApiKey } from '../core/api-key.js';
-import { isPrivateDirectorySync, isPrivateFileSync, restrictPrivatePathSync } from '../core/platform-files.js';
+import { arePrivateFilesAndDirectory, isPrivateDirectorySync, isPrivateFileSync, restrictPrivatePathSync } from '../core/platform-files.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { ManagementError } from '../contracts/management.js';
+import { ManagementError, isCredentialProvider, type CredentialProvider } from '../contracts/management.js';
 
-export type ManagedCredentialProvider = 'dashscope' | 'deepseek';
+/** Was the closed union 'dashscope' | 'deepseek'. Accepting an operator-defined name is what lets a
+ *  self-hosted or third-party endpoint be added through configuration instead of a source change;
+ *  see isCredentialProvider for the shape a name must have. */
+export type ManagedCredentialProvider = CredentialProvider;
 export interface ManagedCredentialEntry { readonly id:string; readonly provider:ManagedCredentialProvider; readonly file:string; readonly createdAt:string; readonly operationId:string }
 interface StoredEntry { id:string; provider:ManagedCredentialProvider; name:string; createdAt:string; operationId:string }
 interface State { version:1; revision:number; entries:StoredEntry[] }
@@ -22,10 +25,23 @@ function assertOwned(path:string,directory=false):void {
   if(stat.isSymbolicLink() || (directory ? !isPrivateDirectorySync(path) : !isPrivateFileSync(path)))
     fail('unavailable','本机凭据存储权限不符合要求。');
 }
+/** Same verdict as assertOwned, but the caller already paid for one batched ACL pass.
+ *  `acl` is null when the batch never covered the path, which keeps the single-path check. */
+function assertOwnedWith(path:string,acl:boolean|null,directory=false):void {
+  const stat=lstatSync(path);
+  if(stat.isSymbolicLink() || !(acl ?? (directory ? isPrivateDirectorySync(path) : isPrivateFileSync(path))))
+    fail('unavailable','本机凭据存储权限不符合要求。');
+}
 function readOwned(path:string):string {
   assertOwned(path);
   const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);
   try {const opened=fstatSync(fd),current=lstatSync(path);if(!isPrivateFileSync(path,opened)||opened.size>256*1024)fail('unavailable','本机凭据存储状态不可用。');return readFileSync(fd,'utf8');}
+  finally{closeSync(fd);}
+}
+function readOwnedWith(path:string,acl:boolean|null):string {
+  assertOwnedWith(path,acl);
+  const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);
+  try {const opened=fstatSync(fd),current=lstatSync(path);if(!(acl ?? isPrivateFileSync(path,opened))||opened.size>256*1024)fail('unavailable','本机凭据存储状态不可用。');return readFileSync(fd,'utf8');}
   finally{closeSync(fd);}
 }
 /** Conservative local recovery: never displace a live/reused PID or an unidentifiable owner.
@@ -55,20 +71,48 @@ export class ManagedCredentialStore {
     this.directory=resolve(directory);
     if(!isAbsolute(projectRoot)||!isAbsolute(directory)||!outside(projectRoot,this.directory))throw new Error('Credential directory must be outside the project');
   }
+  /** One batched ACL pass covers the directory, the registry and every key file it names, so a
+   *  listing no longer starts one powershell process per credential. The directory is the only
+   *  path whose check also accepts a directory stat, so it is asked for separately below. */
+  private verify():{directory:boolean;registry:boolean;files:boolean[]} {
+    if(process.platform!=='win32')return {directory:isPrivateDirectorySync(this.directory),registry:isPrivateFileSync(join(this.directory,'registry.json')),files:[]};
+    const registry=join(this.directory,'registry.json');
+    let names:string[]=[];
+    try {
+      const value=JSON.parse(readFileSync(registry,'utf8')) as {entries?:{name?:unknown}[]};
+      if(Array.isArray(value?.entries))names=value.entries.map(x=>typeof x?.name==='string'?x.name:'').filter(Boolean);
+    } catch { /* The unbatched path below reports the real failure. */ }
+    const [directory,registryVerdict,...files]=arePrivateFilesAndDirectory(this.directory,[registry,...names.map(name=>join(this.directory,name))]);
+    return {directory:directory!,registry:registryVerdict!,files};
+  }
   private state():State {
     try {
-      assertOwned(this.directory,true);
+      const registryFile=join(this.directory,'registry.json');
+      // One list() asks for the same state more than once. Every read also spends a powershell
+      // process on Windows, so remember the parsed state while the registry file is unchanged.
+      // Any write goes through this class and rewrites the registry, so the stamp invalidates it.
+      let stamp:string|null=null;
+      try {const s=lstatSync(registryFile);stamp=`${s.mtimeMs}:${s.size}:${s.ino}`;} catch {stamp=null;}
+      if(stamp!==null&&this.cachedStamp===stamp&&this.cachedState)return this.cachedState;
+      const acl=this.verify();
+      assertOwnedWith(this.directory,acl.directory,true);
       if(realpathSync(this.directory)!==this.directory)throw new Error();
-      const value=JSON.parse(readOwned(join(this.directory,'registry.json'))) as State;
+      const value=JSON.parse(readOwnedWith(registryFile,acl.registry)) as State;
       if(value.version!==1||!Number.isSafeInteger(value.revision)||value.revision<0||!Array.isArray(value.entries)||value.entries.length!==value.revision||value.entries.length>1000)throw new Error();
       const ids=new Set<string>(),operations=new Set<string>();
+      let at=0;
       for(const x of value.entries){
-        if(!x||!['dashscope','deepseek'].includes(x.provider)||!/^credential-[a-f0-9-]{36}\.key$/.test(x.name)||x.id!==managedCredentialId(join(this.directory,x.name),x.provider)||ids.has(x.id)||operations.has(x.operationId)||!/^[a-zA-Z0-9_-]{8,100}$/.test(x.operationId)||!Number.isFinite(Date.parse(x.createdAt)))throw new Error();
+        if(!x||!isCredentialProvider(x.provider)||!/^credential-[a-f0-9-]{36}\.key$/.test(x.name)||x.id!==managedCredentialId(join(this.directory,x.name),x.provider as ManagedCredentialProvider)||ids.has(x.id)||operations.has(x.operationId)||!/^[a-zA-Z0-9_-]{8,100}$/.test(x.operationId)||!Number.isFinite(Date.parse(x.createdAt)))throw new Error();
+        const stored=join(this.directory,x.name);
+        assertOwnedWith(stored,acl.files[at++]??null);
         ids.add(x.id);operations.add(x.operationId);
       }
+      if(stamp!==null){this.cachedStamp=stamp;this.cachedState=value;}
       return value;
     } catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return {version:1,revision:0,entries:[]};return fail('unavailable','本机凭据目录不可用，请检查本地访问权限。');}
   }
+  private cachedStamp:string|null=null;
+  private cachedState:State|undefined;
   entries():readonly ManagedCredentialEntry[]{return this.state().entries.map(({name,...x})=>({...x,file:join(this.directory,name)}));}
   revision():number{return this.state().revision;}
   private ensureDirectory():void {
@@ -80,7 +124,7 @@ export class ManagedCredentialStore {
   }
   save(input:{provider:ManagedCredentialProvider;key:string;expectedRevision:number;operationId:string}):{revision:number;credentialRef:string;provider:ManagedCredentialProvider} {
     const key = normalizeApiKey(input.key);
-    if(!['dashscope','deepseek'].includes(input.provider)||key===undefined||!Number.isSafeInteger(input.expectedRevision)||input.expectedRevision<0||!/^[a-zA-Z0-9_-]{8,100}$/.test(input.operationId))fail('invalid_request','请选择对应服务商并填写完整 API Key。');
+    if(!isCredentialProvider(input.provider)||key===undefined||!Number.isSafeInteger(input.expectedRevision)||input.expectedRevision<0||!/^[a-zA-Z0-9_-]{8,100}$/.test(input.operationId))fail('invalid_request','请选择对应服务商并填写完整 API Key。');
     this.ensureDirectory();const release=acquireSetupLock(join(this.directory,'write.lock'),'credentials:'+this.projectRoot);
     let created:string|undefined,temporary:string|undefined;
     try {

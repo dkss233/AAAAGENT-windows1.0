@@ -7,6 +7,28 @@ export function createPresentationView(client,render) {
   const canvas=el('canvas',{class:'preset-canvas','aria-label':'当前模型真实预览'});
   const stage=el('div',{class:'preset-stage'},canvas), status=el('p',{class:'preset-preview-status',role:'status'},'正在准备模型…');
   let data=null,query='',category='all',selected=null,engine=null,loading=null,active=false,epoch=0,saving=false,error='',message='';
+  // Swapping the rig is a task, not a request: the backend opens a native folder dialog and then runs
+  // the installer, which rebuilds the renderer assets and re-pins the fingerprint. This page polls.
+  let swapping=false,timer=null;
+  async function swapModel(){
+    if(swapping)return;
+    swapping=true;error='';message='已打开文件夹选择窗口，请在弹出的窗口里选好模型文件夹。';
+    render();
+    try{
+      let state=await client.request('/api/presentation/model',{method:'POST',body:{}});
+      // The dialog waits for the operator, so poll until the backend reports it settled.
+      const deadline=Date.now()+30*60*1000;
+      while(state?.running&&Date.now()<deadline){
+        await new Promise(resolve=>{timer=setTimeout(resolve,2000);});
+        state=await client.request('/api/presentation/model');
+      }
+      if(state?.running){message='更换模型仍在进行，可以稍后回来查看结果。';}
+      else if(state?.cancelled){message='已取消，模型没有改动。';}
+      else if(state?.completed){message='模型已更换。请退出并重新启动桌宠后生效。';}
+      else{message='';error=state?.detail??'更换模型未完成，请查看 .local\\model-install.log。';}
+    }catch(e){message='';error=e?.status===404?'当前版本不支持在控制台更换模型。':'更换模型未完成：'+(e?.message??'未知原因');}
+    finally{if(timer){clearTimeout(timer);timer=null;}swapping=false;render();}
+  }
   // Preview scale. The renderer clamps it to 0.2 – 8; 1 is the framing preset's own baseline.
   let previewZoom=1;
   const ZOOM_MIN=0.2, ZOOM_MAX=8;
@@ -141,7 +163,7 @@ export function createPresentationView(client,render) {
         el('output',{id:'preset-zoom-value',for:'preset-zoom-range'},Math.round(previewZoom*100)+'%'),
         button('重置 100%',()=>{applyZoom(1);const r=document.getElementById('preset-zoom-range');if(r)r.value='1';},{class:'preset-zoom-reset'})),
       status,
-      el('div',{class:'actions'},button('停止预览',()=>stop(),{disabled:!engine||!selected}),button('恢复默认',()=>stop(true),{disabled:!engine})),
+      el('div',{class:'actions'},button('停止预览',()=>stop(),{disabled:!engine||!selected}),button('更换模型',swapModel,{id:'model-swap',disabled:swapping}),button('恢复默认',()=>stop(true),{disabled:!engine})),
       el('p',{class:'subtle preset-hint'},'预览不影响聊天，也不会播放声音。缩放只作用于这个预览窗口。'));
     const search=el('input',{id:'preset-search',type:'search',placeholder:'搜索表情或动作',value:query,'aria-label':'搜索表情或动作',onInput:e=>{query=e.target.value;render();}});
     const filters=el('div',{class:'preset-filters',role:'group','aria-label':'预设分类'},Object.entries(categoryNames).map(([id,label])=>button(label,()=>{category=id;render();},{'aria-pressed':category===id,class:category===id?'selected':''})));

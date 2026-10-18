@@ -1,4 +1,4 @@
-import { historicalDialoguePrefix } from './companion-fixture.js';
+import { historicalDialoguePrefix, withoutEmotionShape } from './companion-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -24,7 +24,7 @@ for (const fixture of dialogueFactorALiveV1.cases) test(`factor B changes only g
   assert.deepEqual(input, before); assert.equal(requests.length, 1);
   const body = requests[0]!, system = body.messages[0]!.content, originalSystem = fixture.originalMessages[0]!.content;
   const generic = system.slice(system.indexOf(factStart), system.indexOf(outcomeStart));
-  assert.equal(historicalDialoguePrefix(system.slice(0, system.indexOf(factStart))), originalSystem.slice(0, originalSystem.indexOf(factStart)), 'historical prefix is preserved apart from later presentation/manual-edit rules');
+  assert.equal(withoutEmotionShape(historicalDialoguePrefix(system.slice(0, system.indexOf(factStart)))), originalSystem.slice(0, originalSystem.indexOf(factStart)), 'historical prefix is preserved apart from the emotionAssessment field and later presentation/manual-edit rules');
   assert.match(system,/expression描述助手本轮回复的表达/);assert.match(system,/不能仅用旧对话或自动摘要推翻人工修正/);
   assert.equal(system.slice(system.indexOf(outcomeStart)), originalSystem.slice(originalSystem.indexOf(outcomeStart)), 'actual factor A rule suffix stays byte-identical');
   assert.deepEqual(body.messages.slice(1), fixture.originalMessages.slice(1), 'actual outcome and all single-user JSON data stay byte-identical');

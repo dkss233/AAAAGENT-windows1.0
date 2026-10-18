@@ -85,7 +85,15 @@ export function assembleContext(ledger: ContextReader, scope: TurnScope, text: s
   };
   const background=options.emotionBackground;
   if(background&&(background.user.observation||background.companion.observation)){
-    const ceiling=Math.min(options.inputTokenBudget,countedInputTokens+reserve);
+    // The reservation keeps room for this layer, but it must not be a hard cap: the measured brief
+    // background is 666 characters against the 512 default, so capping at counted+reserve discarded
+    // the layer on EVERY turn. The mood was recorded and then never sent, which is why neither the
+    // console nor the reply reflected it.
+    //
+    // Zero still means "spend nothing on this layer", which is how the setting turns it off. Above zero
+    // the layer may use the room the request actually has, because it is small beside the budget and is
+    // the most time-sensitive layer there is.
+    const ceiling=reserve>0?options.inputTokenBudget:countedInputTokens;
     if(!admit({...context,emotionBackground:background},'current_emotion',ceiling)){
       // Strip redundant state chronology, never observation content/provenance/source versions.
       const brief:EmotionBackground={user:{...background.user,updatedAt:null,logicalOrder:null,sessionId:null},companion:{...background.companion,updatedAt:null,logicalOrder:null,sessionId:null}};

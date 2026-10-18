@@ -82,6 +82,9 @@ export function modelsView(a) {
   const history=el('details',{class:'card'},el('summary',{},'配置历史与回滚'),el('p',{class:'subtle section-gap'},'回滚保存为新的配置版本，重启后生效。回滚会替换当前表单草稿，请先核对。'),
     settings.history.length?el('div',{class:'record-list'},settings.history.map(h=>el('div',{class:'label-row'},el('span',{},`版本 ${h.revision} · ${time(h.savedAt)}`),button('回滚到此版本',()=>a.rollbackSettings(h.revision),{'data-target-revision':h.revision,disabled:!canSave(a)||s.settingsConflict||s.pending.has('settings')||h.revision===settings.revision})))):el('p',{class:'empty'},'暂时没有可回滚的保存版本。'));
   return el('div',{},a.wake?.view(),a.selfSetup?.view(),versionStrip(settings),budgetComparison(settings),a.selfSetup?.available()&&a.selfSetup.modelHelp(),summaries,
+    // Placed with the model summaries rather than behind the editor: adding a supplier is a
+    // configuration act of its own, and it is what makes the reviewed catalogue non-final.
+    a.customTts?.view(),
     el('p',{class:'subtle section-gap'},settings.pending?'版本已保存，重启后生效；当前运行仍使用上方有效配置。':'表单修改需保存并重启后才生效。'),
     ...settingsNotices(a),editor,el('div',{class:'savebar'},settingsActions(a)),background,history);
 }

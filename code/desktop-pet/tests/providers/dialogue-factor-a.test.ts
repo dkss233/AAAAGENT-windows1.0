@@ -1,4 +1,4 @@
-import { historicalDialoguePrefix } from './companion-fixture.js';
+import { historicalDialoguePrefix, withoutEmotionShape } from './companion-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -21,7 +21,7 @@ function harness(raw: string) {
 }
 function selectedRules(body: Body) {
   const system = body.messages[0]!.content;
-  assert.equal(historicalDialoguePrefix(system.split('本轮感知')[0]!), unchangedPrefix, 'historical character/schema/history prefix is preserved apart from later presentation/manual-edit rules');
+  assert.equal(withoutEmotionShape(historicalDialoguePrefix(system.split('本轮感知')[0]!)), unchangedPrefix, 'historical character/schema/history prefix is preserved apart from the emotionAssessment field and later presentation/manual-edit rules');
   assert.match(system,/expression描述助手本轮回复的表达/);assert.match(system,/不能仅用旧对话或自动摘要推翻人工修正/);
   return system.slice(system.indexOf(boundary));
 }

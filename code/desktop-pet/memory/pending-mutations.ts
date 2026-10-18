@@ -43,6 +43,22 @@ export class PendingMutations {
   this.db.prepare('UPDATE memory_pending_mutations SET status=? WHERE character_id=? AND current_message_id=?').run(completed?'completed':'failed',scope.characterId,id);
  }
  fail(scope:TurnScope,id:string):void {const row=this.row(scope,id);if(!row||(row.status==='completed'||row.status==='cancelled'))return;if(!sameScope(scope,JSON.parse(row.scope_json)))throw new MemoryRuleError('pending_identity_mismatch');this.db.prepare("UPDATE memory_pending_mutations SET status='failed' WHERE character_id=? AND current_message_id=?").run(scope.characterId,id);}
+ /** Resolves a hold the planner declined to act on.
+  *
+  *  A clarification applies nothing (commitTurn rejects a clarification that carries mutations), so the
+  *  request is answered rather than left outstanding. Marking it 'failed' instead made it a DURABLE
+  *  privacy hold: has() counts 'failed', nothing ever releases it, and every later turn for that character
+  *  lost memory reads and lost its emotion observation — one ambiguous sentence froze memory until the
+  *  operator manually cancelled it.
+  *
+  *  Deliberately does NOT advance the character epoch, unlike cancel(): that bump exists to invalidate
+  *  already-captured strict work after a NEW privacy request, and nothing was applied here. finish() also
+  *  leaves the epoch alone when a request completes. */
+ releaseClarification(scope:TurnScope,id:string):void {
+  const row=this.row(scope,id);if(!row||row.status==='completed'||row.status==='cancelled')return;
+  if(!sameScope(scope,JSON.parse(row.scope_json)))throw new MemoryRuleError('pending_identity_mismatch');
+  this.db.prepare("UPDATE memory_pending_mutations SET status='cancelled' WHERE character_id=? AND current_message_id=?").run(scope.characterId,id);
+ }
  assertWritable(scope:TurnScope,id:string,version?:number):void {
   const row=this.row(scope,id);if(!row)return;
   if(!sameScope(scope,JSON.parse(row.scope_json)))throw new MemoryRuleError('pending_identity_mismatch');

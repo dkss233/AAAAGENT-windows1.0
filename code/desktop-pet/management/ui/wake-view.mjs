@@ -6,9 +6,28 @@ const copy=s=>({keyword:s.keyword,sensitivity:s.sensitivity,silenceMs:s.silenceM
 const same=(a,b)=>!!a&&!!b&&a.keyword===b.keyword&&a.sensitivity===b.sensitivity&&a.silenceMs===b.silenceMs;
 export function createWakeView(client,render,getHost){
  let current=null,draft=null,base=null,conflict=false,identity=null,epoch=0,active=false,reading=null,writing=null,timer=null,stale=true,error='',message='',composing=false;
+ // Installing the five wake models is a ~33 MB verified download, so the console starts it and polls.
+ let installing=false,installTimer=null;
+ async function installModels(){
+  if(installing)return;
+  installing=true;error='';message='正在下载并校验唤醒模型（约 33 MB），请保持网络连通…';
+  render();
+  try{
+   let state=await client.request('/api/wake/models',{method:'POST',body:{}});
+   const deadline=Date.now()+30*60*1000;
+   while(state?.running&&Date.now()<deadline){
+    await new Promise(resolve=>{installTimer=setTimeout(resolve,2000);});
+    state=await client.request('/api/wake/models');
+   }
+   if(state?.running){message='安装仍在进行，可以稍后回来看状态。';}
+   else if(state?.completed){message='唤醒模型已安装。请退出并重新启动桌宠，之后即可开启本次监听。';}
+   else{message='';error=state?.detail??'唤醒模型未安装成功，请查看 .local\\wake-install.log。';}
+  }catch(e){message='';error=e?.status===404?'当前版本不支持在控制台安装唤醒模型。':'安装未完成：'+(e?.message??'未知原因');}
+  finally{if(installTimer){clearTimeout(installTimer);installTimer=null;}installing=false;render();}
+ }
  const visible=()=>getHost().page==='models'&&getHost().connection==='online'&&!document.hidden;
  const dirty=()=>draft&&!same(draft,base);
- function stop(){active=false;epoch++;clearTimeout(timer);reading?.controller.abort();reading=null;writing=null;stale=true;}
+ function stop(){active=false;epoch++;clearTimeout(timer);if(installTimer){clearTimeout(installTimer);installTimer=null;}installing=false;reading?.controller.abort();reading=null;writing=null;stale=true;}
  function sync(){const h=getHost(),key=JSON.stringify([h.instanceId,h.authEpoch]);if(key!==identity){if(identity!==null&&dirty())conflict=true;stop();identity=key;current=null;error='';}if(!visible()){if(active)stop();return;}if(!active){active=true;queueMicrotask(()=>active&&refresh());}}
  function accept(s){
   if(s?.version!=='0.1.0'||s.instanceId!==getHost().instanceId||!Number.isSafeInteger(s.revision)||s.revision<0||!valid(s.settings)||typeof s.available!=='boolean'||!Number.isSafeInteger(s.session?.generation)||s.session.generation<0||typeof s.session.enabled!=='boolean'||!Object.hasOwn(phases,s.session.phase))throw Error('Invalid wake snapshot');
@@ -43,7 +62,7 @@ export function createWakeView(client,render,getHost){
   draft&&el('div',{class:'form-grid'},field('唤醒词','wake-keyword',draft.keyword,v=>edit('keyword',v),{maxLength:12,onCompositionStart:()=>{composing=true;},onCompositionEnd:()=>{composing=false;render();},disabled:!active||!!writing,hint:'2–12 个汉字；“乐正绫”读作 yuè zhèng líng。'}),select('灵敏度','wake-sensitivity',draft.sensitivity,sensitivities,v=>edit('sensitivity',v),{disabled:!active||!!writing}),select('说完后等待多久发送','wake-silence',String(draft.silenceMs),[1000,1500,2000,2500,3000].map(v=>({value:String(v),label:v/1000+' 秒'})),v=>edit('silenceMs',Number(v)),{disabled:!active||!!writing})),
   draft&&!valid(draft)&&notice('请输入 2–12 个汉字，并选择有效的灵敏度和静音时长。','warning'),
   conflict&&notice('本页草稿已保留，请核对已保存值后再保存。','warning'),
-  el('div',{class:'actions'},button('刷新唤醒状态',refresh,{id:'wake-refresh',disabled:!active||!!reading||!!writing}),conflict&&button('核对后保留本页修改',()=>{if(!current||stale||writing)return;base=copy(current.settings);conflict=false;render();},{id:'wake-review',disabled:stale||!!writing}),button('保存唤醒设置',()=>write('save'),{id:'wake-save',disabled:!writable()||stale||conflict||!dirty()||!valid(draft)}),button(current?.session.enabled?'关闭监听':'开启本次监听',()=>write(current?.session.enabled?'disable':'enable'),{id:'wake-toggle',class:current?.session.enabled?'':'primary',disabled:!writable()||!current?.session.enabled&&(stale||conflict||dirty()||!current?.available)})),
+  el('div',{class:'actions'},button('刷新唤醒状态',refresh,{id:'wake-refresh',disabled:!active||!!reading||!!writing}),conflict&&button('核对后保留本页修改',()=>{if(!current||stale||writing)return;base=copy(current.settings);conflict=false;render();},{id:'wake-review',disabled:stale||!!writing}),button('保存唤醒设置',()=>write('save'),{id:'wake-save',disabled:!writable()||stale||conflict||!dirty()||!valid(draft)}),button(current?.session.enabled?'关闭监听':'开启本次监听',()=>write(current?.session.enabled?'disable':'enable'),{id:'wake-toggle',class:current?.session.enabled?'':'primary',disabled:!writable()||!current?.session.enabled&&(stale||conflict||dirty()||!current?.available)}),button('安装唤醒模型',installModels,{id:'wake-install',disabled:installing})),
   el('p',{class:'field-help'},'修改后保存会关闭旧监听，不会自动重新开启。按住语音键仍可直接说话；每次回复后回到等待唤醒。'));
  }
  document.addEventListener('visibilitychange',()=>{sync();render();});window.addEventListener('pagehide',stop);window.addEventListener('pageshow',()=>{sync();render();});

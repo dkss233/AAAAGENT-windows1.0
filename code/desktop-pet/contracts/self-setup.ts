@@ -1,6 +1,8 @@
 import type { CredentialInfo, ManagedSettings, ProviderAdapterInfo, SettingsSnapshot } from './management.js';
 export const SELF_SETUP_VERSION = '0.3.0' as const;
-export type SetupProvider = 'deepseek' | 'dashscope';
+/** Was the closed union 'deepseek' | 'dashscope'. Widened so an operator-defined supplier can be
+ *  saved through the same flow; shape is enforced by isCredentialProvider at every write. */
+export type SetupProvider = string;
 export type SetupVoiceModel = 'MiniMax/speech-2.8-turbo' | 'MiniMax/speech-2.8-hd';
 export interface SetupIdentity { readonly instanceId:string }
 export interface SetupCredential extends CredentialInfo { readonly provider:SetupProvider; readonly managed:boolean }

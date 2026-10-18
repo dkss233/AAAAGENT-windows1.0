@@ -1,7 +1,10 @@
 import type { SetupProvider, CredentialTestResult, TestSetupCredential } from '../contracts/self-setup.js';
 import { ManagementError } from '../contracts/management.js';
 
-export const KEY_TEST_ENDPOINTS:Record<SetupProvider,string>={
+/** Only the two reviewed suppliers publish a fixed key-test endpoint. An operator-defined supplier has
+ *  no such default, so the lookup is partial by design and the caller reports it as untestable rather
+ *  than probing a URL nobody confirmed. */
+export const KEY_TEST_ENDPOINTS:Record<string,string|undefined>={
  deepseek:'https://api.deepseek.com/models',
  dashscope:'https://dashscope.aliyuncs.com/api/v1/models?page_size=1',
 };
@@ -40,7 +43,9 @@ export class CredentialSmoke {
    if(signal.aborted||!this.options.ready())return result(false,'本地实例已变化，请重新打开设置页。');
    let key:string;try{key=await this.options.key(credentialRef,provider);}catch{return result(false,'无法读取此凭据。');}
    if(signal.aborted||!this.options.ready())return result(false,'本地实例已变化，请重新打开设置页。');
-   const response=await(this.options.fetch??fetch)(KEY_TEST_ENDPOINTS[provider],{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'error',signal});
+   const testEndpoint=KEY_TEST_ENDPOINTS[provider];
+   if(!testEndpoint)return result(false,'自定义服务商没有可用的固定校验地址，请用语音合成实际验证。');
+   const response=await(this.options.fetch??fetch)(testEndpoint,{method:'GET',headers:{Authorization:'Bearer '+key,Accept:'application/json'},redirect:'error',signal});
    const reader=response.body?.getReader();let bytes=0,body='';const decoder=new TextDecoder();
    if(reader)try{while(true){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>65536){await reader.cancel();return result(false,'HTTP '+response.status+'：供应商响应过大。',response.status);}body+=decoder.decode(part.value,{stream:true});}body+=decoder.decode();}finally{reader.releaseLock();}
    let data:any;try{data=JSON.parse(body);}catch{return result(false,!response.ok?safeCredentialError('HTTP '+response.status+(body.trim()?' · '+body.trim():''),key):'HTTP '+response.status+'：供应商响应无法解析。',response.status);}

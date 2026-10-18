@@ -8,6 +8,7 @@ import {createPendingMemoryView} from './pending-memory-view.mjs';
 import {ManagementClient,query,clone,rebase} from './api.mjs';
 import {el,button,badge,notice,field,time,captureView,restoreView} from './dom.mjs';
 import {overviewView,memoryView,modelsView,eventsView} from './views.mjs';
+import {createCustomTtsView} from './custom-tts-view.mjs';
 import {createMemoryDynamicsView} from './memory-dynamics-view.mjs';
 import {validBudgetReport} from './context-budget-view.mjs';
 import {createTasksView} from './tasks-view.mjs';
@@ -43,7 +44,8 @@ const memoryImport=createMemoryImportView(client,render,()=>({page:s.page,sectio
 const balances=createBalancesView(client,render,()=>s);
 const selfSetup=createSelfSetupView(client,render,()=>({page:s.page,connection:s.connection,authEpoch,onError:error,onMode:mode=>{s.setupMode=mode;if(mode==='first-run')s.connection='online';}}));
 const emotion=createEmotionView(client,render,()=>({page:s.page,section:s.section,connection:s.connection,character:s.character,instanceId:s.snapshot?.runtime.instanceId,authEpoch,onError:error}));
-const actions={emotion,selfSetup,balances,wake,memoryImport,memoryDynamics,s,render,currentDraft,selectPage,loadRecords,loadPrompt,loadContext,selectRecord,saveRecord,savePrompt,saveSettings,rollbackSettings,refreshSnapshot,editSetting,reviewSettings,reviewPrompt,reviewRecord};
+const customTts=createCustomTtsView(client,render,()=>({page:s.page,connection:s.connection,authEpoch,onError:error}));
+const actions={customTts,emotion,selfSetup,balances,wake,memoryImport,memoryDynamics,s,render,currentDraft,selectPage,loadRecords,loadPrompt,loadContext,selectRecord,saveRecord,savePrompt,saveSettings,rollbackSettings,refreshSnapshot,editSetting,reviewSettings,reviewPrompt,reviewRecord};
 function error(e){if(e.name==='AbortError')return;if(e.status===401||e.status===403){s.connection='locked';s.error='本机会话已失效，请从本机管理入口重新打开，或重新连接。未保存编辑仍保留。'}else{s.error=e.message;if(!e.status||e.status>=500)s.connection='offline'}render()}
 async function write(key,fn,role=null){const auth=authEpoch;if(s.pending.has(key))return;s.pending.add(key);s.error='';s.message='';render();try{await fn()}catch(e){if(auth===authEpoch&&(!role||role===s.character))error(e)}finally{s.pending.delete(key);render()}}
 async function read(kind,url,accept){const seq=(reads.get(kind)||0)+1;reads.set(kind,seq);const auth=authEpoch;s.pending.add(kind);render();try{const data=await client.request(url);if(reads.get(kind)!==seq||auth!==authEpoch)return;if(data.characterId!==s.character)throw Error('服务返回的角色与本次查询不一致，内容未显示。');accept(data)}catch(e){if(reads.get(kind)===seq&&auth===authEpoch)error(e)}finally{if(reads.get(kind)===seq){s.pending.delete(kind);render()}}}

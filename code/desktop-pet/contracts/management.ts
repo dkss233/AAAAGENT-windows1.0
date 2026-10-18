@@ -4,10 +4,24 @@ import type { CharacterId } from './index.js';
 /** Local management HTTP API v1. No credential contents or private filesystem paths. */
 export const MANAGEMENT_API_VERSION = 1 as const;
 export type ProviderSlot = 'asr' | 'dialogue' | 'memory_turn' | 'summary' | 'perception' | 'tts' | 'admission';
+/** Two reviewed suppliers, plus operator-defined names for a self-hosted or third-party endpoint.
+ *
+ *  The list used to be the closed union 'dashscope' | 'deepseek', which is what made adding a service
+ *  a source change rather than a configuration one. A custom name still has to look like an
+ *  identifier; the safety boundary moved to the ENDPOINT (protocol, userinfo and query are rejected,
+ *  and the operator confirms the exact URL), not to the supplier's name. */
+export const BUILT_IN_CREDENTIAL_PROVIDERS = ['dashscope', 'deepseek'] as const;
+/** A plain string rather than a branded union: every call site already validates at runtime through
+ *  isCredentialProvider, and a branded type only spread `| undefined` through the optional fields it
+ *  was assigned to (CredentialInfo.provider, self-setup's SetupProvider, the catalogue tests). */
+export type CredentialProvider = string;
+export function isCredentialProvider(value: unknown): value is CredentialProvider {
+  return typeof value === 'string' && /^[a-z][a-z0-9_-]{1,31}$/.test(value);
+}
 export interface ProviderSelection {
   readonly contextWindowTokens?: number;
   adapterId: string;
-  provider: 'dashscope' | 'deepseek';
+  provider: CredentialProvider;
   model: string;
   endpoint: string;
   credentialRef: string;
@@ -65,7 +79,7 @@ export interface ProviderAdapterInfo {
   note: string;
 }
 export interface CredentialInfo {
-  readonly provider?: 'dashscope' | 'deepseek';
+  readonly provider?: CredentialProvider;
   readonly managed?: boolean; id: string; label: string; status: 'configured' | 'missing' | 'unavailable'; masked: string }
 export interface RuntimeModule {
   id: string;

@@ -39,7 +39,13 @@ export class SqliteMemoryPort implements MemoryPort {
       bindScope(requested, owned.characterId); return {...data,memories:this.store.recall.references(owned,candidates)};
     }, recentTurns:()=>foreground.turns,hasUnreadRecent:()=>foreground.turns.hasUnread(),
       ...(!privacyExcluded?{messageEmotion:(requested:TurnScope,id:string)=>this.store.emotion.message(requested,id)}:{}),assertContextCurrent: (requested, revision) => this.store.assertContextCurrent(requested, revision) }, owned, text, privacyExcluded?null:perception, this.store.now(), {
-      ...this.options,...(currentMessageId?{currentMessageId}:{}), ...(!privacyExcluded?{emotionBackground:this.store.emotion.background(owned)}:{}),
+      // emotionBackground is DELIBERATELY not privacy-gated. It describes the character's own mood, not
+      // the user's stored material, and assembleContext is its only route to the emotion layer.
+      // Omitting it while a hold was outstanding meant prepare() could not issue a ticket, so no
+      // observation was recorded — and because a FAILED hold is never released, one failed memory turn
+      // froze the mood for that character permanently, leaving the console showing a stale value with
+      // nothing explaining why. The hold still excludes every user-facing memory layer above.
+      ...this.options,...(currentMessageId?{currentMessageId}:{}), emotionBackground:this.store.emotion.background(owned),
       memoryTieBreak:(a,b)=>(candidateOrder.get(a.id)??0)-(candidateOrder.get(b.id)??0), relevance:memory=>scores.get(memory.id)??0, prompts: { [owned.characterId]: this.store.prompt(owned) },
     });
     if(snapshot.context.contextBudget){

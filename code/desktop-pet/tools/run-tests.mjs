@@ -8,8 +8,12 @@ const paths = [];
 async function collect(dir, accepts) {
   for (const file of (await readdir(resolve(root, dir))).sort()) if (accepts(file)) paths.push(resolve(root, dir, file));
 }
-if (group === 'windows') await collect('tests/windows', name => name.endsWith('.test.mjs'));
-else if (group === 'release') {
+if (group === 'windows') {
+  await collect('tests/windows', name => name.endsWith('.test.mjs'));
+  // Desktop renderer logic that has no other home. zoom-wheel.test.mjs guards the two independent
+  // wheel-zoom accumulators; without it a shared accumulator silently regresses.
+  await collect('desktop/tests', name => name === 'zoom-wheel.test.mjs');
+} else if (group === 'release') {
   await collect('dist/tests/memory', name => name === 'import-49.test.js' || name === 'context-continuity.test.js' || /^dynamics.*\.test\.js$/.test(name));
   await collect('dist/tests/providers', name => ['qwen-asr.test.js', 'minimax-tts.test.js', 'registered-voices.test.js'].includes(name));
   await collect('dist/tests/wechat', name => name === 'conversation.test.js');

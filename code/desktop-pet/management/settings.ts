@@ -4,7 +4,8 @@ import { TEXT_SLOTS } from '../providers/text-protocol.js';
 import { ManagementError, type ManagedSettings, type ProviderAdapterInfo, type ProviderSelection, type ProviderSlot } from '../contracts/management.js';
 import { validateTrialConfiguration, type TrialConfiguration } from '../app/trial-config.js';
 import { credentialRegistry } from './credentials.js';
-import { managementAdapterCatalog } from '../providers/management-catalog.js';
+import { managementAdapterCatalog, CUSTOM_TTS_ADAPTER_ID } from '../providers/management-catalog.js';
+import { validateCustomTts } from '../providers/local-speech.js';
 import type { RegisteredVoiceStore } from '../providers/registered-voices.js';
 
 export const PROVIDER_SLOTS: readonly ProviderSlot[] = ['asr', 'dialogue', 'memory_turn', 'summary', 'perception', 'tts', 'admission'];
@@ -63,6 +64,19 @@ export function validateManagedSettings(value: unknown, base: TrialConfiguration
     const required = ['adapterId', 'provider', 'model', 'endpoint', 'credentialRef', 'inputTokenLimit', 'outputTokenLimit', 'reservationMicros', 'inputMicrosPerToken', 'outputMicrosPerToken'];
     keys(p, [...required, 'characterMicros', 'thinking', 'voice', 'language', 'temperature', 'audioMicrosPerSecond','contextWindowTokens'], required);
     const adapter = adapters.find(a => a.id === p.adapterId && a.slots.includes(slot));
+    // An operator-defined supplier is not in the reviewed catalogue, so it cannot satisfy the
+    // allow-list checks below. It is instead checked against the customTts block the operator saved:
+    // supplier, address and model must match that block exactly, which is what keeps the selection and
+    // the address actually dialled in step. Without this branch a custom supplier could never be
+    // applied from the console, which is the whole point of the feature.
+    const custom = slot === 'tts' && base.customTts ? validateCustomTts(base.customTts) : undefined;
+    if (custom && p.adapterId === CUSTOM_TTS_ADAPTER_ID) {
+      if (p.provider !== custom.provider || p.endpoint !== custom.baseUrl + '/audio/speech'
+        || p.model !== custom.model || p.voice !== custom.voice) invalid('自定义语音的服务商、地址、模型或音色与已保存的设置不一致。');
+      if (![p.inputTokenLimit, p.outputTokenLimit].every(n => Number.isSafeInteger(n) && (n as number) >= 0)) invalid('模型用量上界无效。');
+      try { credentials.file(p.credentialRef as string, custom.provider); } catch { invalid('请先保存该自定义服务商的 API Key。'); }
+      continue;
+    }
     if (!adapter || adapter.provider !== p.provider || !adapter.endpoints.includes(p.endpoint as string) || !text(p.model) || !text(p.credentialRef)) invalid();
     if (!adapter.models.includes(p.model)) invalid('这个型号尚未登记适配能力和费用边界，不能应用。');
     const choice = adapter.choices?.find(c => c.configuration.model === p.model && c.configuration.endpoint === p.endpoint);
