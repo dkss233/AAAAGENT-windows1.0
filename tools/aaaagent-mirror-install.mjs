@@ -41,6 +41,13 @@ function run(command, args, cwd, say) {
   });
 }
 
+/** Run a node script directly: node.exe is not a .cmd shim, so it must not go through run(). */
+const runNode = (args, cwd, say) => new Promise((done) => {
+  const child = spawn(process.execPath, args, { cwd, stdio: 'inherit', windowsHide: true });
+  child.on('error', (error) => { say('  无法执行 node：' + error.message); done(1); });
+  child.on('close', (code) => done(code === null ? 1 : (code & 0xff)));
+});
+
 /**
  * Install dependencies and build, using the mirror. Returns true only when all four commands succeed.
  * `say` receives operator-facing lines, so a caller can choose how much to narrate.
@@ -85,11 +92,34 @@ export async function installWithMirror(root, say = console.log) {
     return false;
   }
   say('');
-  say('  [1/2] 依赖安装完成。');
+  say('  [1/3] 依赖安装完成。');
+
+  // Electron 44 ships install.js but declares no postinstall, so npm never downloads the ~100 MB
+  // runtime binary. The pet's launcher needs it (node_modules/electron/dist/electron.exe), and
+  // without it the window cannot open even though every dependency is installed.
+  const electronBinary = join(repo, 'node_modules', 'electron', 'dist',
+    isWindows ? 'electron.exe' : process.platform === 'darwin' ? 'Electron.app/Contents/MacOS/Electron' : 'electron');
+  if (!existsSync(electronBinary)) {
+    say('');
+    rule();
+    say('   第 2 步：下载 Electron 运行时（约 100 MB）');
+    rule();
+    say('');
+    if (await runNode(['node_modules/electron/install.js'], repo, say) !== 0 || !existsSync(electronBinary)) {
+      say('');
+      say('  [失败] Electron 运行时未下载成功。请检查网络后重新双击启动。');
+      say('');
+      return false;
+    }
+    say('');
+    say('  [2/3] Electron 运行时完成。');
+  } else {
+    say('  [2/3] Electron 运行时已存在，跳过。');
+  }
 
   say('');
   rule();
-  say('   第 2 步：编译后端与界面');
+  say('   第 3 步：编译后端与界面');
   rule();
   say('');
   if (await run('npm', ['run', 'build'], repo, say) !== 0) {
@@ -101,7 +131,7 @@ export async function installWithMirror(root, say = console.log) {
     return false;
   }
   say('');
-  say('  [2/2] 编译完成。');
+  say('  [3/3] 编译完成。');
   say('');
   return true;
 }
