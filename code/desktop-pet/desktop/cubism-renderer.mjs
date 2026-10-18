@@ -34,6 +34,13 @@ function resolveFaces(policy) {
 }
 const headParameters = ['ParamAngleX2', 'ParamAngleX3', 'ParamAngleX4'];
 const interactionParameters = [...headParameters, 'ParamBodyAngleX', 'ParamEyeBallX', 'ParamEyeBallY'];
+
+// Seconds a "是否持续启用该表情" choice takes to reach full effect, and to release.
+//
+// Without it the parameter write landed in a single frame, so the face popped to the new expression.
+// 0.5 is the Cubism framework's own DefaultFadeInSeconds (vendor/.../effect/cubismpose.ts), which is
+// what makes this match the feel of switching expressions in Cubism Viewer.
+const HIDDEN_EXPRESSION_FADE_SECONDS = 0.5;
 // Idle-animation intensity. These are the only knobs that decide how strongly the rig
 // moves on its own: headAngleScale drives the 33 angle-based physics chains, and the
 // breath pair drives the 10 breath-based ones (hair, skirt, tail, arms, body).
@@ -57,6 +64,8 @@ export class JellyfishRenderer extends CubismUserModel {
     this.hiddenExpressions = new Set();
     this.hiddenValues = new Map();
     this.hiddenOverrides = new Map();
+    // presetId -> fade factor 0..1, advanced one frame at a time by applyHiddenParameters.
+    this.hiddenFade = new Map();
     this.expressionParameterIds = new Map();
     this.expressionParameters = new Set(); this.expressionValues = new Map(); this.previewParameters = new Set(); this.appearanceParameters = new Set();
     this.interaction = new InteractionMotion(); this.elapsed = 0; this.gestureManager = new CubismExpressionMotionManager(); this.previewManager = new CubismExpressionMotionManager(); this.framing = 'full';
@@ -190,25 +199,107 @@ export class JellyfishRenderer extends CubismUserModel {
       const item = presets.get(presetId);
       const name = item?.expressionName;
       if (!name) continue;
-      for (const parameter of this.expressionParameterIds.get(name) ?? []) {
-        // An explicit policy value wins; otherwise use the value the expression itself would set,
-        // which is exactly what activating that expression does.
-        const value = Number.isFinite(chosen) && chosen !== 0 ? chosen : this.expressionParameterValues.get(name)?.get(parameter) ?? 0;
-        result.set(parameter, value);
-      }
+      const parameters = this.expressionParameterIds.get(name);
+      if (!parameters?.length) continue;
+      result.set(presetId, {
+        // Non-zero is an absolute value from the policy; 0 means "the value the expression itself
+        // sets", which is resolved per parameter below.
+        chosen: Number.isFinite(chosen) ? chosen : 0,
+        parameters,
+      });
     }
     return result;
   }
-  /** Force every hidden expression's parameters on this frame. The render loop and reset() both
-   *  restore these parameters, so a one-off write would be undone; re-applying every frame is what
-   *  activating the expression would do, which is why this is the mechanism that actually hides it. */
-  applyHiddenParameters() {
-    if (!this._model) return;
-    const forced = this.hiddenParameters();
-    this.hiddenOverrides = forced;
-    for (const [id, value] of forced) this.set(id, (this.rigBaseline?.get(id) ?? 0) + value);
+  /** The absolute value a "持续启用" choice holds one parameter at.
+   *
+   *  Two sources, with different units, which is worth spelling out because mixing them silently
+   *  writes the wrong number:
+   *   - an explicit policy value (hiddenValues) is already the absolute parameter value;
+   *   - otherwise the expression's own Value is used, as `rigBaseline + Value` — the expression is an
+   *     offset from the rig's neutral pose, so the absolute value it produces is baseline plus itself.
+   *  A baseline of 0 makes the two coincide, which is why the distinction is easy to miss. */
+  hiddenTarget(expressionName, parameter, chosen) {
+    if (chosen !== 0) return chosen;
+    const baseline = this.rigBaseline?.get(parameter) ?? 0;
+    return baseline + (this.expressionParameterValues.get(expressionName)?.get(parameter) ?? 0);
   }
-  /** Report the hidden-parameter decision once per policy change (never per frame). */
+  /** Force every hidden expression's parameters on this frame, fading each one in AND out.
+   *
+   *  The write has to happen EVERY frame: updateView() restores `this.defaults` at the top of each
+   *  frame, so a one-off write is gone by the next one. That is also why the fade lives here rather
+   *  than being a separate animation — the blend factor is what varies per frame, not the write.
+   *
+   *  Each frame nudges the parameter from the rig's baseline toward the held value, so at factor 0 the
+   *  rig is untouched and at 1 the expression is fully applied. The factor advances by delta, so the
+   *  transition lasts the configured number of seconds at any frame rate.
+   *
+   *  Unticking needs the fade too, and that is the harder half: the preset has already left the policy
+   *  by then, so the value to fade back from has to be remembered. It goes in `hiddenOut` and stays
+   *  there until its factor reaches 0, which is what lets the release take the same 0.5s as the
+   *  activation instead of snapping to the neutral pose in one frame. */
+  applyHiddenParameters(delta = 0) {
+    if (!this._model) return;
+    const grouped = this.hiddenParameters();
+    const step = HIDDEN_EXPRESSION_FADE_SECONDS > 0 ? delta / HIDDEN_EXPRESSION_FADE_SECONDS : 1;
+    const progress = this.hiddenFade ??= new Map();
+    const out = this.hiddenOut ??= new Map();
+    // Start a fade-out for anything that was being forced and no longer is. The remembered target is
+    // re-resolved from the last factor, so a choice released mid-fade continues from where it was
+    // rather than from full strength.
+    for (const [presetId, at] of progress) {
+      if (grouped.has(presetId)) continue;
+      const item = presets.get(presetId);
+      const parameters = item?.expressionName ? this.expressionParameterIds.get(item.expressionName) : undefined;
+      if (!parameters?.length) { progress.delete(presetId); continue; }
+      const held = out.get(presetId);
+      // Re-remember only while the remembered factor is still ahead of where the release has got to.
+      if (!held || at < held.at - 1e-9) {
+        out.set(presetId, { at, targets: new Map(parameters.map(name => [name, this.forcedValue(name)])) });
+      }
+    }
+    // The key carries the target as well as the preset, so changing a value starts a fresh fade
+    // instead of jumping, while re-asserting the same choice leaves the factor where it is.
+    const wanted = new Set([...grouped.keys()]);
+    // Drop tracking for choices that are no longer forced, so this map cannot grow without bound.
+    for (const key of [...progress.keys()]) if (!wanted.has(key)) progress.delete(key);
+
+    const forced = new Map();
+    for (const [presetId, { chosen, parameters }] of grouped) {
+      const at = progress.get(presetId) ?? 0;
+      const fade = at >= 1 ? 1 : Math.min(1, at + step);
+      progress.set(presetId, fade);
+      for (const name of parameters) {
+        const target = this.hiddenTarget(presets.get(presetId)?.expressionName, name, chosen);
+        const baseline = this.rigBaseline?.get(name) ?? 0;
+        const blended = baseline + (target - baseline) * fade;
+        forced.set(name, blended);
+        this.set(name, blended);
+      }
+    }
+    // Fade the released ones back to the baseline, and forget them once they arrive.
+    for (const [presetId, entry] of out) {
+      if (progress.has(presetId)) { out.delete(presetId); continue; }
+      const fade = entry.at <= 0 ? 0 : Math.max(0, entry.at - step);
+      if (fade <= 0) { out.delete(presetId); continue; }
+      entry.at = fade;
+      for (const [name, target] of entry.targets) {
+        const baseline = this.rigBaseline?.get(name) ?? 0;
+        const blended = baseline + (target - baseline) * fade;
+        forced.set(name, blended);
+        this.set(name, blended);
+      }
+    }
+    this.hiddenOverrides = forced;
+  }
+  /** A parameter's currently forced value, or its baseline when nothing is forcing it. Used to
+   *  remember what a released choice was holding so it can be faded back from there. */
+  forcedValue(name) {
+    return this.hiddenOverrides?.get(name) ?? this.rigBaseline?.get(name) ?? 0;
+  }
+  /** Report the hidden-parameter decision once per policy change (never per frame).
+   *
+   *  This fires as the choice is applied, so it carries the value being started toward, not the
+   *  transition — the fade itself is observable through the parameter values the renderer draws. */
   reportHiddenParameters() {
     const forced = this.hiddenOverrides ?? new Map();
     this.report({ type: 'hidden-parameters', expressions: [...(this.hiddenExpressions ?? [])],
@@ -376,7 +467,7 @@ export class JellyfishRenderer extends CubismUserModel {
     if (!this.previewMode) this.blendParameters(this.expressionParameters, this.expressionValues, delta);
     // Held last: the reset above and the expression blend both touch these parameters, so a hidden
     // expression has to win on every frame to actually stay hidden.
-    if (!this.previewMode && this.hiddenOverrides?.size) this.applyHiddenParameters();
+    if (!this.previewMode && this.hiddenOverrides?.size) this.applyHiddenParameters(delta);
     const active = !this.previewMode && view.state === 'speaking';
     // Cursor following is the operator's explicit choice, so it must not depend on the optional
     // proc-head/proc-body catalog rows: those id's exist only for rigs that ship them, and an

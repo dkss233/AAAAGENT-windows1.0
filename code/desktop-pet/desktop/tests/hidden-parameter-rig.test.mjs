@@ -55,8 +55,10 @@ test('an explicit hidden value overrides the expression value', () => {
 
 test('unticking stops holding the parameter', () => {
   assert.equal(policy(3, [], {}), true);
-  frames(5);
-  assert.equal(rig.hiddenOverrides.size, 0, '取消后不应再有强制覆盖');
+  // The release fades out over HIDDEN_EXPRESSION_FADE_SECONDS rather than snapping, so the override
+  // survives until the factor reaches 0 — about 15 frames at 30fps. Run past that, then check.
+  frames(30);
+  assert.equal(rig.hiddenOverrides.size, 0, '取消并淡出后不应再有强制覆盖');
   rig.reset();
   frames(5);
   assert.equal(Number(rig.get(targetParameter).toFixed(4)), Number(baseline.toFixed(4)), '取消后回到模型基线');

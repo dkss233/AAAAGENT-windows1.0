@@ -6,6 +6,7 @@ import { WorkCard } from './work-card.mjs';
 import { DesktopWorkbenchCard } from './workbench-card.mjs';
 import { installDisplayControls } from './display-controls.mjs';
 import { installPetWindowControls } from './pet-window-controls.mjs';
+import { applyWheel, createWheelZoom, syncWheelZoom } from './zoom-wheel.mjs';
 import { toDeviceFailure, deviceFailureMessage } from '../media/capture-errors.ts';
 import { PressToTalk, validVoiceKey } from './press-to-talk.ts';
 import { DesktopChatLog } from './chat-log.ts';
@@ -605,9 +606,11 @@ character.addEventListener('pointerup', endMoveDrag, { capture: true });
 character.addEventListener('pointercancel', endMoveDrag, { capture: true });
 // Long-press the move button to reset the model to its default position and size. A short
 // press still toggles the adjust mode; only a press held past the threshold resets.
-// Model-only scale for movement mode, mirrored from the latest display config so it
-// survives a renderer switch, and reset by the long press below.
-let wheelScale = Number.isFinite(lastDisplayConfig?.characterScale) ? lastDisplayConfig.characterScale : 1;
+// Wheel-zoom state for both modes. Movement-mode model scale and non-movement-mode window zoom are
+// separate quantities in the shell (prefs.characterScale and prefs.width) and must stay separate here
+// too: one shared accumulator made each mode start from the size the other one was left at, so
+// switching modes snapped the model or the window to the other mode's scale before it zoomed.
+let wheelZoom = createWheelZoom(lastDisplayConfig);
 const MOVE_LONG_PRESS_MS = 600;
 let movePressTimer, moveLongPressFired = false;
 const moveButton = $('model-move');
@@ -621,7 +624,9 @@ moveButton.addEventListener('pointerdown', event => {
     // The gesture belongs to whichever layer the button is currently driving, so the
     // reset is routed by mode: window framing when off, model framing when on.
     native('shell', { type: moveMode ? 'reset_model_framing' : 'reset_window_framing' });
-    if (moveMode) wheelScale = 1;
+    // The shell just reset its own value; re-seed both from the config that comes back, so the next
+    // notch continues from the reset size instead of the size that was on screen before the reset.
+    wheelZoom = syncWheelZoom(wheelZoom, lastDisplayConfig);
   }, MOVE_LONG_PRESS_MS);
 });
 for (const type of ['pointerup', 'pointercancel', 'pointerleave']) moveButton.addEventListener(type, clearMovePress);
@@ -675,10 +680,9 @@ window.WhaleDesktop = { express: async payload => {
   wheelTarget.addEventListener('wheel', event => {
     if (petWindow.collapsed) return;
     event.preventDefault();
-    wheelScale = Math.min(2.5, Math.max(0.5, wheelScale * Math.exp(-event.deltaY / 600)));
-    // Movement mode: the model scales, nothing else does.
-    if (moveMode) native('shell', { type: 'set_character_scale', scale: wheelScale });
-    else native('shell', { type: 'zoom_model', scale: wheelScale });
+    // One message per notch, for the mode that is active. The other mode's value is untouched.
+    const action = applyWheel(wheelZoom, { moveMode, deltaY: event.deltaY });
+    if (action) native('shell', action);
   }, { passive: false });
 }
 $('model-kind').onchange = () => { const kind = $('model-kind').value; if(window.desktopHost) native('shell',{type:'set_renderer',rendererKind:kind}); else void selectRenderer(kind); };

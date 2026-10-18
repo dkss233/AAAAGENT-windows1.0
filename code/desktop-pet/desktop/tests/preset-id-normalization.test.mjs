@@ -3,6 +3,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { normalizePresentationIntent } from '../../contracts/presentation.ts';
 
 const cases = [
@@ -39,9 +42,21 @@ test('an unknown preset id collapses to explicit neutral, not to a string', () =
   assert.equal(resolved.presetId, null);
 });
 
-test('the catalog ships a usable enabled set for this rig', async () => {
-  const catalog = JSON.parse(await readFile('desktop/assets/jellyfish/presets.json', 'utf8'));
-  const stored = JSON.parse(await readFile('D:\\AAAAGENT\\windows\\.local\\data\\presentation-settings.json', 'utf8')).models['local-model'];
+// desktop/tests -> desktop -> code/desktop-pet -> code -> windows (the project root). Derived rather
+// than hard-coded: this used to name one machine's install directory outright, so on any other machine
+// the test died with a bare ENOENT instead of saying what it needed.
+//
+// Every path in this file is hung off projectRoot. Mixing one relative read in with these made the test
+// pass only when the process happened to start in code/desktop-pet — it works today because the desktop
+// shell sets that cwd, which is an implementation detail, not a promise. Deriving from import.meta.url
+// depends on nothing but where the file sits.
+const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
+const catalogFile = resolve(projectRoot, 'code', 'desktop-pet', 'desktop', 'assets', 'jellyfish', 'presets.json');
+const settingsFile = resolve(projectRoot, '.local', 'data', 'presentation-settings.json');
+
+test('the catalog ships a usable enabled set for this rig', { skip: existsSync(settingsFile) ? false : 'no presentation settings on this machine' }, async () => {
+  const catalog = JSON.parse(await readFile(catalogFile, 'utf8'));
+  const stored = JSON.parse(await readFile(settingsFile, 'utf8')).models['local-model'];
   console.log('  emotions: ' + JSON.stringify(stored.emotions));
   for (const [emotion, id] of Object.entries(stored.emotions)) {
     const item = catalog.items.find((i) => i.id === id);
