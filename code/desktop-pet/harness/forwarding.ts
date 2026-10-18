@@ -323,5 +323,27 @@ export class HarnessForwarding implements ForwardingPort {
     const tick = () => { void this.track(this.observeUsage()).catch(() => this.warnUsage()); };
     this.observationTimer = setInterval(tick, intervalMs); this.observationTimer.unref(); tick();
   }
-  async close() { clearInterval(this.observationTimer); this.observationTimer = undefined; await Promise.allSettled([...this.active]); this.options.receipts.close(); }
+  /**
+   * Race a promise against a timer that must not outlive the race: a ref'd setTimeout here kept the
+   * backend's event loop alive for its full duration, so every quit waited that long before exiting.
+   */
+  private bounded(promise: Promise<unknown>, ms: number): Promise<void> {
+    return new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, ms); timer.unref();
+      void promise.finally(() => { clearTimeout(timer); resolve(); });
+    });
+  }
+  async close() {
+    clearInterval(this.observationTimer); this.observationTimer = undefined;
+    // Quitting must not wait for a receipt check: the desktop polls every few seconds, and the
+    // backend cannot exit until close() resolves, so an in-flight check would hold the window open.
+    await this.bounded(Promise.allSettled([...this.active]), 300);
+    if (this.active.size === 0) this.options.receipts.close();
+    // The Windows Codex connection owns an app-server child whose stdio pipes keep the backend's
+    // event loop alive; shutdown must close it. Bounded, because close() waits up to 3 s for exit.
+    try {
+      const closing = (this.options.codex as { close?: () => Promise<void> | void }).close;
+      if (closing) await this.bounded(Promise.resolve(closing.call(this.options.codex)).catch(() => undefined), 500);
+    } catch { /* best effort */ }
+  }
 }

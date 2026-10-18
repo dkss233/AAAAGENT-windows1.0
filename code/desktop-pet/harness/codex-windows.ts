@@ -47,6 +47,8 @@ export class CodexWindowsConnection extends CodexAppConnection {
     for (const waiter of this.pending.values()) { clearTimeout(waiter.timer); waiter.reject(new CodexAppError('unavailable')); }
     this.pending.clear(); this.child = undefined; this.starting = undefined;
   }
+  /** The app-server child's stdio pipes are what kept the backend alive; close() must own them. */
+  get processId(): number | undefined { return this.child?.pid; }
   private write(value: object) {
     if (!this.child || !this.child.stdin.writable) throw new CodexAppError('unavailable');
     this.child.stdin.write(JSON.stringify(value) + '\n');

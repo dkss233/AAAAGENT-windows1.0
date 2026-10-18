@@ -1,5 +1,6 @@
 import { LocalAsrProvider, LocalTtsProvider, createCustomTtsProvider } from '../providers/local-speech.js';
 import { selectTrialDialogue } from './dialogue-selection.js';
+import { openLocalSocialConnection, type LocalSocialConnection } from '../companion/cloud/local.js';
 import { isOutside, isPrivateFileSync } from '../core/platform-files.js';
 import { countRequestInput,inputBudgetInfo,DEFAULT_CURRENT_EMOTION_RESERVE_TOKENS } from '../providers/input-count.js';
 import { normalizeApiKey, MAX_API_KEY_FILE_BYTES } from '../core/api-key.js';
@@ -234,6 +235,7 @@ export async function startTrialBackend(environment: NodeJS.ProcessEnv = process
   let wechat: WeChatService | undefined;
   let wake: WakeManager | undefined;
   let managementForget: StrictManagementForget | undefined;
+  let socialConnection: LocalSocialConnection | undefined;
   let memoryImport: SqliteMemoryImportManagement | undefined;
   let desktopWork: import('../contracts/desktop-work.js').DesktopWorkPort | undefined;
   let desktopWorkbench: DesktopWorkbench | undefined;
@@ -286,8 +288,10 @@ export async function startTrialBackend(environment: NodeJS.ProcessEnv = process
     }
     const presentation = await PresentationSettingsStore.open(resolve(configuration.projectRoot, '.local/data/presentation-settings.json'),
       await readPresentationCatalog(configuration.projectRoot), policy => process.stdout.write(JSON.stringify({ channel: 'presentation_policy', policy }) + '\n'));
+    try { if(configuration.purpose==='user-trial')socialConnection=openLocalSocialConnection(configuration.projectRoot); }
+    catch { process.stderr.write('Social memory connection unavailable; private companion memory remains available.\n'); }
     const {dialogue,foregroundBudget}=selectTrialDialogue(configuration,()=>endpoint('dialogue'),transport,
-      ()=>presentation.allowedIntent(),settings.effective.context.targetInputTokens,settings.effective.providers.dialogue.temperature);
+      ()=>presentation.allowedIntent(),settings.effective.context.targetInputTokens,settings.effective.providers.dialogue.temperature,undefined,socialConnection);
     const strictProvider=new StrictTrialMemoryProvider(store, endpoint('memory_turn'), transport, configuration.phaseId, evidence, configuration.models.memory_turn.thinking,
       'real_provider', configuration.models.memory_turn.contextWindowTokens);
     const memory = new ObservedTrialMemory(store, {
@@ -441,8 +445,43 @@ export async function startTrialBackend(environment: NodeJS.ProcessEnv = process
     const close = async () => {
       if (stopping) return; stopping = true; clearInterval(cleanupTimer); lines.close(); process.stdin.pause();
       managementForget?.close();
-      try { await wake?.close(); await wechat?.close(); await desktopWork?.close(); await desktopWorkbench?.close(); await management?.close(); await managementForget?.drain(); await settings.drain(); await presentation.drain(); }
-      finally { try { await session!.close(); } finally { await release(); } }
+      // Shutdown timing: the window stays open until this promise settles, so one slow step is the
+      // difference between an instant quit and several seconds. One stderr line per step, always on.
+      const exitStarted = Date.now();
+      const exitStep = async (name: string, run: () => Promise<unknown>) => {
+        const at = Date.now();
+        try { await run(); } finally { process.stderr.write('[exit] ' + name + ' ' + (Date.now() - at) + 'ms\n'); }
+      };
+      try {
+        await exitStep('wake', async () => { await wake?.close(); });
+        await exitStep('wechat', async () => { await wechat?.close(); });
+        await exitStep('desktopWork', async () => { await desktopWork?.close(); });
+        await exitStep('desktopWorkbench', async () => { await desktopWorkbench?.close(); });
+        await exitStep('management', async () => { await management?.close(); });
+        await exitStep('managementForget', async () => { await managementForget?.drain(); });
+        await exitStep('settings', async () => { await settings.drain(); });
+        await exitStep('presentation', async () => { await presentation.drain(); });
+      }
+      finally {
+        try { await exitStep('session', async () => { await session!.close(); }); }
+        finally { try { await exitStep('social', async () => { await socialConnection?.close(); }); }
+          finally {
+            process.stderr.write('[exit] total ' + (Date.now() - exitStarted) + 'ms\n');
+            try {
+              // Describe what keeps the loop alive, so the root cause can be fixed instead of masked.
+              const describe = (h: any): string => {
+                const name = h?.constructor?.name ?? typeof h;
+                if (name === 'Socket') return 'Socket:' + (h.localPort ?? '?') + '->' + (h.remoteAddress ?? h.remoteFamily ?? '?') + ':' + (h.remotePort ?? '?') + '/' + (h.readyState ?? '?');
+                if (name === 'ChildProcess') return 'Child:' + (h.pid ?? '?') + ':' + String(h.spawnfile ?? '') + ':' + (Array.isArray(h.spawnargs) ? h.spawnargs.slice(1, 3).join(' ') : '');
+                if (name === 'Server') return 'Server:' + (h.listening ? 'listening' : 'closed');
+                return name;
+              };
+              const handles = ((process as any)._getActiveHandles() as any[]).map(describe).join(' | ');
+              process.stderr.write('[exit] handles ' + handles + '\n');
+            } catch { /* diagnostics only */ }
+            await release();
+          } }
+      }
     };
     let submitted = false;
     lines.on('line', line => {
@@ -458,23 +497,26 @@ export async function startTrialBackend(environment: NodeJS.ProcessEnv = process
       try { if(wake?.receive(JSON.parse(line)))return; } catch { /* Original protocol validator owns non-wake input. */ }
       void session!.receiveLine(line);
     });
-    lines.on('close', () => { void close(); });
-    process.once('SIGTERM', () => { void close(); }); process.once('SIGINT', () => { void close(); });
+    lines.on('close', () => { void close().finally(() => {
+      // Cleanup is finished; a lingering socket or child keeps the loop alive, and the host would wait
+      // its 10 s deadline and SIGKILL us, which looks like a hang in the window. Exit on purpose,
+      // preserving an exit code a smoke run may have set.
+      // Watchdog, not an immediate exit: if anything still holds the loop open, end the process after
+      // 500 ms instead of letting the host wait its 10 s deadline and SIGKILL us. A backend that closed
+      // everything exits on its own first, so this timer usually never fires.
+      setTimeout(() => process.exit(process.exitCode ?? 0), 500).unref();
+    }); });
+    process.once('SIGTERM', () => { void close().finally(() => setImmediate(() => process.exit(process.exitCode ?? 0))); });
+    process.once('SIGINT', () => { void close().finally(() => setImmediate(() => process.exit(process.exitCode ?? 0))); });
   } catch (error) {
     managementForget?.close();
     await wake?.close(); await wechat?.close(); await desktopWorkbench?.close(); await management?.close(); await managementForget?.drain();
     await memoryImport?.close();
     if (session) await session.close(); else store?.close();
-    await release(); throw error;
+    try { await socialConnection?.close(); } finally { await release(); } throw error;
   }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  // Report the real reason. A generic line here once hid a startup failure behind "配置与程序版本"
-  // for every cause, which is useless to both the operator and anyone diagnosing a report.
-  startTrialBackend().catch((error: unknown) => {
-    process.stderr.write('试用后端未启动：' + (error instanceof Error ? error.message : String(error)) + '\n');
-    if (error instanceof Error && error.stack) process.stderr.write(error.stack + '\n');
-    process.exitCode = 1;
-  });
+  startTrialBackend().catch(() => { process.stderr.write('试用后端未启动，请检查已登记的配置与程序版本。\n'); process.exitCode = 1; });
 }

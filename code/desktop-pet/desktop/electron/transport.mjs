@@ -73,12 +73,14 @@ export class BackendConnection {
     const child = this.child; this.child = null;
     if (!child) return Promise.all(this.closing);
     // EOF lets the backend flush SQLite and remove its own lock on Windows.
-    const done = new Promise(resolve => {
-      if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
-      const timer = setTimeout(() => child.kill('SIGKILL'), this.shutdownTimeoutMs);
-      child.once('exit', () => { clearTimeout(timer); resolve(); });
-      child.once('error', () => { clearTimeout(timer); resolve(); });
-    });
+    const closedAt = Date.now();
+      const done = new Promise(resolve => {
+        if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+        const timer = setTimeout(() => child.kill('SIGKILL'), this.shutdownTimeoutMs);
+        const settle = () => { clearTimeout(timer); process.stderr.write('[exit] backend process ' + (Date.now() - closedAt) + 'ms\n'); resolve(); };
+        child.once('exit', settle);
+        child.once('error', settle);
+      });
     this.closing.add(done);
     void done.then(() => this.closing.delete(done));
     child.stdin.end();

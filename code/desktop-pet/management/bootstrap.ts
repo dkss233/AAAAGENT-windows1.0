@@ -280,8 +280,15 @@ export async function startRuntimeManagement(base: TrialConfiguration, configFil
           return harness.submitWork(sessionId, requestId, text);
         },
         workReceipt: async (sessionId: string, requestId: string) => {
-          const started = await requireHost(log, false);
-          if (!started) return { status: 'unknown' as const, detail: '暂时无法核实这次任务的状态；不会自动重发。' };
+          // Reading a receipt must never start the Host: the desktop polls this every few seconds, so
+          // starting one here would wake a ~420 MB process while the pet is idle - and block shutdown
+          // on an in-flight poll. A cold Host just cannot verify, which is the honest answer.
+          const current = currentEngineProfile();
+          if (!current) return { status: 'unknown' as const, detail: '暂时无法核实这次任务的状态；不会自动重发。' };
+          const { harnessHostAliveCached } = await import('../harness/on-demand.js');
+          if (!(await harnessHostAliveCached(current.dshWebLog))) {
+            return { status: 'unknown' as const, detail: 'Harness 主机未启动，暂时无法核实这次任务的状态；不会自动重发。' };
+          }
           return harness.workReceipt(sessionId, requestId);
         },
       },
