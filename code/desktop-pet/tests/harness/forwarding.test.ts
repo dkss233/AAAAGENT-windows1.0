@@ -144,6 +144,24 @@ test('late unknown observation cannot downgrade a concurrent exact completion', 
  assert.equal(f.state.sends.length,1);assert.equal(f.state.hostCalls,0);
 });
 
+test('the snapshot tells the console whether an engine runtime is installed',async t=>{
+ const f=await fixture(t);
+ const base={ projects:f.projects, presetId:'desktop-pet-relay-v1', workspace:f.projectRoot, compatible:async()=>true, presetReady:async()=>false,
+   harness:{ async probe(){ return { state:'unavailable' as const, observedAt:'now', codexDelivery:'unverified' as const }; }, async createRelaySession(){}, async submitConfirmedOperation(){} },
+   codex:{ list:()=>[], discover:async()=>({available:true}), async send(){ throw new Error('unused'); }, async receipt(){ throw new Error('unused'); } } };
+ // The receipt store only accepts its canonical filename, so each service gets its own directory.
+ await mkdir(join(f.root,'engine-absent')); await mkdir(join(f.root,'engine-live'));
+ const absent=new HarnessForwarding({ ...base, receipts:new ForwardReceipts(join(f.root,'engine-absent','harness-relay.sqlite')), enginePresent:false });
+ const live=new HarnessForwarding({ ...base, receipts:new ForwardReceipts(join(f.root,'engine-live','harness-relay.sqlite')), enginePresent:()=>true });
+ // Closed inside the body: the fixture's own cleanup removes this directory, and an open SQLite
+ // handle would turn that into EBUSY on Windows.
+ try{
+  assert.equal((await absent.snapshot()).connection.engine,'absent');
+  // A getter is re-read on every snapshot, so an install finished while the console is open shows up.
+  assert.equal((await live.snapshot()).connection.engine,'present');
+ } finally { await absent.close(); await live.close(); }
+});
+
 test('target search advertises and requests the same 1000-item UI contract',async t=>{
  const f=await fixture(t),service=f.service();const result=await service.targets('synthetic search');assert.equal(result.limit,1000);assert.deepEqual(f.state.targetReads,[{query:'synthetic search',limit:1000}]);assert.equal(result.items.length,1);assert.equal(f.state.sends.length,0);
 });

@@ -98,7 +98,32 @@ export class HarnessConnection {
     return (await this.launchEndpoint()).origin + '/';
   }
 
+  /**
+   * The launcher URL. A browser must visit this once per Host activation: the web app authenticates a
+   * browser with a cookie signed by this activation's secret and bound to the exact host:port, so a
+   * clean deep link alone is rejected with "reopen the URL printed by dsh web". Treat it as a
+   * credential - it is handed to the OS opener, never stored in a receipt or returned to the page.
+   */
+  async workAuthUrl(): Promise<string> {
+    return (await this.launchEndpoint()).href;
+  }
+
   /** Enabled only after the pinned native navigation extension is installed; binding comes from the original T3 reader. */
+  /**
+   * Deep link for a session we already know the id of (older receipts carry no stored link).
+   * The working directory and preset come from the Host's own list, never from a guess.
+   */
+  async workSessionUrlById(sessionId: string): Promise<string> {
+    if (!nativeId(sessionId)) throw new HarnessConnectionError('incompatible');
+    const endpoint = await this.launchEndpoint();
+    const capability = typeof this.nativeNavigationVersion === 'function'
+      ? await this.nativeNavigationVersion(endpoint.origin) : this.nativeNavigationVersion;
+    const listed = await this.call('session/list', { _request: {} }, this.timeoutMs, endpoint);
+    const row = Array.isArray(listed?.items) ? listed.items.find((item: any) => item?.sessionId === sessionId) : undefined;
+    if (!row || typeof row.cwd !== 'string' || typeof row?.projections?.values?.agentPreset !== 'string') throw new HarnessConnectionError('incompatible');
+    return this.workSessionUrl({ sessionId, cwd: row.cwd, preset: row.projections.values.agentPreset });
+  }
+
   async workSessionUrl(binding: DshEntryBinding): Promise<string> {
     if (this.nativeNavigationVersion === 0) throw new HarnessConnectionError('incompatible');
     const target = { ...binding };

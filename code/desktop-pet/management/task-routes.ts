@@ -26,7 +26,13 @@ export async function taskRoute(req: IncomingMessage, url: URL, tasks: TaskManag
     respond(await tasks.snapshot()); return true;
   }
   if (url.pathname === '/api/tasks/prepare') {
-    const target = object(b.target); const input: ForwardPrepare = { text: text(b.text, 20000), target: { threadId: text(target.threadId, 200), hostId: text(target.hostId, 200) },
+    // The executor decides the shape: a Harness task has no native target, and a Codex task must have
+    // one. Forcing a target here made every Harness prepare fail validation as "任务字段无效".
+    const executor = b.executor === 'harness' ? 'harness' : 'codex';
+    // A Harness task has no native target at all, so it must not even parse one.
+    const target = executor === 'codex' ? object(b.target) : undefined;
+    const input: ForwardPrepare = { text: text(b.text, 20000), executor,
+      ...(target ? { target: { threadId: text(target.threadId, 200), hostId: text(target.hostId, 200) } } : {}),
       ...(b.projectId === undefined ? {} : { projectId: text(b.projectId, 200), projectVersion: version(b.projectVersion) }) };
     if (b.projectId === undefined && b.projectVersion !== undefined) return invalid();
     respond(await tasks.prepare(input)); return true;

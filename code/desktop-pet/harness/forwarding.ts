@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { ManagementError } from '../contracts/management.js';
+import { WORK_PRESET_ID } from './preset.js';
 import { FORWARD_TARGET_LIMIT } from '../contracts/harness.js';
 import type { ForwardingPort, ForwardPrepare, ForwardRequest, ForwardSnapshot, ForwardTargets } from '../contracts/harness.js';
 import type { ProjectIndexPort } from '../contracts/projects.js';
@@ -19,6 +20,11 @@ interface Options {
   harness: Pick<HarnessConnection, 'probe' | 'createRelaySession' | 'submitConfirmedOperation'> & Partial<Pick<HarnessConnection, 'relayMetrics' | 'relayMetricsBatch' | 'requestTerminal'>>;
   nativeWork?: {
     workHostUrl?():Promise<string>;
+    workAuthUrl?():Promise<string>;
+    /** Clean deep link for one exact session; validated against the Host's own session list. */
+    workSessionUrl?(binding:{sessionId:string;cwd:string;preset:string}):Promise<string>;
+    /** Same link resolved from the Host list, for receipts recorded before the link was stored. */
+    workSessionUrlById?(sessionId:string):Promise<string>;
     createWorkSession(sessionId:string,cwd:string):Promise<void>;
     submitWork(sessionId:string,requestId:string,text:string):Promise<void>;
     workReceipt(sessionId:string,requestId:string):Promise<{status:'working'|'approval'|'completed'|'failed'|'unknown';result?:string;detail?:string;sessionUrl?:string;approvalTools?:string[]}>;
@@ -31,6 +37,10 @@ interface Options {
   workspace: string;
   /** Starts the Harness host on the operator's explicit request; absent when no engine profile exists. */
   startHarness?(): Promise<boolean>;
+  /** Whether an engine runtime is installed. A getter, because the console can install one live. */
+  enginePresent?: boolean | (() => boolean);
+  /** How to hand a URL to the operator's browser. Injectable so the open order stays testable. */
+  openUrl?(url: string): Promise<void>;
   recordMetrics?(metrics: RelayMetrics): Promise<void>;
 }
 const invalid = (): never => { throw new ManagementError('invalid_request', '请核对任务正文、现有任务和项目。'); };
@@ -48,7 +58,9 @@ export class HarnessForwarding implements ForwardingPort {
   records(): ForwardRequest[] { return this.options.receipts.list().map(publicForward); }
   async snapshot(): Promise<ForwardSnapshot> {
     const [host, app, preset] = await Promise.all([this.options.harness.probe(), this.options.compatible(), this.options.presetReady()]);
-    return { requests: this.options.receipts.list().map(publicForward), connection: { harness: host.state, codex: app ? 'compatible' : 'incompatible', preset: preset ? 'ready' : 'unavailable' } };
+    const engine = typeof this.options.enginePresent === 'function' ? this.options.enginePresent() : this.options.enginePresent;
+    return { requests: this.options.receipts.list().map(publicForward), connection: { harness: host.state, codex: app ? 'compatible' : 'incompatible', preset: preset ? 'ready' : 'unavailable',
+      engine: engine === false ? 'absent' : 'present' } };
   }
   /** Explicit start, so the console can warm the host without sending any work. */
   async startHarness(): Promise<boolean> { return this.options.startHarness ? this.options.startHarness() : false; }
@@ -96,12 +108,50 @@ export class HarnessForwarding implements ForwardingPort {
     const frozen=await this.validatePrepare(input);
     return publicForward(this.options.receipts.prepareDraft(draftId,expectedVersion,frozen));
   }
+  /** Host roots whose browser we already authenticated in this process, with the time we did it. */
+  private readonly authenticatedHosts=new Map<string,number>();
+  /**
+   * Open the native view for a confirmed work session.
+   *
+   * A deep link only works for a browser that already holds this activation's cookie, so the first
+   * open for a host also visits the launcher URL. That URL is a credential: it goes straight to the
+   * OS opener and never into a receipt, a page or a log.
+   */
   async openNative(id:string):Promise<void>{
     const row=this.options.receipts.get(id);
-    if(row.executor!=='harness'||!row.confirmedAt||!row.harnessSessionId||!this.options.nativeWork?.workHostUrl)invalid();
-    const url=new URL(await this.options.nativeWork!.workHostUrl!());
-    if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.pathname!=='/'||url.search||url.hash||url.username||url.password)invalid();
-    await openLocalUrl(url.toString());
+    const nativeWork=this.options.nativeWork;
+    if(row.executor!=='harness'||!row.confirmedAt||!row.harnessSessionId||!nativeWork?.workHostUrl)invalid();
+    const host=new URL(await nativeWork!.workHostUrl!());
+    if(host.protocol!=='http:'||host.hostname!=='127.0.0.1'||host.pathname!=='/'||host.search||host.hash||host.username||host.password)invalid();
+    const open=this.options.openUrl??openLocalUrl;
+    let target=this.#sessionLink(row.nativeSessionUrl);
+    // A receipt confirmed before links were stored still has its session id; resolve it live.
+    if(!target && nativeWork!.workSessionUrlById){
+      try{ target=this.#sessionLink(await nativeWork!.workSessionUrlById(row.harnessSessionId!)); }catch{ target=null; }
+    }
+    if(!target){await open(host.toString());return;}
+    const auth=nativeWork!.workAuthUrl ? await nativeWork!.workAuthUrl!().catch(()=>undefined) : undefined;
+    const now=Date.now();
+    for(const [origin,at] of this.authenticatedHosts) if(now-at>30*60*1000) this.authenticatedHosts.delete(origin);
+    if(auth && !this.authenticatedHosts.has(target.origin)){
+      const launcher=new URL(auth);
+      // Only the token URL authenticates; it must load (and set its cookie) before the deep link.
+      if(launcher.protocol==='http:'&&launcher.hostname==='127.0.0.1'&&launcher.pathname==='/'&&launcher.origin===target.origin){
+        await open(launcher.href);
+        this.authenticatedHosts.set(target.origin,now);
+        await new Promise(resolve=>setTimeout(resolve,1200));
+      }
+    }
+    await open(target.href);
+  }
+  /** A receipt carries a clean local deep link; anything else falls back to the bare Host root. */
+  #sessionLink(value:string|undefined):URL|null{
+    try{
+      const url=new URL(value??'');
+      if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.pathname!=='/'||url.search||url.username||url.password)return null;
+      if(!/^aaaagent-session=1&sid=[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:&|$)/.test(url.hash.slice(1)))return null;
+      return url;
+    }catch{return null;}
   }
   async confirm(id: string, expectedVersion: number, assertCurrent?: () => void): Promise<ForwardRequest> {
     assertCurrent?.();
@@ -135,7 +185,18 @@ export class HarnessForwarding implements ForwardingPort {
     return this.track((async () => {
       try {
         if(record.executor==='harness'){
-          await this.options.nativeWork!.createWorkSession(record.harnessSessionId!,record.project?.detailRef.rootPath??this.options.workspace);
+          const cwd=record.project?.detailRef.rootPath??this.options.workspace;
+          await this.options.nativeWork!.createWorkSession(record.harnessSessionId!,cwd);
+          // Record the clean deep link while the binding is known: the console's "view in Harness"
+          // needs it, and deriving it later would have to guess the working directory.
+          if(this.options.nativeWork!.workSessionUrl){
+            for(let attempt=0;attempt<4;attempt++){
+              const url=await this.options.nativeWork!.workSessionUrl({sessionId:record.harnessSessionId!,cwd,preset:WORK_PRESET_ID}).catch(()=>undefined);
+              if(url){this.options.receipts.mutate(id,row=>{row.nativeSessionUrl=url;});break;}
+              // The Host's session list can lag the create call; retry briefly instead of losing the link.
+              await new Promise(resolve=>setTimeout(resolve,500));
+            }
+          }
           const text=record.text+(record.project?'\n\n[Confirmed project reference]\n'+JSON.stringify(record.project)+'\nRead current project constraints as needed.':'');
           await this.options.nativeWork!.submitWork(record.harnessSessionId!,record.harnessRequestId,text);
           this.options.receipts.mutate(id,row=>{row.phase='accepted';row.detail='Harness正在执行；如需工具批准，请在原生会话中处理。';});
