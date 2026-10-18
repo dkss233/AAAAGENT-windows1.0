@@ -155,6 +155,13 @@ const within = (parent: string, path: string): boolean => {
 };
 
 /** Metadata validation only. This function never reads credentials, budgets, databases or devices. */
+export function requiredTrialRuntimeFiles(desktopHost?: 'electron' | 'macos'): string[] {
+  return ['dist/app/trial-backend.js', 'dist/app/trial-launcher.js', 'desktop/build/renderer.js',
+    ...(process.platform === 'win32' || desktopHost === 'electron'
+      ? ['desktop/electron/main.mjs', 'desktop/electron/preload.cjs', 'desktop/electron/transport.mjs', 'desktop/electron/layout.mjs', 'desktop/electron/assets.mjs', 'tools/management-url.mjs']
+      : ['desktop/build/星月陪伴.app/Contents/MacOS/DesktopPet'])];
+}
+
 export function validateTrialConfiguration(value: unknown): TrialConfiguration {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('试用配置尚未准备好。');
   const c = value as TrialConfiguration;
@@ -198,10 +205,7 @@ export function validateTrialConfiguration(value: unknown): TrialConfiguration {
   if (c.purpose === 'smoke-text' && (typeof c.smokeInput !== 'string' || !c.smokeInput.trim())) fail('无声文字阶段缺少固定的合成输入。');
   if (c.desktopHost !== undefined && !['electron', 'macos'].includes(c.desktopHost)) fail('桌面外壳配置无效。');
   if (c.outputMode !== undefined && c.outputMode !== 'voice' && c.outputMode !== 'text') fail('对话输出模式无效。');
-  const required = ['dist/app/trial-backend.js', 'dist/app/trial-launcher.js', 'desktop/build/renderer.js',
-    ...(process.platform === 'win32' || c.desktopHost === 'electron'
-      ? ['desktop/electron/main.mjs', 'desktop/electron/preload.cjs', 'desktop/electron/transport.mjs', 'desktop/electron/layout.mjs', 'desktop/electron/assets.mjs', 'tools/management-url.mjs']
-      : ['desktop/build/星月陪伴.app/Contents/MacOS/DesktopPet'])];
+  const required = requiredTrialRuntimeFiles(c.desktopHost);
   if (!c.runtimeFiles || typeof c.runtimeFiles !== 'object' || Array.isArray(c.runtimeFiles)
     || required.some(path => !c.runtimeFiles[`code/desktop-pet/${path}`])) fail('试用构建版本尚未登记。');
   for (const [path, digest] of Object.entries(c.runtimeFiles)) {

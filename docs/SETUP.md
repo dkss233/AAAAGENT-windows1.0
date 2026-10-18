@@ -2,6 +2,8 @@
 
 [项目首页](../README.md) · [English](#english)
 
+Windows 用户可直接交给本地助手执行[Agent 安装流程](../AGENT_INSTALL.md)。默认服务并非唯一选择；更换平台的配置范围与具体代码入口见[服务商迁移说明](PROVIDER_MIGRATION.md)。
+
 ## 编译后即可打开首次设置
 
 这是源码开发版。首次设置不要求已有 Key、音色或 JSON 配置；完整桌宠运行仍需自己有权使用的 Live2D 模型、Cubism SDK 和本机应用构建。供应商账户、外部执行器、素材与订阅均不随包提供。
@@ -15,6 +17,21 @@ npm run configure-local
 ```
 
 Windows PowerShell 使用 `npm.cmd`；系统和桌面构建要求见 [Windows 安装说明](../README-WINDOWS.md)。Mac 要求 Node.js 20.19+；原生桌面另需 Swift/Xcode Command Line Tools。保留设置窗口，打开它显示的本机链接。链接含会话授权，不要截图公开或转发。首次入口只启动本地设置服务，不会打开设备、登录账户或自动调用模型。已有配置时使用原桌宠入口，在控制台“模型与声音”中修改。
+
+## Windows 一键准备（可选）
+
+不想手动敲那三条命令时，用仓库根目录的脚本，行为与 `启动桌宠.cmd` 首次运行一致：
+
+~~~powershell
+# 只检查环境，不写配置、不装依赖，输出 JSON
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-windows.ps1 -CheckOnly
+# 只安装依赖并构建，不打开设置页
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-windows.ps1 -PrepareOnly
+~~~
+
+前提是 Windows x64、Node 22.12+（自带 npm）、完整仓库（`code/workbench` 与 `code/desktop-pet` 同级）。
+依赖走 npmmirror 镜像；`npm ci` 之后会自动补齐 Electron 运行时（Electron 44 没有 postinstall，缺了它窗口打不开），最后跑一次 `npm run doctor` 作诊断。
+退出码：0 成功、2 环境不满足、3 已有配置或实例在运行、4 下载或构建失败。
 
 ## Key、模型和自己的参考音频
 

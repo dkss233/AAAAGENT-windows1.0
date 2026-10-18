@@ -11,21 +11,13 @@ import { MEMORY_MAINTENANCE_PROMPT } from './memory-prompt.js';
 import { PRESENTATION_PRESET_IDS } from '../contracts/presentation.js';
 
 import { normalizeSpokenText } from './spoken-text.js';
+import type { SocialContextPort } from '../companion/cloud/protocol.js';
 
 
-/** A model that means "no preset" writes it in several ways; all of them mean absent. */
-const ABSENT_PRESET = new Set(['', 'null', 'none', 'undefined', 'nil']);
-function presetValue(raw: unknown): string | null | undefined {
-  if (raw === undefined) return undefined;
-  if (raw === null) return null;
-  const text = string(raw).trim();
-  return ABSENT_PRESET.has(text.toLowerCase()) ? null : text;
-}
 function expression(raw: unknown): ExpressionIntent {
   const value = object(raw);
   if (typeof value.intensity !== 'number' || !Number.isFinite(value.intensity) || value.intensity < 0 || value.intensity > 1) throw new Error('Invalid expression intensity');
-  const presetId = presetValue(value.presetId);
-  return { ...(presetId === undefined ? {} : { presetId }), emotion: string(value.emotion), intensity: value.intensity, delivery: string(value.delivery), gesture: value.gesture === null ? null : string(value.gesture) };
+  return { ...(value.presetId === undefined ? {} : { presetId: value.presetId === null ? null : string(value.presetId) }), emotion: string(value.emotion), intensity: value.intensity, delivery: string(value.delivery), gesture: value.gesture === null ? null : string(value.gesture) };
 }
 
 /** No output length cap is introduced; JSON mode is followed by local shape validation. */
@@ -33,11 +25,12 @@ export class JsonDialogueProvider implements DialogueProvider {
   constructor(private readonly config: EndpointConfig, private readonly transport = new ProviderTransport(),
     private readonly visualPolicy?: () => { presets: readonly { id: string; label: string }[] },
     private readonly clock: () => ReturnType<typeof hostClock> = hostClock,
-    private readonly requestOptions: DialogueRequestOptions = {}) {}
+    private readonly requestOptions: DialogueRequestOptions = {}, private readonly social?: SocialContextPort) {}
   private readonly frames=new Map<string,{input:Omit<DialogueRequest,'context'>;frame:DialogueRequestFrame}>();
   prepare(input:Omit<DialogueRequest,'context'>):void {
     const key=JSON.stringify(input.scope);
-    this.frames.delete(key);this.frames.set(key,{input:structuredClone(input),frame:{now:this.clock(),...(this.visualPolicy?{visual:structuredClone(this.visualPolicy())}:{})}});
+    const reference=this.social?.capture(input.scope.characterId);
+    this.frames.delete(key);this.frames.set(key,{input:structuredClone(input),frame:{now:this.clock(),...(reference?{social:structuredClone(reference)}:{}),...(this.visualPolicy?{visual:structuredClone(this.visualPolicy())}:{})}});
     if(this.frames.size>64)this.frames.delete(this.frames.keys().next().value!);
   }
   private frame(scope:DialogueRequest['scope'],text:string) {
@@ -64,8 +57,11 @@ export class JsonDialogueProvider implements DialogueProvider {
     const built=buildDialogueRequest(input,this.config,this.frame(input.scope,input.text).frame,this.requestOptions);
     if(countRequestInput({...built.body,model:this.config.model})>input.context.inputTokenBudget)throw Error('required_context_exceeds_budget');
     const {forgetting}=built;
+    const reference=this.frame(input.scope,input.text).frame.social;
+    if(reference&&!forgetting)this.social?.assertCurrent(reference);
     const raw = await this.transport.request(this.config, input.scope, 'dialogue', built.body, signal);
     checkAbort(signal);
+    if(reference&&!forgetting)this.social?.assertCurrent(reference);
     const reply = parseModelJson(completedText(raw)), text = normalizeSpokenText(string(reply.text), built.currentMessage);
     const intent = expression(reply.expression);
     // The assembled context omits this turn (memory/context.ts skips it), so the message identity is
@@ -75,11 +71,8 @@ export class JsonDialogueProvider implements DialogueProvider {
     if (this.visualPolicy) {
       const enabled = new Set(this.visualPolicy().presets.map(p => p.id));
       // Reread after model latency. Only the visual projection is filtered; words and TTS intent survive.
-      const usable = intent.presetId && PRESENTATION_PRESET_IDS.includes(intent.presetId as never) && enabled.has(intent.presetId);
-      // Omit the field entirely when no preset applies. A present-but-unusable id is defined as
-      // explicitly neutral, which would suppress the emotion's face and make a mapped expression
-      // look broken; the emotion projection is what the operator configured, so it must win.
-      return { scope: input.scope, text, expression: { ...intent, ...(usable ? { presetId: intent.presetId } : {}) }, ...(emotionAssessment?{emotionAssessment}:{}) };
+      const presetId = intent.presetId && PRESENTATION_PRESET_IDS.includes(intent.presetId as never) && enabled.has(intent.presetId) ? intent.presetId : null;
+      return { scope: input.scope, text, expression: { ...intent, presetId }, ...(emotionAssessment?{emotionAssessment}:{}) };
     }
     return { scope: input.scope, text, expression: intent, ...(emotionAssessment?{emotionAssessment}:{}) };
   }

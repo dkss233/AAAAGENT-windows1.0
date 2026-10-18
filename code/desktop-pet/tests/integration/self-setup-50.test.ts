@@ -8,6 +8,10 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { firstRunDraft, startFirstRunSetup } from '../../app/self-setup.js';
+import { prepareTrialLaunch, trialFiles } from '../../app/trial-launcher.js';
+import { requiredTrialRuntimeFiles } from '../../app/trial-config.js';
+import { assertCompanionDataConfiguration } from '../../app/companion-data.js';
+import { TrialAuthorizer } from '../../app/trial-authorizer.js';
 import { ManagementSettingsStore } from '../../management/settings-store.js';
 import { ManagedCredentialStore } from '../../management/credential-store.js';
 import { credentialRegistry } from '../../management/credentials.js';
@@ -62,7 +66,7 @@ test('key saving is immutable and distinct from model selection; persisted setti
  assert.ok(reopened.credentials.filter((c:any)=>c.managed).every((c:any)=>c.status==='configured'));
  const draft=firstRunDraft(f.root,f.options.credentialDirectory),managed=new ManagedCredentialStore(f.root,f.options.credentialDirectory),registry=credentialRegistry(draft,managed);
  const finishedBase=effectiveTrialConfiguration(draft,settings,registry,true);
- const runtimeSettings=await ManagementSettingsStore.open(resolve(f.root,'artifacts/W0-I/model-evaluation/trial/user-trial/management-settings.json'),finishedBase,undefined,{credentials:credentialRegistry(finishedBase,managed),draftOnly:true});
+ const runtimeSettings=await ManagementSettingsStore.open(resolve(dirname(trialFiles(f.root).configFile),'management-settings.json'),finishedBase,undefined,{credentials:credentialRegistry(finishedBase,managed),draftOnly:true});
  assert.deepEqual(runtimeSettings.snapshot().saved,settings); // Revision-zero placeholder history survives final config preparation.
 });
 test('real HTTP upload/clone/first-use use two confirmations, same ledger and bound registry without changing selected voice',async t=>{
@@ -71,16 +75,16 @@ test('real HTTP upload/clone/first-use use two confirmations, same ledger and bo
  const audioBase64=Buffer.from(pcm16Wav(new Float32Array(240000),24000)).toString('base64');
  const upload={instanceId,operationId:'synthetic-reference',filename:'private-name.wav',audioBase64};
  const reference=(await f.request('/reference',upload)).value;assert.equal(reference.durationMs,10000);assert.equal((await f.request('/reference',upload)).value.id,reference.id);
- assert.equal((await readdir(resolve(f.root,'data/desktop-pet/voice-assets/self-setup/references'))).length,2);assert.equal(f.calls.length,0);
+ assert.equal((await readdir(resolve(f.root,'.local/data/voice-assets/self-setup/references'))).length,2);assert.equal(f.calls.length,0);
  const op=(await f.request('/voice/prepare',{instanceId,referenceId:reference.id,label:'自己的声音',targetModel:'MiniMax/speech-2.8-turbo',credentialRef:credential.credentialRef,configRevision:0,text:'你好。'})).value;
  assert.equal(op.phase,'prepared');assert.equal(f.calls.length,0);assert.equal(op.cloneReceipt,undefined);
  assert.equal((await f.request('/voice/confirm',{instanceId,operationId:op.operationId,expectedRevision:1,costConsent:false})).status,400);assert.equal(f.calls.length,0);
  const clone=(await f.request('/voice/confirm',{instanceId,operationId:op.operationId,expectedRevision:1,costConsent:true})).value;assert.equal(clone.phase,'clone_ready');assert.equal(f.calls.length,4);
- await assert.rejects(lstat(resolve(f.root,'data/desktop-pet/registered-voices.json')));
+ await assert.rejects(lstat(resolve(f.root,'.local/data/registered-voices.json')));
  assert.equal((await f.request('/voice/confirm',{instanceId,operationId:op.operationId,expectedRevision:1,costConsent:true})).status,409);assert.equal(f.calls.length,4);
  const ready=(await f.request('/voice/confirm',{instanceId,operationId:op.operationId,expectedRevision:clone.revision,costConsent:true})).value;assert.equal(ready.phase,'registered');assert.equal(f.calls.length,5);
- const ledger=JSON.parse(await readFile(resolve(f.root,'artifacts/W0-I/model-evaluation/budget.json'),'utf8'));assert.equal(ledger.entries.length,2);assert.equal(ledger.entries[1].actualMicros,9900600);
- const registry=JSON.parse(await readFile(resolve(f.root,'data/desktop-pet/registered-voices.json'),'utf8'));assert.equal(registry.voices[0].credentialRef,credential.credentialRef);
+ const ledger=JSON.parse(await readFile(firstRunDraft(f.root).budgetFile,'utf8'));assert.equal(ledger.entries.length,2);assert.equal(ledger.entries[1].actualMicros,9900600);
+ const registry=JSON.parse(await readFile(resolve(f.root,'.local/data/registered-voices.json'),'utf8'));assert.equal(registry.voices[0].credentialRef,credential.credentialRef);
  const after=(await f.request()).value;assert.deepEqual(after.settings.saved,s.settings.saved);assert.ok(!/synthetic-private|credentialFile|cloneReceipt|private-name/.test(JSON.stringify(after)));
  const sample=await fetch(f.service.origin+'/api/self-setup/voice/sample?instanceId='+instanceId+'&operationId='+op.operationId+'&kind=activation',{headers:{Authorization:'Bearer '+f.service.token}});assert.equal(sample.status,200);assert.equal(sample.headers.get('content-type'),'audio/wav');assert.ok((await sample.arrayBuffer()).byteLength>44);
 });
@@ -94,11 +98,11 @@ test('explicit 403 recovery preserves old refusal and zero-charge receipt; refre
  const request={instanceId,operationId:failed.operationId,expectedRevision:failed.revision};const next=(await f.request('/voice/retry',request)).value;
  assert.equal(next.phase,'prepared');assert.notEqual(next.operationId,failed.operationId);assert.equal((await f.request('/voice/retry',request)).value.operationId,next.operationId);assert.equal(f.calls.length,calls);
  f.setRefusal(false);assert.equal((await f.request('/voice/confirm',{instanceId,operationId:next.operationId,expectedRevision:next.revision,costConsent:true})).value.phase,'clone_ready');
- const ledger=JSON.parse(await readFile(resolve(f.root,'artifacts/W0-I/model-evaluation/budget.json'),'utf8'));assert.equal(ledger.entries.length,2);assert.equal(ledger.entries[0].actualMicros,0);assert.equal(ledger.entries[0].status,'settled');assert.notEqual(ledger.entries[0].operationId,ledger.entries[1].operationId);
+ const ledger=JSON.parse(await readFile(firstRunDraft(f.root).budgetFile,'utf8'));assert.equal(ledger.entries.length,2);assert.equal(ledger.entries[0].actualMicros,0);assert.equal(ledger.entries[0].status,'settled');assert.notEqual(ledger.entries[0].operationId,ledger.entries[1].operationId);
  assert.equal((await f.request()).value.operations.find((o:any)=>o.operationId===failed.operationId).phase,'failed');
 });
 
-test('synthetic finish produces pinned prepared config and original activation CLI validates it without calls',async t=>{
+test('first-run finishes, activates through the shipped CLI and passes the real launch gates without provider calls',async t=>{
  const f=await fixture(t),s=(await f.request()).value,instanceId=s.instanceId;
  const deepseek=(await f.request('/credentials',{instanceId,provider:'deepseek',key,expectedRevision:0,operationId:'synthetic-deepseek'})).value;
  const dashscope=(await f.request('/credentials',{instanceId,provider:'dashscope',key:key+'2',expectedRevision:1,operationId:'synthetic-dashscope'})).value;
@@ -106,20 +110,49 @@ test('synthetic finish produces pinned prepared config and original activation C
  assert.equal((await f.request('/settings',{instanceId,expectedRevision:0,settings},'PUT')).status,200);
  const code=resolve(f.root,'code/desktop-pet'),sourceCode=fileURLToPath(new URL('../../../',import.meta.url));await mkdir(code,{recursive:true});
  await cp(resolve(sourceCode,'dist'),resolve(code,'dist'),{recursive:true});await writeFile(resolve(code,'package.json'),JSON.stringify({type:'module'}));
- await symlink(resolve(sourceCode,'node_modules'),resolve(code,'node_modules'),'dir');
+ await symlink(resolve(sourceCode,'node_modules'),resolve(code,'node_modules'),process.platform==='win32'?'junction':'dir');
  const asset=resolve(code,'desktop/assets/jellyfish'),manifest=JSON.stringify({FileReferences:{Moc:'synthetic.moc3',Expressions:[],Motions:{}}}),moc='synthetic-not-a-live-model';
  await mkdir(asset,{recursive:true});await writeFile(resolve(asset,'pet.model3.json'),manifest);await writeFile(resolve(asset,'synthetic.moc3'),moc);
  const hash=(s:string)=>createHash('sha256').update(s).digest('hex'),fingerprint=hash('pet.model3.json\0'+hash(manifest)+'\nsynthetic.moc3\0'+hash(moc)+'\n');
  await writeFile(resolve(asset,'presets.json'),JSON.stringify({schemaVersion:1,modelId:'synthetic',modelFingerprint:fingerprint,items:[{id:'neutral',label:'合成',category:'idle',source:'procedural',availability:'manual',defaultEnabled:false,previewable:true}]}));
- for(const path of ['desktop/build/renderer.js','desktop/build/星月陪伴.app/Contents/MacOS/DesktopPet']){await mkdir(dirname(resolve(code,path)),{recursive:true});await writeFile(resolve(code,path),'synthetic-pinned-bytes-never-executed');}
+ for(const path of requiredTrialRuntimeFiles()){
+  if(path.startsWith('dist/'))continue;
+  await mkdir(dirname(resolve(code,path)),{recursive:true});
+  if(path.startsWith('desktop/electron/')||path.startsWith('tools/'))await cp(resolve(sourceCode,path),resolve(code,path));
+  else await writeFile(resolve(code,path),'synthetic-pinned-bytes-never-executed');
+ }
+ await mkdir(resolve(code,'tools'),{recursive:true});
+ await cp(resolve(sourceCode,'tools/configure-local.mjs'),resolve(code,'tools/configure-local.mjs'));
+ if(process.platform==='win32'){
+  await assert.rejects(lstat(resolve(code,'desktop/build/星月陪伴.app')));
+  const entry=resolve(code,'desktop/electron/preload.cjs'),bytes=await readFile(entry);
+  await rm(entry);assert.ok((await f.request()).value.initialization.blockers.some((x:string)=>x.includes('本机应用构建')));
+  await writeFile(entry,bytes);
+ }
  assert.deepEqual((await f.request()).value.initialization.blockers,[]);
+ await assert.rejects(lstat(firstRunDraft(f.root).budgetFile));
  const ready=await f.request('/finish',{instanceId,expectedRevision:1});assert.equal(ready.status,200,JSON.stringify(ready));assert.equal(ready.value.status,'prepared');
- const dir=resolve(f.root,'artifacts/W0-I/model-evaluation/trial/user-trial'),configBefore=await readFile(resolve(dir,'config.json'),'utf8');
+ const dir=dirname(trialFiles(f.root).configFile),configBefore=await readFile(resolve(dir,'config.json'),'utf8');
  assert.equal(JSON.parse(await readFile(resolve(dir,'activation.json'),'utf8')).status,'prepared');assert.equal(JSON.parse(configBefore).limitMicros,null);
- const template=await readFile(resolve(sourceCode,'tools/release-package-43/templates/layout/code/desktop-pet/tools/configure-local.mjs'),'utf8');await mkdir(resolve(code,'tools'));
- await writeFile(resolve(code,'tools/configure-local.mjs'),template.replaceAll('.local/model-evaluation','artifacts/W0-I/model-evaluation').replaceAll('.local/data','data/desktop-pet'));
+ const configuration=JSON.parse(configBefore);assertCompanionDataConfiguration(configuration);
+ const budget=JSON.parse(await readFile(configuration.budgetFile,'utf8'));assert.equal(budget.batchId,configuration.budgetBatchId);assert.deepEqual(budget.entries,[]);
+ assert.equal(configuration.desktopHost,process.platform==='win32'?'electron':'macos');
+ if(process.platform==='win32')assert.equal(configuration.budgetFile,resolve(f.root,'.local/model-evaluation/budget.json'));
+ assert.ok(configuration.runtimeFiles['code/desktop-pet/tools/configure-local.mjs']);
+ await assert.rejects(prepareTrialLaunch(f.root,process.execPath));
  execFileSync(process.execPath,[resolve(code,'tools/configure-local.mjs'),'--activate-existing'],{timeout:20000,stdio:'pipe'});
  assert.equal(JSON.parse(await readFile(resolve(dir,'activation.json'),'utf8')).status,'active');assert.equal(await readFile(resolve(dir,'config.json'),'utf8'),configBefore);assert.equal(f.calls.length,0);
+ const plan=await prepareTrialLaunch(f.root,process.execPath);assert.equal(plan.environment.PET_TRIAL_CONFIG,trialFiles(f.root).configFile);
+ if(process.platform==='win32')assert.match(plan.executable,/electron\.exe$/);
+ const authorizer=new TrialAuthorizer(configuration,trialFiles(f.root).configFile,trialFiles(f.root).activationFile);
+ const permit=await authorizer.authorize({scope:{characterId:'companion',sessionId:'synthetic',turnId:'synthetic',generation:1},
+  operation:'dialogue',model:configuration.models.dialogue.model,endpoint:configuration.models.dialogue.endpoint},new AbortController().signal);
+ await permit.settle({status:'success',usage:{prompt_tokens:0,completion_tokens:0},requestId:null});
+ const settled=JSON.parse(await readFile(configuration.budgetFile,'utf8'));assert.equal(settled.entries.length,1);assert.equal(settled.entries[0].actualMicros,0);
+ await assert.rejects(startFirstRunSetup(f.root,f.options),{code:'unavailable'});
+ assert.throws(()=>execFileSync(process.execPath,[resolve(code,'tools/configure-local.mjs'),'--activate-existing'],{timeout:20000,stdio:'pipe'}));
+ await writeFile(resolve(code,'desktop/build/renderer.js'),'changed-after-activation');
+ await assert.rejects(prepareTrialLaunch(f.root,process.execPath));assert.equal(f.calls.length,0);
 });
 
 test('HTTP key save normalizes only outer whitespace, rejects injection, and preserves new format across restart and voice requests',async t=>{

@@ -4,6 +4,7 @@ import { countRequestInput, inputBudgetInfo } from './input-count.js';
 import { JsonDialogueProvider } from './qwen-dialogue.js';
 import { denyPaidCalls, object, ProviderTransport, type EndpointConfig, type JsonRecord, type ProviderOperation } from './transport.js';
 import type { hostClock } from './host-clock.js';
+import type { SocialContextPort } from '../companion/cloud/protocol.js';
 
 /** Only foreground companion replies. Memory, summary, admission and speech keep their own providers. */
 export interface LocalDialogueConfiguration {
@@ -90,13 +91,13 @@ class LocalDialogueTransport extends ProviderTransport {
 /** Reuses the cloud adapter's scope, grounding, structured reply and visual-policy validation. */
 export class LocalDialogueProvider extends JsonDialogueProvider {
   constructor(config: LocalDialogueConfiguration, visualPolicy?: () => { presets: readonly { id: string; label: string }[] },
-    request: typeof fetch = fetch, clock?: () => ReturnType<typeof hostClock>) {
+    request: typeof fetch = fetch, clock?: () => ReturnType<typeof hostClock>, social?: SocialContextPort) {
     const c = validateLocalDialogue(config);
     // Fail-closed sentinels satisfy the shared provider contract; no cloud credential is captured here.
     const endpoint: EndpointConfig = { endpoint: c.baseUrl + '/chat/completions', model: c.model,
       apiKey: () => { throw Error('Local dialogue has no API credential'); }, authorizer: denyPaidCalls };
     super(endpoint, new LocalDialogueTransport(c, request), visualPolicy, clock,
       { protocol: 'openai-json', outputTokenLimit: c.outputTokenLimit, ...(c.temperature === undefined ? {} : { temperature: c.temperature }),
-        ...(c.reasoningEffort === undefined ? {} : { reasoningEffort: c.reasoningEffort }) });
+        ...(c.reasoningEffort === undefined ? {} : { reasoningEffort: c.reasoningEffort }) },social);
   }
 }

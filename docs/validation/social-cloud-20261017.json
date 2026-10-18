@@ -1,0 +1,18 @@
+{
+  "validatedDate": "2026-10-17",
+  "platform": "Windows x64",
+  "status": "passed",
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "modelCalls": 6,
+  "localModelCalls": 0,
+  "actualQQMessagesSent": 0,
+  "syntheticQQSender": true,
+  "sharedGroupAttribution": true,
+  "privateGroupExcluded": true,
+  "privateStoreUnchanged": true,
+  "receiptDeduplicated": true,
+  "restartResumed": true,
+  "forgetPropagated": true,
+  "scope": "Isolated synthetic group fixtures; real cloud inference; no real QQ delivery test."
+}

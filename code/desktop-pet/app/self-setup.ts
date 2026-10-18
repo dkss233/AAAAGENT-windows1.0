@@ -12,16 +12,18 @@ import { deepseekFlashModel } from '../providers/text-protocol.js';
 import { startManagementServer } from '../management/server.js';
 import { readPresentationCatalog } from '../management/presentation.js';
 import { ManagementError } from '../contracts/management.js';
-import { companionDatabaseFile } from './companion-data.js';
-import { validateTrialConfiguration, type TrialConfiguration } from './trial-config.js';
+import { requiredTrialRuntimeFiles, validateTrialConfiguration, type TrialConfiguration } from './trial-config.js';
 import { verifyTrialRuntime, trialFiles } from './trial-launcher.js';
+import { companionDatabaseFile } from './companion-data.js';
+import { restrictPrivatePathSync } from '../core/platform-files.js';
+import { EvaluationBudget } from '../core/evaluation-budget.js';
 
 const hash=(value:string|Uint8Array)=>createHash('sha256').update(value).digest('hex');
 /** Draft metadata has no runtime fingerprint or credentials. It is never accepted by the runtime validator. */
 export function firstRunDraft(projectRoot:string,credentialDirectory=managedCredentialDirectory(projectRoot)):TrialConfiguration {
  const deepseek=resolve(credentialDirectory,'unconfigured-deepseek.key'),dashscope=resolve(credentialDirectory,'unconfigured-dashscope.key');
  const text=deepseekFlashModel(deepseek),chat='https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
- return {version:1,product:'companion-v1',phaseId:'local-trial-personal',purpose:'user-trial',projectRoot,sourceRevision:'unprepared',runtimeFiles:{},database:companionDatabaseFile(projectRoot),budgetFile:resolve(projectRoot,process.platform==='win32'?'.local/model-evaluation/budget.json':'artifacts/W0-I/model-evaluation/budget.json'),budgetBatchId:'local-'+hash(projectRoot).slice(0,24),budgetMode:'unlimited',limitMicros:null,phaseLimitMicros:0,maxCalls:0,operationLimits:{dialogue:0,memory_turn:0,summary:0,perception:0,tts:0,admission:0},memory:{mode:'strict',scheduling:'semantic-admission',timeoutMs:300000},models:{
+ return {version:1,desktopHost:process.platform==='win32'?'electron':'macos',product:'companion-v1',phaseId:'local-trial-personal',purpose:'user-trial',projectRoot,sourceRevision:'unprepared',runtimeFiles:{},database:companionDatabaseFile(projectRoot),budgetFile:resolve(projectRoot,process.platform==='win32'?'.local/model-evaluation/budget.json':'artifacts/W0-I/model-evaluation/budget.json'),budgetBatchId:'local-'+hash(projectRoot).slice(0,24),budgetMode:'unlimited',limitMicros:null,phaseLimitMicros:0,maxCalls:0,operationLimits:{dialogue:0,memory_turn:0,summary:0,perception:0,tts:0,admission:0},memory:{mode:'strict',scheduling:'semantic-admission',timeoutMs:300000},models:{
   dialogue:text,summary:text,admission:text,
   memory_turn:{provider:'deepseek',model:'deepseek-v4-pro',endpoint:text.endpoint,credentialFile:deepseek,reservationMicros:11000000,inputTokenLimit:32768,outputTokenLimit:393216,inputMicrosPerToken:9,outputMicrosPerToken:27,thinking:'high'},
   asr:{provider:'dashscope',model:'qwen3-asr-flash',endpoint:chat,credentialFile:dashscope,reservationMicros:220,inputTokenLimit:0,outputTokenLimit:0,inputMicrosPerToken:0,outputMicrosPerToken:0,audioMicrosPerSecond:220},
@@ -36,8 +38,7 @@ async function exists(file:string):Promise<boolean>{try{await lstat(file);return
 async function runtimePins(root:string):Promise<Record<string,string>>{
  const files:Record<string,string>={};
  async function scan(directory:string):Promise<void>{for(const entry of await readdir(directory,{withFileTypes:true})){const file=resolve(directory,entry.name);if(entry.isSymbolicLink())throw Error('runtime_symlink');if(entry.isDirectory()){if(!['node_modules','.cache','.git'].includes(entry.name))await scan(file);}else if(entry.isFile())files[relative(root,file).split('\\').join('/')]=hash(await readFile(file));}}
- // tools/ is pinned too: the required-file list below includes tools/management-url.mjs.
- await scan(resolve(root,'code/desktop-pet/dist'));await scan(resolve(root,'code/desktop-pet/desktop'));await scan(resolve(root,'code/desktop-pet/tools'));return files;
+ for(const name of ['dist','desktop','tools'])await scan(resolve(root,'code/desktop-pet',name));return files;
 }
 /** Opens without a Key, voice, JSON config, app bundle or Live2D asset. No provider probes or devices. */
 export async function startFirstRunSetup(projectRoot:string,options:{credentialDirectory?:string;fetch?:typeof fetch;uiRoot?:string}={}){
@@ -47,18 +48,19 @@ export async function startFirstRunSetup(projectRoot:string,options:{credentialD
  // Never adopt or overwrite an unrelated pre-existing ledger.
  if(await exists(base.budgetFile)){const budget=JSON.parse(await readFile(base.budgetFile,'utf8'));if(budget.batchId!==base.budgetBatchId||budget.limitMicros!==base.limitMicros||budget.currency!=='CNY')throw new ManagementError('unavailable','本机已有不同的账目配置，请继续使用原入口。');}
  await mkdir(directory,{recursive:true,mode:0o700});
+ restrictPrivatePathSync(directory);
  const release=acquireSetupLock(resolve(directory,'first-run.lock'),'first-run:'+root);
  const instanceId=randomUUID();
  let server:Awaited<ReturnType<typeof startManagementServer>>|undefined,setup:ReturnType<typeof createSelfSetup>|undefined;
  try{
-  const voices=await RegisteredVoiceStore.open(resolve(root,'data/desktop-pet/registered-voices.json'));
+  const voices=await RegisteredVoiceStore.open(resolve(root,'.local/data/registered-voices.json'));
   const settings=await ManagementSettingsStore.open(resolve(directory,'management-settings.json'),base,voices,{credentials,draftOnly:true});
   let completed=false;
   async function blockers():Promise<string[]>{
    const result:string[]=[],saved=settings.snapshot().saved,available=credentials.list();
    if(Object.values(saved.providers).some(p=>!available.some(c=>c.id===p.credentialRef&&c.provider===p.provider&&c.status==='configured')))result.push('请保存所需Key，并在每个模型模块选择同供应商的凭据。');
    try{await readPresentationCatalog(root);}catch{result.push('启动前还需配置自己有权使用的 Live2D 模型与匹配目录；现在仍可保存Key和准备音色。');}
-   const required=['dist/app/trial-backend.js','dist/app/trial-launcher.js','desktop/build/renderer.js',...(process.platform==='win32'?['desktop/electron/main.mjs','desktop/electron/preload.cjs','desktop/electron/transport.mjs','desktop/electron/layout.mjs','desktop/electron/assets.mjs','tools/management-url.mjs']:['desktop/build/星月陪伴.app/Contents/MacOS/DesktopPet'])];
+   const required=[...requiredTrialRuntimeFiles(base.desktopHost),...(process.platform==='win32'?['node_modules/electron/dist/electron.exe']:[])];
    for(const path of required)if(!await exists(resolve(root,'code/desktop-pet',path))){result.push('启动前需要完成本机应用构建；现在仍可完成模型与音色设置。');break;}
    return result;
   }
@@ -66,6 +68,10 @@ export async function startFirstRunSetup(projectRoot:string,options:{credentialD
    const missing=await blockers();if(missing.length)throw new ManagementError('invalid_request',missing.join(' '));
    const pins=await runtimePins(root),effective=effectiveTrialConfiguration(base,settings.snapshot().saved,credentials,true);
    const config=validateTrialConfiguration({...effective,sourceRevision:hash(JSON.stringify(pins)).slice(0,40),runtimeFiles:pins});await verifyTrialRuntime(config);
+   // System voices need no enrollment request, but the first real call still needs its ledger.
+   // The shared transaction validates and preserves an existing voice-enrollment ledger.
+   await mkdir(dirname(config.budgetFile),{recursive:true,mode:0o700});restrictPrivatePathSync(dirname(config.budgetFile));
+   await new EvaluationBudget(config.budgetFile,config.budgetBatchId,config.limitMicros).snapshot();
    const raw=JSON.stringify(config,null,2)+'\n',activation=JSON.stringify({version:1,phaseId:config.phaseId,status:'prepared',configSha256:hash(raw)})+'\n';
    // Exclusive writes; retries may complete the exact same partially prepared pair, never replace an existing configuration.
    for(const [file,content] of [[files.configFile,raw],[files.activationFile,activation]] as const){

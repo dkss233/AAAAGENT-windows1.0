@@ -1,5 +1,9 @@
 # AAAAGENT Windows 0.3.0-dev.1
 
+## QQ bot and companion memory · 2026-10-18
+
+Windows now supports receipt-backed QQ summaries, companion synchronization and a login background service. Validation used six real cloud calls and zero local-model calls; QQ delivery receipts were synthetic. [Release notes](docs/WINDOWS-20261018.md) · [Setup](docs/SOCIAL_MEMORY.md) · [Architecture](../docs/ARCHITECTURE.md)
+
 This is a **source development candidate, not a stable release or a signed installer**. It integrates video / Live2D switching, a separate T3 workbench, three ASR and three TTS options, and opt-in local foreground dialogue through Ollama. The October 10, 2026 checks include both successful paths and unresolved failures.
 
 [中文](README.md) · [Project home](../README.en.md) · [Platform differences](../docs/PLATFORMS.md#english) · [Third-party sources and notices](THIRD_PARTY_NOTICES.md)
@@ -7,6 +11,8 @@ This is a **source development candidate, not a stable release or a signed insta
 Windows uses the separate `windows/code/desktop-pet/` tree, an Electron window and a Node.js backend. Follow the project home for macOS. Do not share platform binaries, `node_modules`, credential paths or runtime fingerprints between the two installations.
 
 ## Getting started
+
+For installation by a local coding agent, use the [agent runbook (中文)](AGENT_INSTALL.md) and `Install-Windows.ps1`. It installs locked dependencies, builds the app and opens first-run setup. Supply your own credentials and licensed assets. The [provider migration guide (中文)](docs/PROVIDER_MIGRATION.md) explains configuration changes versus adapter work for other cloud platforms.
 
 Use Windows x64, Node.js 22.12 or later, and character assets and SDK components you are authorized to use. From the repository root:
 

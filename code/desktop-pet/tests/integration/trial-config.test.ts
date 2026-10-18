@@ -4,8 +4,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { assertRuntimeRetirements, isTrialRuntimePath, readActiveTrialConfiguration, validateTrialConfiguration, type TrialConfiguration, type TrialModel, type TrialOperation } from '../../app/trial-config.js';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { assertRuntimeRetirements, isTrialRuntimePath, readActiveTrialConfiguration, requiredTrialRuntimeFiles, validateTrialConfiguration, type TrialConfiguration, type TrialModel, type TrialOperation } from '../../app/trial-config.js';
 import { TrialAuthorizer, estimateTrialMicros, assertReviewedUnknownCosts } from '../../app/trial-authorizer.js';
 import { prepareTrialLaunch, preparedWorkbenchEnvironment, trialFiles, verifyTrialRuntime } from '../../app/trial-launcher.js';
 import { TrialTransport } from '../../app/trial-backend.js';
@@ -57,9 +57,8 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, smoke = fals
   const memory: TrialModel = { ...chat, provider: 'deepseek', model: 'deepseek-v4-pro', endpoint: 'https://api.deepseek.com/chat/completions',
     reservationMicros: 11000000, inputMicrosPerToken: 9, outputMicrosPerToken: 27, outputTokenLimit: 393216, thinking: 'high' };
   const c: TrialConfiguration = { version: 1, product: 'companion-v1', phaseId: 'local-trial-controlled', purpose: smoke ? 'smoke-text' : 'user-trial', ...(smoke ? {smokeInput:'合成文字'} : {}), projectRoot, sourceRevision: 'a'.repeat(40),
-    runtimeFiles: Object.fromEntries(['dist/app/trial-backend.js', 'dist/app/trial-launcher.js', 'desktop/build/renderer.js',
-      'desktop/build/星月陪伴.app/Contents/MacOS/DesktopPet'].map(p => [`code/desktop-pet/${p}`, hash('controlled')])),
-    database: join(projectRoot, 'data/desktop-pet/companion.sqlite'), budgetFile: join(projectRoot, 'artifacts/W0-I/model-evaluation/budget.json'),
+    runtimeFiles: Object.fromEntries(requiredTrialRuntimeFiles().map(p => [`code/desktop-pet/${p}`, hash('controlled')])),
+    database: join(projectRoot, '.local/data/companion.sqlite'), budgetFile: join(projectRoot, process.platform === 'win32' ? '.local/model-evaluation/budget.json' : 'artifacts/W0-I/model-evaluation/budget.json'),
     budgetBatchId: 'original-fixture-batch', limitMicros: 20000000, phaseLimitMicros: 20000000, maxCalls: 200,
     operationLimits: { admission: 40, dialogue: 40, memory_turn: 40, summary: 20, perception: smoke ? 0 : 20, tts: 40 },
     memory: { mode: 'strict', scheduling: 'semantic-admission', timeoutMs: 300000 },
@@ -158,7 +157,7 @@ test('reported costs reject malformed or overflowing usage and charge TTS per ac
 
 test('launch plan supplies the real native arguments and refuses changed build bytes before a process starts', async t => {
   const f = await fixture(t), paths = trialFiles(f.c.projectRoot);
-  const priorDirectory = join(f.c.projectRoot, 'artifacts/W0-I/model-evaluation/trial');
+  const priorDirectory = join(f.c.projectRoot, process.platform === 'win32' ? '.local/model-evaluation/trial' : 'artifacts/W0-I/model-evaluation/trial');
   const priorConfig = join(priorDirectory, 'config.json'), priorActivation = join(priorDirectory, 'activation.json');
   await mkdir(priorDirectory, { recursive: true });
   await writeFile(priorConfig, 'frozen-smoke-config'); await writeFile(priorActivation, 'frozen-smoke-activation');
@@ -167,7 +166,7 @@ test('launch plan supplies the real native arguments and refuses changed build b
   await mkdir(dirname(paths.configFile), { recursive: true });
   await writeFile(paths.configFile, await readFile(f.configFile)); await writeFile(paths.activationFile, await readFile(f.activationFile));
   const plan = await prepareTrialLaunch(f.c.projectRoot, '/controlled/node');
-  assert.equal(plan.version, f.c.sourceRevision); assert.equal(plan.arguments[0], '--root');
+  assert.equal(plan.version, f.c.sourceRevision); assert.equal(plan.arguments[process.platform === 'win32' ? 1 : 0], '--root');
   assert.ok(plan.arguments.includes(join(f.c.projectRoot, 'code/desktop-pet/dist/app/trial-backend.js')));
   assert.ok(!plan.arguments.includes('backend.js')); assert.equal(plan.environment.PET_TRIAL_CONFIG, paths.configFile);
   assert.equal(await readFile(priorConfig, 'utf8'), 'frozen-smoke-config');
@@ -185,7 +184,7 @@ test('the pinned local workbench starts only from the matching prepared T3 tree 
   await writeFile(join(scratch, 'LICENSE'), 'controlled MIT license'); run(scratch, 'add', 'LICENSE'); run(scratch, 'commit', '-qm', 'fixed source');
   const commit = run(scratch, 'rev-parse', 'HEAD'), patchSha256 = hash('');
   const markerPath = `artifacts/runtime/t3-${commit.slice(0, 8)}-${patchSha256.slice(0, 12)}/.aaaagent-prepared.json`;
-  const nodePath = 'artifacts/runtime/toolchain/node-v24.13.1-darwin-arm64/bin/node';
+  const nodePath = process.platform === 'win32' ? 'artifacts/runtime/engines-codex-0.160.0-dsh-0.2.0-rc.2-win32-x64/node/node.exe' : 'artifacts/runtime/toolchain/node-v24.13.1-darwin-arm64/bin/node';
   const sourceDir = join(root, dirname(markerPath));
   await mkdir(join(sourceDir, 'apps/server/dist'), { recursive: true });
   await writeFile(join(sourceDir, 'LICENSE'), 'controlled MIT license');
@@ -208,14 +207,16 @@ test('the pinned local workbench starts only from the matching prepared T3 tree 
   const environment = await preparedWorkbenchEnvironment(configuration);
   assert.equal(environment.AAAAGENT_T3_PREPARED_DIR, sourceDir);
   assert.equal(environment.AAAAGENT_T3_NODE_EXECUTABLE, join(root, nodePath));
-  const codexDir = 'artifacts/runtime/codex-0.156.0-aarch64-apple-darwin-6f7bdad25693';
-  const codexSource = { version: '0.156.0', target: 'aarch64-apple-darwin',
+  const codexSource = process.platform === 'win32' ? { version: '0.160.0', target: 'x86_64-pc-windows-msvc',
+    archiveSha256: '7f7fbbc8d6fd4ea2f3b13855ef47ea59663ba7e61fb2e9821df37163b8030891', entrypoint: 'bin/codex.exe' } : { version: '0.156.0', target: 'aarch64-apple-darwin',
     archiveSha256: '6f7bdad25693f464a146ad6f24d477ad6fbffe07b62556f829ee5d3b04f48f8b', entrypoint: 'bin/codex' };
-  const codexFiles = { 'bin/codex': hash('controlled Codex'), 'bin/codex-code-mode-host': hash('controlled host') };
+  const codexDir = `artifacts/runtime/codex-${codexSource.version}-${codexSource.target}-${codexSource.archiveSha256.slice(0,12)}`;
+  const hostFile = process.platform === 'win32' ? 'bin/codex-code-mode-host.exe' : 'bin/codex-code-mode-host';
+  const codexFiles = { [codexSource.entrypoint]: hash('controlled Codex'), [hostFile]: hash('controlled host') };
   const codexMarker = JSON.stringify({ source: codexSource, files: codexFiles });
   await mkdir(join(root, codexDir, 'bin'), { recursive: true });
-  await writeFile(join(root, codexDir, 'bin/codex'), 'controlled Codex');
-  await writeFile(join(root, codexDir, 'bin/codex-code-mode-host'), 'controlled host');
+  await writeFile(join(root, codexDir, codexSource.entrypoint), 'controlled Codex');
+  await writeFile(join(root, codexDir, hostFile), 'controlled host');
   await writeFile(join(root, codexDir, '.aaaagent-codex.json'), codexMarker);
   await writeFile(join(root, workbench, 'codex-source.json'), JSON.stringify(codexSource));
   const pinned = { ...configuration, runtimeFiles: { ...configuration.runtimeFiles,
@@ -224,7 +225,7 @@ test('the pinned local workbench starts only from the matching prepared T3 tree 
     ...Object.fromEntries(Object.entries(codexFiles).map(([file, digest]) => [codexDir + '/' + file, digest])) } };
   assert.ok(Object.keys(pinned.runtimeFiles).every(isTrialRuntimePath));
   await verifyTrialRuntime(pinned); await preparedWorkbenchEnvironment(pinned);
-  const missing = { ...pinned.runtimeFiles }; delete missing[codexDir + '/bin/codex-code-mode-host'];
+  const missing = { ...pinned.runtimeFiles }; delete missing[codexDir + '/' + hostFile];
   await assert.rejects(preparedWorkbenchEnvironment({ ...pinned, runtimeFiles: missing }), /工作台本地运行文件/);
   assert.equal(isTrialRuntimePath(codexDir + '/../auth.json'), false);
   await assert.rejects(preparedWorkbenchEnvironment({ ...pinned,
@@ -317,7 +318,7 @@ test('independent ASR proves WAV duration, preserves unknown reservations, and e
   const {QwenAsrProvider}=await import('../../providers/qwen-asr.js');
   const {ManagementRuntime}=await import('../../management/runtime.js');
   const {defaultManagedSettings,validateManagedSettings}=await import('../../management/settings.js');
-  const tool=await import(resolve(dirname(fileURLToPath(import.meta.url)),'../../../tools/voice-pipeline-update.mjs'));
+  const tool=await import(pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)),'../../../tools/voice-pipeline-update.mjs')).href);
   const c:TrialConfiguration=tool.nextVoiceConfiguration(f.c);
   assert.equal(c.operationLimits,undefined); assert.equal(c.maxCalls,undefined); assert.equal(c.phaseLimitMicros,undefined);
   const settings=defaultManagedSettings(c); validateManagedSettings(settings,c);
@@ -370,7 +371,7 @@ test('MiniMax request guard rejects explicit emotion before authorization, key a
 });
 
 test('explicit DSH Host location survives configuration only with pinned trial support', async t => {
-  const f = await fixture(t), workbenchDshWebLog = '/synthetic-private/DeepSeek Harness/web.log';
+  const f = await fixture(t), workbenchDshWebLog = resolve('/synthetic-private/DeepSeek Harness/web.log');
   assert.throws(() => validateTrialConfiguration({ ...f.c, workbenchDshWebLog }), /DSH Host/);
   const c = { ...f.c, workbenchDshWebLog, runtimeFiles: { ...f.c.runtimeFiles,
     'code/workbench/integration/dsh-controller-source.json': hash('native pin'),

@@ -1,33 +1,21 @@
 # AAAAGENT Windows 0.3.0-dev.1
 
-> ## 授权与署名 / License and attribution
->
-> 本项目源自 **AAAAGENT** —— <https://github.com/phoiex/AAAAGENT>（作者：phoiex 及项目贡献者）。
-> 本仓库是其 Windows 部分的**修改版本**，由 [dkss233](https://github.com/dkss233) 修改（2026-10）。
->
-> 适用许可：**[AAAAGENT 非商业使用及署名许可 1.0](LICENSE)** —— 允许非商业使用，
-> **禁止任何形式的商业用途**，使用时须署名并保留来源。这不是 MIT / Apache 或 OSI 批准的开源许可。
->
-> 具体修改内容见 **[来源与改动说明](NOTICE.md)**；完整的改动过程与验证记录见
-> **[桌宠开发日志（公开版）](桌宠开发日志-公开版.md)**。
->
-> 本仓库的修改不代表原作者观点，**原作者未对本仓库背书**。
-> 原始项目版权、来源与第三方声明均予保留，详见 [第三方来源与许可](THIRD_PARTY_NOTICES.md)。
->
-> This is a **modified version** of AAAAGENT (<https://github.com/phoiex/AAAAGENT>).
-> Licensed under the AAAAGENT Noncommercial and Attribution License 1.0 — noncommercial use only,
-> attribution required. Modifications are listed in [NOTICE.md](NOTICE.md).
-> Not endorsed by the original authors.
+## QQ 机器人与桌宠记忆 · 2026-10-18
+
+新增 QQ 回执桥接、云端社交摘要、桌宠增量同步及 Windows 登录后台服务。[更新公告](docs/WINDOWS-20261018.md) · [安装与启停](docs/SOCIAL_MEMORY.md) · [项目架构](../docs/ARCHITECTURE.md)
 
 Windows 源码候选版，**不是稳定版，也没有签名安装包**。本版接入视频桌宠 / Live2D 切换、独立 T3 工作台、三种 ASR、三种 TTS，以及默认关闭的 Ollama 本地前台对话。2026-10-10 的分阶段测试有通过项，也有未解决的模型质量与后台记忆问题。
 
-[English](README.en.md) · [项目首页](https://github.com/phoiex/AAAAGENT) · [第三方来源与许可](THIRD_PARTY_NOTICES.md) · [来源与改动说明](NOTICE.md) · [许可](LICENSE)
+[English](README.en.md) · [项目首页](../README.md) · [平台差异](../docs/PLATFORMS.md) · [第三方来源与许可](THIRD_PARTY_NOTICES.md)
 
 Windows 使用独立的 `windows/code/desktop-pet/` 源码、Electron 窗口和 Node.js 后端。Mac 入口在项目首页；不要混用两个平台的 `node_modules`、二进制、配置路径或运行指纹。
 
 ## 开始使用
 
 > **下载的源码不能直接双击 `.cmd` 运行。** 仓库不含 `dist/`、`node_modules/` 等构建产物，必须先安装依赖并编译；未编译时启动器会直接列出缺少的产物和要执行的命令。完整步骤见 [安装与配置](docs/SETUP.md)。
+
+
+**交给本地 Agent 安装：** 复制[Agent 安装文档](AGENT_INSTALL.md)中的请求，助手会拉源码、安装依赖、构建并打开设置页，再指导你填写 Key 和准备角色资源。新增 `Install-Windows.ps1` 一键准备入口；需要改用其他云平台时，按[服务商迁移说明](docs/PROVIDER_MIGRATION.md)接入。
 
 准备 Windows x64、Node.js 22.12 或更高版本，以及有权使用的桌宠素材与所需 SDK。从仓库根目录运行：
 

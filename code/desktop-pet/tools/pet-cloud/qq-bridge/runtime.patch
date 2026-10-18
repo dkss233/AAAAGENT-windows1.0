@@ -1,0 +1,50 @@
+--- a/app/app.py
++++ b/app/app.py
+@@ -18,6 +18,7 @@
+ from stickers import StickerLibrary, explicit_request
+ from web_search import WebSearch, explicit_query, qq_search_reply
+ from weather import weather_plan
++from social_bridge import SocialBridge
+ 
+ HERE=Path(__file__).resolve().parent
+ DEFAULT_DATA=HERE.parent/'data'
+@@ -41,6 +42,7 @@
+         self.brain=Brain(self.store)
+         self.stickers=StickerLibrary(HERE.parent/'assets'/'stickers',self.store)
+         self.web_search=WebSearch(self.store)
++        self.social=SocialBridge(self.root,self.secret_file.with_name('social-channel.json'))
+         self.config_path=self.root/'settings.json'
+         self.config={'target_group_name':'苹果是无聊水果','group_openid':'','auto_start':False,'model_enabled':False,'model_provider':'deepseek','gateway_retry_once':True,'daily_budget_usd':0,'daily_max_calls':0,'gateway_endpoint':'https://123.207.244.230/v1','gateway_protocol':'openai_responses','gateway_model':''}
+         if self.config_path.exists():self.config.update(json.loads(self.config_path.read_text(encoding='utf-8')))
+@@ -242,6 +244,7 @@
+                 # One message POST only. An uncertain send is never retried as plain text.
+                 reply_id=self.gateway.send(group,mid,reply,media=media)
+                 self.store.mark(group,mid,'replied',reply,reply_id)
++                if getattr(self,'social',None):self.social.record_delivery(item,reply,reply_id)
+                 if media:self.stickers.sent(item,sticker,reply_id)
+             except Exception as exc:
+                 if stage=='model' and self.config.get('model_enabled') and not self.paused and not expired:
+@@ -249,6 +252,7 @@
+                         self.store.mark(group,mid,'sending',fallback)
+                         reply_id=self.gateway.send(group,mid,fallback)
+                         self.store.mark(group,mid,'replied',fallback,reply_id)
++                        if getattr(self,'social',None):self.social.record_delivery(item,fallback,reply_id)
+                         self.last_error='模型接口自动重试后仍失败，已发送简短在线回应'
+                         continue
+                     except Exception as send_error:exc=send_error;stage='sending_fallback'
+@@ -278,6 +282,7 @@
+ 
+     def shutdown(self):
+         self.pause(False)
++        self.social.close()
+         if self.qr_process and self.qr_process.poll() is None:self.qr_process.terminate()
+ 
+     def snapshot(self):
+@@ -285,6 +290,7 @@
+         result['last_event']=self.last_event
+         result['stickers']=self.stickers.snapshot()
+         result['web_search']=self.web_search.snapshot()
++        result['social']=self.social.snapshot()
+         result['qq_ready']=self.gateway.ready
+         try:creds=self.credentials()
+         except Exception:creds={}
