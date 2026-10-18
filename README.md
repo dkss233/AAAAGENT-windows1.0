@@ -38,7 +38,7 @@ npm.cmd run build
 npm.cmd run build:desktop
 ```
 
-**国内网络**：`npm ci` 需要从 GitHub 下载 `better-sqlite3`、`electron` 的预编译二进制，容易超时；超时后会退回本地编译，而那需要 Python 与 Visual Studio C++ 生成工具。用国内镜像可跳过这两项依赖 —— 双击仓库根目录的 **`安装-国内镜像.cmd`**，或手动设置：
+**国内网络**：`npm ci` 需要从 GitHub 下载 `better-sqlite3`、`electron` 的预编译二进制，容易超时；超时后会退回本地编译，而那需要 Python 与 Visual Studio C++ 生成工具。**首次双击 `启动桌宠.cmd` 时会询问是否用国内镜像安装，答 Y 即可** —— 它会走 npmmirror（阿里云公共镜像），跳过这两项依赖。也可手动执行 `node tools/aaaagent-install-mirror.mjs`，或自己设置：
 
 ```powershell
 $env:npm_config_registry='https://registry.npmmirror.com'
