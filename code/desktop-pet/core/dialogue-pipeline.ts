@@ -124,7 +124,11 @@ export class DialoguePipeline {
       const validateContext = () => independent ? background!.assertContextCurrent(context) : this.ports.memoryLifecycle?.assertContextCurrent(context);
       validateContext();
       let emotionInput:EmotionInferenceInput|null=null;
-      if(!memoryPending || memoryPending.request==='none')try{emotionInput=this.ports.emotion?.prepare(context,source,text)??null;}catch{/* Optional state stays unavailable. */}
+      // NOT gated on memoryPending. Whether this sentence might change stored facts is a different question
+      // from what the user sounds like right now. Gating it here meant every turn the admission classifier
+      // called 'uncertain' — which contradictory or unrelated remarks produce constantly — skipped emotion
+      // entirely, so the console fell back to showing the last value from hours earlier.
+      try{emotionInput=this.ports.emotion?.prepare(context,source,text)??null;}catch{/* Optional state stays unavailable. */}
       // Ambiguous requests get the resolver's question without another model turning it into an acknowledgement.
       const reply = memoryOutcome?.status === 'needs_clarification'
         ? { scope, text: memoryOutcome.clarification?.trim() ?? '', expression: { emotion: 'neutral', intensity: 0, delivery: '自然、温和地询问', gesture: null } }

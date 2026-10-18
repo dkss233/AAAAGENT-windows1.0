@@ -13,11 +13,23 @@ export interface QwenAudioTtsConfig extends EndpointConfig {
 }
 export const QWEN_AUDIO_TTS_MODEL = 'qwen-audio-3.0-tts-flash';
 export const QWEN_AUDIO_TTS_PLUS_MODEL = 'qwen-audio-3.0-tts-plus';
+export const QWEN_AUDIO_TTS_V31_MODEL = 'qwen-audio-3.1-tts-flash';
 export const QWEN_AUDIO_TTS_ENDPOINT = 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer';
 export const QWEN_AUDIO_TTS_VOICES = ['longanfengyue', 'longanlingxi'] as const;
-export const isQwenAudioTtsModel = (model: string): boolean => model === QWEN_AUDIO_TTS_MODEL || model === QWEN_AUDIO_TTS_PLUS_MODEL;
+/** 3.1 system voices. Every id carries the _v3.1 suffix: the bare name belongs to the 3.0 family and
+ *  is answered with "[cosyvoice:]Engine error [411]", so the suffix is part of the identifier rather
+ *  than decoration. Verified against the live endpoint, one request per id. */
+export const QWEN_AUDIO_TTS_V31_VOICES = [
+  'longpaopao_v3.1', 'longanhuan_v3.1', 'longanlingxin_v3.1', 'longanfengyue_v3.1', 'xunanchuan_v3.1',
+  'yuxiaoyun_v3.1', 'qiaoxiaojiao_v3.1', 'xiaxiaochen_v3.1', 'anmingyuan_v3.1',
+] as const;
+export const isQwenAudioTtsModel = (model: string): boolean =>
+  model === QWEN_AUDIO_TTS_MODEL || model === QWEN_AUDIO_TTS_PLUS_MODEL || model === QWEN_AUDIO_TTS_V31_MODEL;
+/** Voice families cannot be mixed across model generations — the service rejects a foreign id. */
 const supportedVoice = (model: string, voice: string): boolean => model === QWEN_AUDIO_TTS_PLUS_MODEL
-  ? voice === 'longanlingxin' : model === QWEN_AUDIO_TTS_MODEL && QWEN_AUDIO_TTS_VOICES.some(value => value === voice);
+  ? voice === 'longanlingxin'
+  : model === QWEN_AUDIO_TTS_V31_MODEL ? QWEN_AUDIO_TTS_V31_VOICES.some(value => value === voice)
+    : model === QWEN_AUDIO_TTS_MODEL && QWEN_AUDIO_TTS_VOICES.some(value => value === voice);
 
 /** The completed QwenAudio HTTP response can retain this exact streaming length
  * pair. Repair only its canonical mono PCM header; arbitrary truncation remains

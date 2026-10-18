@@ -68,10 +68,20 @@ export class LocalAsrProvider implements AsrProvider {
     } finally { bytes.fill(0); }
   }
 }
+/** Marks a configuration that already passed its own validator.
+ *
+ *  LocalTtsProvider used to re-run validateLocalSpeech unconditionally, which pinned tts.model to the
+ *  three reviewed local weights — so an operator-defined model could never reach the request, even
+ *  though the transport is identical. This mark means "the address policy has been applied"; only this
+ *  module can create it, so a caller cannot use it to smuggle an unchecked address past the check. */
+const SELF_VALIDATED = Symbol('aaaagent.customTts.validated');
+
 export class LocalTtsProvider implements TtsProvider {
   private readonly config: LocalSpeechConfiguration;
   constructor(config: LocalSpeechConfiguration, private readonly store: MediaStorePort, private readonly request: typeof fetch = fetch) {
-    this.config = validateLocalSpeech(config); if (!this.config.tts) throw Error('本地 TTS 未配置。');
+    // Only a config this module marked is trusted; everything else still goes through validation.
+    this.config = (config as { [SELF_VALIDATED]?: true })[SELF_VALIDATED] === true ? config : validateLocalSpeech(config);
+    if (!this.config.tts) throw Error('本地 TTS 未配置。');
   }
   async synthesize(input: TtsRequest, signal: AbortSignal): Promise<TtsResult> {
     checkAbort(signal); if (!input.text.trim()) throw Error('不能合成空文本。');
@@ -93,4 +103,62 @@ export class LocalTtsProvider implements TtsProvider {
       } finally { bytes.fill(0); }
     } finally { clips.forEach(clip => clip.fill(0)); }
   }
+}
+
+/** An operator-configured OpenAI-compatible speech endpoint.
+ *
+ *  This exists because adding a supplier used to require a source change: the catalogue, the credential
+ *  provider union and the endpoint assertion were all closed lists. Almost every TTS service — hosted or
+ *  self-run — speaks the same shape local-speech already implements (`POST {baseUrl}/audio/speech`),
+ *  so the *transport* did not need to change; only the address check did. LocalTtsProvider is reused as
+ *  is, which keeps one reviewed request path instead of a second implementation to keep in step. */
+export interface CustomTtsConfiguration {
+  readonly baseUrl: string;
+  readonly model: string;
+  readonly voice: string;
+  readonly provider: string;
+  readonly credentialRef: string;
+  readonly timeoutMs?: number;
+}
+
+/**
+ * Rejects anything that could aim a key at an unintended host.
+ *
+ * The safety boundary moved here from the supplier name, and it is deliberately tighter than "any
+ * http(s) URL": a non-loopback address must be https, because the API key is sent with the request and
+ * plain http would put it on the wire in clear text. Loopback may stay http, which is what a
+ * self-hosted server on the same machine needs. Embedded credentials, a query string, a fragment and
+ * any path other than /v1 are refused, and the operator must confirm the exact URL — the console shows
+ * it in full before saving. */
+export function validateCustomTts(value: unknown): CustomTtsConfiguration {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('自定义语音配置无效。');
+  const c = value as CustomTtsConfiguration;
+  let url: URL;
+  try { url = new URL(c.baseUrl); } catch { throw Error('服务地址无效，请填写完整的 http 或 https 地址。'); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw Error('服务地址只允许 http 或 https。');
+  const loopback = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname);
+  if (url.protocol === 'http:' && !loopback)
+    throw Error('非本机地址必须使用 https：API Key 会随请求发送，明文 http 会让它在网络中可见。');
+  if (url.username || url.password) throw Error('服务地址不能包含用户名或密码，凭据请单独填写。');
+  if (url.search || url.hash) throw Error('服务地址不能带查询串或锚点。');
+  if (!url.hostname) throw Error('服务地址缺少主机名。');
+  if (!['/v1', '/v1/'].includes(url.pathname)) throw Error('服务地址应指向 /v1，例如 https://example.com/v1。');
+  if (!/^[a-z][a-z0-9_-]{1,31}$/.test(c.provider)) throw Error('服务商名称只能用 2–32 位小写字母、数字、下划线或连字符。');
+  if (typeof c.credentialRef !== 'string' || !c.credentialRef.trim()) throw Error('请先保存该服务商的 API Key。');
+  if (typeof c.model !== 'string' || !c.model.trim() || c.model.length > 128) throw Error('请填写模型名称。');
+  if (typeof c.voice !== 'string' || !c.voice.trim() || c.voice.length > 128) throw Error('请填写音色名称。');
+  if (c.timeoutMs !== undefined && (!Number.isSafeInteger(c.timeoutMs) || c.timeoutMs < 1000 || c.timeoutMs > 180000)) throw Error('超时须为 1–180 秒。');
+  return Object.freeze({ ...c, baseUrl: c.baseUrl.replace(/\/$/, ''), timeoutMs: c.timeoutMs ?? 120000 });
+}
+
+/** One reviewed request path: the local and custom cases differ only in the address policy. */
+export function createCustomTtsProvider(config: CustomTtsConfiguration, store: MediaStorePort, request: typeof fetch = fetch): TtsProvider {
+  const validated = validateCustomTts(config);
+  // Marked because validateCustomTts, not validateLocalSpeech, is this config's authority: the model
+  // name is the operator's own and is deliberately absent from the reviewed local weights list.
+  const bridge = { baseUrl: validated.baseUrl,
+    ...(validated.timeoutMs === undefined ? {} : { timeoutMs: validated.timeoutMs }),
+    tts: { model: validated.model, voice: validated.voice } } as LocalSpeechConfiguration & { [SELF_VALIDATED]?: true };
+  bridge[SELF_VALIDATED] = true;
+  return new LocalTtsProvider(bridge, store, request);
 }

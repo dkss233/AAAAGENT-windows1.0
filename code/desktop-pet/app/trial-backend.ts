@@ -1,4 +1,4 @@
-import { LocalAsrProvider, LocalTtsProvider } from '../providers/local-speech.js';
+import { LocalAsrProvider, LocalTtsProvider, createCustomTtsProvider } from '../providers/local-speech.js';
 import { selectTrialDialogue } from './dialogue-selection.js';
 import { isOutside, isPrivateFileSync } from '../core/platform-files.js';
 import { countRequestInput,inputBudgetInfo,DEFAULT_CURRENT_EMOTION_RESERVE_TOKENS } from '../providers/input-count.js';
@@ -25,7 +25,7 @@ import { SplitPerceptionProvider } from '../providers/split-perception.js';
 import { StrictManagementForget, withStrictManagementForget } from './management-forget.js';
 import { assertCompanionDataConfiguration } from './companion-data.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, statSync, realpathSync } from 'node:fs';
+import { readFileSync, statSync, realpathSync, appendFileSync } from 'node:fs';
 import { appendFile, mkdir, open, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -303,9 +303,14 @@ export async function startTrialBackend(environment: NodeJS.ProcessEnv = process
     const mediaStore = new MemoryMediaStore();
     const makeAsr = (media: MediaStorePort) => configuration.localSpeech?.asr
       ? new LocalAsrProvider(configuration.localSpeech, media) : new QwenAsrProvider(endpoint('asr'), media, transport);
-    const makeTts = (media: MediaStorePort) => configuration.localSpeech?.tts
-      ? new LocalTtsProvider(configuration.localSpeech, media)
-      : createTrialTtsProvider(settings.effective.providers.tts, endpoint('tts'), media, transport, voices);
+    // Precedence: an operator-configured endpoint wins over both, because selecting it is an explicit
+    // act in the console. localSpeech stays ahead of the catalogue so an existing local setup keeps
+    // working unchanged.
+    const makeTts = (media: MediaStorePort) => configuration.customTts
+      ? createCustomTtsProvider(configuration.customTts, media)
+      : configuration.localSpeech?.tts
+        ? new LocalTtsProvider(configuration.localSpeech, media)
+        : createTrialTtsProvider(settings.effective.providers.tts, endpoint('tts'), media, transport, voices);
     const admission = new TrialAdmission(endpoint('admission'), transport,
       (scope, text, signal) => configuration.purpose==='user-trial' ? memory.foregroundContext(scope,`${scope.turnId}:user`,text,null,signal) : memory.context(scope, text, null, signal), async value => {
         if (value.rejected && configuration.purpose === 'smoke-text') await authorizer.stop('admission_rejected');

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { isQwenAudioTtsModel } from '../providers/qwen-audio-tts.js';
-import { validateLocalSpeech, type LocalSpeechConfiguration } from '../providers/local-speech.js';
+import { validateLocalSpeech, validateCustomTts, type LocalSpeechConfiguration, type CustomTtsConfiguration } from '../providers/local-speech.js';
 import { validateLocalDialogue, type LocalDialogueConfiguration } from '../providers/local-dialogue.js';
 import { MEMORY_SEMANTIC_INPUT_LIMIT } from './memory-semantic-format.js';
 
@@ -87,7 +87,7 @@ export type TrialOperation = 'asr' | 'dialogue' | 'memory_turn' | 'summary' | 'p
 export interface TrialModel {
   readonly contextWindowTokens?: number;
   readonly targetInputTokens?: number;
-  readonly provider: 'deepseek' | 'dashscope';
+  readonly provider: 'deepseek' | 'dashscope' | (string & {});
   readonly model: string;
   readonly endpoint: string;
   readonly credentialFile: string;
@@ -106,6 +106,10 @@ export interface TrialConfiguration {
   readonly outputMode?: 'voice' | 'text';
   /** Windows local speech override; cloud dialogue and memory settings stay independent. */
   readonly localSpeech?: LocalSpeechConfiguration;
+  /** Operator-configured OpenAI-compatible TTS endpoint. Its address is the operator's own choice,
+   *  so it is validated by validateCustomTts (scheme/userinfo/query/path) rather than by the supplier
+   *  allow-list below. Declared here so a custom supplier needs no code change to be selectable. */
+  readonly customTts?: CustomTtsConfiguration;
   /** Opt-in foreground replies only; strict memory, summary and admission remain independently configured. */
   readonly localDialogue?: LocalDialogueConfiguration;
   readonly version: 1;
@@ -212,14 +216,25 @@ export function validateTrialConfiguration(value: unknown): TrialConfiguration {
     if (!m) return fail('实际模型未配置。');
     if (typeof m.model !== 'string' || !m.model.trim() || !positive(m.reservationMicros) || (!unlimited&&m.reservationMicros > (c.purpose === 'user-trial' ? c.limitMicros! : c.phaseLimitMicros))) fail('实际模型或调用预留未配置。');
     if (typeof m.credentialFile !== 'string' || !isAbsolute(m.credentialFile) || within(c.projectRoot, m.credentialFile)) fail('凭据须使用项目外的受限文件。');
-    const expected = m.provider === 'deepseek' ? 'https://api.deepseek.com/chat/completions'
-      : m.provider === 'dashscope' ? operation === 'tts' ? isQwenAudioTtsModel(m.model)
-        ? 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
-        : 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation'
-        : 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions' : null;
-    if (!expected || m.endpoint !== expected) fail('模型服务地址不在已登记供应商范围。');
+    // A custom TTS supplier names its own address, so the reviewed-allow-list check does not apply.
+    // The endpoint is instead matched against the operator's saved customTts.baseUrl, which keeps the
+    // two in step: the address that will actually be called is the confirmed one, not an arbitrary
+    // string in the model block. Every other operation still has to name a reviewed endpoint.
+    const customTts = operation === 'tts' && c.customTts ? validateCustomTts(c.customTts) : undefined;
+    if (customTts) {
+      if (m.provider !== customTts.provider) fail('自定义语音的服务商名称与语音设置不一致。');
+      if (m.endpoint !== customTts.baseUrl + '/audio/speech') fail('自定义语音的服务地址与语音设置不一致。');
+    } else {
+      const expected = m.provider === 'deepseek' ? 'https://api.deepseek.com/chat/completions'
+        : m.provider === 'dashscope' ? operation === 'tts' ? isQwenAudioTtsModel(m.model)
+          ? 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
+          : 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation'
+          : 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions' : null;
+      if (!expected || m.endpoint !== expected) fail('模型服务地址不在已登记供应商范围。');
+    }
     if (operation === 'memory_turn' && m.provider !== 'deepseek') fail('试用严格语义记忆须明确配置DeepSeek，不回退旧维护器。');
-    if (['asr', 'perception', 'tts'].includes(operation) && m.provider !== 'dashscope') fail('感知和语音需要已登记的DashScope配置。');
+    if (['asr', 'perception'].includes(operation) && m.provider !== 'dashscope') fail('感知和语音识别需要已登记的DashScope配置。');
+    if (operation === 'tts' && !customTts && m.provider !== 'dashscope') fail('语音合成需要已登记的DashScope配置，或在语音设置里添加自定义服务商。');
     if (['dialogue', 'summary', 'admission'].includes(operation) && m.provider === 'deepseek'
       && (m.model !== 'deepseek-flash' || m.inputMicrosPerToken !== 2 || m.outputMicrosPerToken !== 8
         || m.inputTokenLimit > (operation === 'dialogue' ? 1048576 : 32768) || m.outputTokenLimit > 393216
@@ -246,6 +261,7 @@ export function validateTrialConfiguration(value: unknown): TrialConfiguration {
     if (m.thinking !== undefined && (operation !== 'memory_turn' || m.thinking !== 'high')) fail('模型思考配置不受当前适配器支持。');
   }
   if (c.localSpeech !== undefined) validateLocalSpeech(c.localSpeech);
+  if (c.customTts !== undefined) validateCustomTts(c.customTts);
   if (c.localDialogue !== undefined) validateLocalDialogue(c.localDialogue);
   return structuredClone(c);
 }

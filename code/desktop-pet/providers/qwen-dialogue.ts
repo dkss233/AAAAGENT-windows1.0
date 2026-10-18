@@ -68,7 +68,10 @@ export class JsonDialogueProvider implements DialogueProvider {
     checkAbort(signal);
     const reply = parseModelJson(completedText(raw)), text = normalizeSpokenText(string(reply.text), built.currentMessage);
     const intent = expression(reply.expression);
-    const emotionAssessment = forgetting ? undefined : parseEmotionAssessment(reply.emotionAssessment,input);
+    // The assembled context omits this turn (memory/context.ts skips it), so the message identity is
+    // supplied here rather than looked up in `recent`, where it is never present.
+    const emotionAssessment = forgetting ? undefined : parseEmotionAssessment(reply.emotionAssessment,input,
+      { id: `${input.scope.turnId}:user`, version: 1 });
     if (this.visualPolicy) {
       const enabled = new Set(this.visualPolicy().presets.map(p => p.id));
       // Reread after model latency. Only the visual projection is filtered; words and TTS intent survive.

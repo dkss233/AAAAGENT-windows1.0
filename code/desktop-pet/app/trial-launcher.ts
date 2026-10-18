@@ -164,6 +164,23 @@ export async function hasConfiguration(projectRoot: string): Promise<boolean> {
  * which is what makes the packaged build relocatable. We wait for that pair and then continue
  * into a normal launch, so the operator never sees a command line.
  */
+/**
+ * Setup takes an exclusive lock and refuses to start while a live owner holds it, so a first run
+ * that the operator simply closed must not keep holding it for the rest of SETUP_WAIT_MS.
+ *
+ * This launcher is spawned detached so it can outlive the console during a normal launch. During
+ * first-run setup that same property is a trap: closing the window leaves the process waiting with
+ * the lock, and the next attempt is refused with "另一个设置进程仍存在".
+ *
+ * The launcher that spawned us (`tools/aaaagent-start.mjs`) is not detached, so it dies with its
+ * window. When it told us its pid, watch that pid and give up as soon as it is gone. Harnesses that
+ * do not set the variable keep the previous behaviour exactly.
+ */
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
 export async function configureFirstRun(projectRoot: string): Promise<void> {
   const files = trialFiles(projectRoot);
   // Setup takes an exclusive lock. A lock whose owner is gone would otherwise make every
@@ -186,18 +203,31 @@ export async function configureFirstRun(projectRoot: string): Promise<void> {
   }
   process.stdout.write(`\n请在浏览器中完成设置（填写 API Key、选择 Live2D 模型文件夹）：\n` + service.url + `\n\n`);
   openInBrowser(service.url);
+  const parentPid = Number(process.env.AAAAGENT_LAUNCHER_PARENT_PID);
+  const watched = Number.isSafeInteger(parentPid) && parentPid > 1 ? parentPid : undefined;
+  let parentExit: ReturnType<typeof setInterval> | undefined;
   try {
     // Wait for the pair to appear. The timeout only stops an indefinite wait; the URL is
     // already printed, so the operator can finish in the browser at their own pace.
-    await new Promise<void>((done) => {
+    await new Promise<void>((done, reject) => {
       const deadline = Date.now() + SETUP_WAIT_MS;
       const timer = setInterval(() => {
         void hasConfiguration(projectRoot).then((ready) => {
           if (ready || Date.now() > deadline) { clearInterval(timer); done(); }
         });
       }, 1000);
+      if (watched !== undefined) {
+        parentExit = setInterval(() => {
+          if (processAlive(watched)) return;
+          clearInterval(timer); clearInterval(parentExit);
+          reject(new TrialNotReadyError('设置窗口已关闭，本次设置未完成；重新运行 启动桌宠.cmd 会重新打开设置页面。'));
+        }, 1000);
+      }
     });
-  } finally { await service.close(); }
+  } finally {
+    if (parentExit !== undefined) clearInterval(parentExit);
+    await service.close();
+  }
   if (!await hasConfiguration(projectRoot)) {
     throw new TrialNotReadyError('设置尚未完成。请重新运行以继续完成设置页面。');
   }

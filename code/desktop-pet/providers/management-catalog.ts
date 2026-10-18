@@ -3,6 +3,8 @@ import type { TrialConfiguration, TrialModel } from '../app/trial-config.js';
 import type { ProviderAdapterInfo, ProviderSelection, ProviderSlot } from '../contracts/management.js';
 import type { RegisteredVoice } from './registered-voices.js';
 import { MINIMAX_TTS_MODEL, MINIMAX_TTS_ENDPOINT } from './minimax-tts.js';
+import { QWEN_AUDIO_TTS_V31_MODEL } from './qwen-audio-tts.js';
+import { validateCustomTts } from './local-speech.js';
 
 type Selection = Omit<ProviderSelection, 'credentialRef'>;
 type Choice = NonNullable<ProviderAdapterInfo['choices']>[number];
@@ -80,6 +82,10 @@ function baseline(slot: ProviderSlot, model: TrialModel): Selection {
     ...(slot === 'tts' ? { voice: 'Cherry', language: 'Chinese' } : {}) };
 }
 
+/** Adapter id for an operator-configured OpenAI-compatible TTS endpoint. Exported so the settings
+ *  validator and the catalogue agree on one spelling. */
+export const CUSTOM_TTS_ADAPTER_ID = 'custom-openai-tts';
+
 /** Metadata only. The caller supplies the registered baseline; no file, key, device or network access. */
 export function managementAdapterCatalog(base: TrialConfiguration, registeredVoices: readonly RegisteredVoice[] = []): ProviderAdapterInfo[] {
   const catalog: ProviderAdapterInfo[] = slots.filter(slot=>base.models[slot]).map(slot => {
@@ -126,22 +132,37 @@ export function managementAdapterCatalog(base: TrialConfiguration, registeredVoi
     characterMicros: 100, reservationMicros: 400_000, voice: 'longanfengyue' };
   const qwenAudioPlus: Selection = { ...qwenAudio, model: 'qwen-audio-3.0-tts-plus',
     characterMicros: 140, voice: 'longanlingxin' };
+  // 3.1 shares the 3.0 endpoint but not the voices; the ids carry a _v3.1 suffix.
+  const qwenAudioV31: Selection = { ...qwenAudio, model: QWEN_AUDIO_TTS_V31_MODEL, voice: 'longpaopao_v3.1' };
   catalog.push({ id: qwenAudio.adapterId, label: 'QwenAudio 情绪语音', slots: ['tts'], provider: 'dashscope',
-    endpoints: [qwenAudio.endpoint], modelHint: qwenAudio.model, models: [qwenAudio.model, qwenAudioPlus.model],
+    endpoints: [qwenAudio.endpoint], modelHint: qwenAudio.model,
+    models: [qwenAudio.model, qwenAudioPlus.model, qwenAudioV31.model],
     choices: [{ label: 'QwenAudio 3.0 Flash（系统音色）', configuration: qwenAudio,
       voices: [{ id: 'longanfengyue', label: '龙安风悦' }, { id: 'longanlingxi', label: '龙安灵希' }] },
     { label: 'QwenAudio 3.0 Plus（旗舰系统音色）', configuration: qwenAudioPlus,
-      voices: [{ id: 'longanlingxin', label: '龙安灵心' }] }],
+      voices: [{ id: 'longanlingxin', label: '龙安灵心' }] },
+    { label: 'QwenAudio 3.1 Flash（含龙泡泡）', configuration: qwenAudioV31,
+      voices: [
+        { id: 'longpaopao_v3.1', label: '龙泡泡' },
+        { id: 'qiaoxiaojiao_v3.1', label: '乔小娇 · 俏丽可爱' },
+        { id: 'yuxiaoyun_v3.1', label: '于小云 · 元气亲切' },
+        { id: 'xiaxiaochen_v3.1', label: '夏小晨 · 元气明亮' },
+        { id: 'longanhuan_v3.1', label: '龙安欢' },
+        { id: 'longanlingxin_v3.1', label: '龙安灵心' },
+        { id: 'longanfengyue_v3.1', label: '龙安风悦' },
+        { id: 'xunanchuan_v3.1', label: '许南川 · 男' },
+        { id: 'anmingyuan_v3.1', label: '安明远 · 男' },
+      ] }],
     capabilities: { instructions: true, cloning: false, voice: true, language: false, temperature: false },
     status: 'available',
-    note: '官方资料核对：2026-09-11。系统音色支持中文和英文；Flash与Plus音色不能混用。此接入不提供语言参数、流式播放或声音复刻。北京每万计费字符Flash 1元、Plus 1.4元，每段保守预留0.40元，按实际计费字符结算。Plus样音已在本地修复文件头并通过播放格式检查；未做新旧音色试听比较，旗舰为官方定位。' });
+    note: '官方资料核对：2026-09-11；3.1 音色表逐个实测。系统音色支持中文和英文；三代音色不能混用——3.1 的 id 必须带 _v3.1 后缀，用 3.0 的名字会被服务端拒绝（Engine error [411]）。此接入不提供语言参数、流式播放或声音复刻。北京每万计费字符Flash 1元、Plus 1.4元、3.1 Flash 1元，每段保守预留0.40元，按实际计费字符结算。' });
   const audio = catalog[catalog.length - 1]!;
   for (const choice of audio.choices!) {
     const compatible = registeredVoices.filter(voice => voice.provider === choice.configuration.provider
       && voice.endpoint === choice.configuration.endpoint && voice.targetModel === choice.configuration.model);
     choice.voices = [...(choice.voices ?? []), ...compatible.map(voice => ({ id: voice.voiceId, label: voice.label }))];
   }
-  if (registeredVoices.some(voice => voice.endpoint === qwenAudio.endpoint && [qwenAudio.model, qwenAudioPlus.model].includes(voice.targetModel))) {
+  if (registeredVoices.some(voice => voice.endpoint === qwenAudio.endpoint && [qwenAudio.model, qwenAudioPlus.model, qwenAudioV31.model].includes(voice.targetModel))) {
     audio.capabilities.cloning = true;
     audio.note = '已登记的克隆音色与具体模型、服务地址和凭据绑定；保存选择时会核对，不支持任意输入音色ID。系统与克隆音色均可选择。北京每万计费字符Flash 1元、Plus 1.4元，每段预留0.40元，沿原账本按实际用量结算。完整WAV后播放；克隆相似度和听感需实际试听判断。';
   }
@@ -161,6 +182,24 @@ export function managementAdapterCatalog(base: TrialConfiguration, registeredVoi
       models: minimaxChoices.map(choice => choice.configuration.model), choices: minimaxChoices,
       capabilities: { instructions: false, cloning: true, voice: true, language: false, temperature: false }, status: 'available',
       note: '使用已登记的音色，按实际合成字符计费，Turbo每万字符2元，HD每万字符3.5元。不指定情绪参数，由模型根据文本生成语气；完整生成后播放。需要在百炼开通所选模型；保存Key不代表已开通。预设可先查看，完成音色复刻与首次正式启用后才可选择对应已登记音色。' });
+  }
+  // The operator-defined supplier appears only once one is configured: it is not a reviewed default,
+  // so offering an empty shell would invite a selection that cannot work. Its entry mirrors the saved
+  // customTts block so the console can display the exact address that will be called.
+  if (base.customTts) {
+    const custom = validateCustomTts(base.customTts);
+    const endpoint = custom.baseUrl + '/audio/speech';
+    catalog.push({ id: CUSTOM_TTS_ADAPTER_ID, label: `自定义语音 · ${custom.provider}`, slots: ['tts'],
+      provider: custom.provider, endpoints: [endpoint], modelHint: custom.model, models: [custom.model],
+      choices: [{ label: `${custom.model}（自定义服务商）`,
+        configuration: { adapterId: CUSTOM_TTS_ADAPTER_ID, provider: custom.provider, model: custom.model,
+          endpoint, inputTokenLimit: 0, outputTokenLimit: 0, inputMicrosPerToken: 0, outputMicrosPerToken: 0,
+          characterMicros: base.models.tts.characterMicros ?? 0, reservationMicros: base.models.tts.reservationMicros,
+          voice: custom.voice },
+        voices: [{ id: custom.voice, label: custom.voice }] }],
+      capabilities: { instructions: false, cloning: false, voice: true, language: false, temperature: false },
+      status: 'available',
+      note: `请求地址：${endpoint}。这是你自己填写的服务地址，请确认它是你信任的服务商。按你登记的字符费率记账；实际计费由该服务商决定。` });
   }
   return catalog;
 }

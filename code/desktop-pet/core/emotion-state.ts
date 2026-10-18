@@ -26,12 +26,41 @@ export class EmotionTurns implements EmotionTurnPort {
     return out;
   }
   prepare(context:DialogueContext,message:SourceVersion,text:string):EmotionInferenceInput|null {
-    if(this.closed || !context.emotionBackground || this.store.pending.has(context.scope.characterId))return null;
+    // Deliberately NOT gated on context.emotionBackground.
+    //
+    // That gate made the whole feature unreachable. assembleContext only attaches the background once
+    // an observation exists, and the background's only source is the stored state — so on a fresh
+    // install there is nothing to attach, prepare() refuses, complete() is never called, and no
+    // observation is ever written. The state stayed null forever and the console showed 暂无 for both
+    // subjects no matter how long the conversation ran.
+    //
+    // Nothing downstream needs it either: the ticket carries its own `background`, which is read
+    // straight from the store, and complete() never looks at context.emotionBackground. The store
+    // still supplies the background the moment one exists, so a warm state keeps the prompt context.
+    // Deliberately NOT gated on this.store.pending either.
+    //
+    // That guard is a MEMORY privacy hold: while a correction/forget request is outstanding, stored
+    // personal material must not be re-committed or reused. Emotion capture is not that operation — it
+    // reads the user's own current message, writes one observation about this turn, and never consults
+    // or rewrites remembered facts. Reusing the guard here coupled the two, and because a FAILED hold is
+    // never released (see PendingMutations.has) a single failed memory turn suppressed every later
+    // emotion observation for the character. The console then showed a stale mood with no explanation,
+    // and nothing in the emotion path could ever clear it.
+    if(this.closed)return null;
     const current=this.store.inspect(context.scope,message.id);
     if(!current||current.version!==message.version||current.state!=='active'||current.text!==text)return null;
-    // Reuse exact issued selections: summaries/memories may influence the same foreground model.
-    // Keeping their source versions also prevents emotional state from surviving their correction.
-    const evidence=this.store.lifecycle.contextSources(context);
+    // The current message is part of the evidence by definition: the ticket is ABOUT this message, and
+    // store.prepare() rejects evidence that does not name it (ticket_missing_current_message).
+    //
+    // It cannot be inherited from the context, because the current user message is deliberately kept
+    // OUT of the assembled context — assembleContext selects only prior turns, so the context's source
+    // list never names it. The emotion background used to carry it once a mood existed, which is
+    // exactly the ordering that locked the feature out of its own first turn: no mood, no evidence, no
+    // ticket, no mood.
+    //
+    // Reuse exact issued selections for the rest: summaries/memories may influence the same foreground
+    // model, and keeping their source versions prevents emotional state from surviving a correction.
+    const evidence=[{id:current.id,version:current.version},...this.store.lifecycle.contextSources(context)];
     const ticket=this.state.prepare(context.scope,{id:current.id,version:current.version},evidence);
     return structuredClone({ticket,text,recent:context.recent,background:ticket.background,perception:context.perception});
   }
@@ -42,7 +71,11 @@ export class EmotionTurns implements EmotionTurnPort {
       user:value.user&&normalizeUserEmotion(value.user.label)?{...value.user,label:normalizeUserEmotion(value.user.label)!,subject:'user',provenance:'text_recent_context',sources:input.ticket.evidence}:null,
       companion:value.companion?{...value.companion,subject:'companion',provenance:'companion_inference',sources:input.ticket.evidence}:null});
     try {
-      if(assessment?.user||assessment?.companion||!this.backgroundProvider){this.state.apply(input.ticket,bind(assessment??{user:null,companion:null}),'dialogue');return;}
+      if(assessment?.user||assessment?.companion||!this.backgroundProvider){
+        const bound=bind(assessment??{user:null,companion:null});
+        this.state.apply(input.ticket,bound,'dialogue');
+        return;
+      }
       const controller=new AbortController();this.jobs.set(input.ticket.id,{scope:input.ticket.scope,controller});
       const frozen=structuredClone(input);
       void Promise.resolve().then(()=>{if(this.closed||controller.signal.aborted)throw Error('cancelled');return this.backgroundProvider!.infer(frozen,controller.signal);}).then(result=>{

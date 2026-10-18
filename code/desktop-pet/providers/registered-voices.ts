@@ -6,6 +6,10 @@ import { dirname, resolve } from 'node:path';
 export interface RegisteredVoice {
   readonly voiceId: string;
   readonly label: string;
+  /** Deliberately stays the literal 'dashscope': a registration is proof that one supplier issued this
+   *  voice for this model, and only the reviewed enrolment path can produce that proof. Widening the
+   *  name here would let a record claim a supplier that never enrolled anything, which the registry
+   *  test asserts against. A custom TTS supplier names its voice directly instead of registering it. */
   readonly provider: 'dashscope';
   readonly endpoint: string;
   readonly targetModel: string;
