@@ -2,7 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { access, readdir, stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
-import { CodexAppConnection, CodexAppError, type CodexAppReceipt } from './codex-app.js';
+import Database from 'better-sqlite3';
+import { CodexAppConnection, CodexAppError, type CodexAppReceipt, type CodexAppTarget } from './codex-app.js';
 
 type Pending = { resolve(value: any): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
 const uuid = (value: string) => /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(value);
@@ -98,9 +99,36 @@ export class CodexWindowsConnection extends CodexAppConnection {
     })();
     try { await this.starting; } catch (error) { this.child?.kill(); this.fail(); throw error; }
   }
+  /**
+   * Windows keeps the App's task list in its own catalog table, not the macOS threads table, so the
+   * inherited listing would always throw. Read-only, local host only, and user-visible tasks only:
+   * the desktop App writes source_kind 'vscode' | 'cli' for tasks it can reopen, while cloud/chatgpt
+   * rows have no local conversation to continue.
+   *
+   * The query matches the thread id as well as the title and directory, because confirmation re-reads
+   * a chosen target by id (forwarding.validatePrepare). A directory is required too: a task without a
+   * working directory cannot be resolved for forwarding, so offering it would only fail later.
+   */
+  override list(query = '', limit = 200): CodexAppTarget[] {
+    if (query.length > 200 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new CodexAppError('invalid_target');
+    let db: Database.Database | undefined;
+    try {
+      db = new Database(join(this.home, 'sqlite', 'codex-dev.db'), { readonly: true, fileMustExist: true });
+      const rows = db.prepare("SELECT thread_id, display_title, cwd FROM local_thread_catalog WHERE host_id='local' AND missing_candidate=0 AND source_kind IN ('vscode','cli') AND IFNULL(cwd,'') <> '' AND (thread_id LIKE ? OR IFNULL(display_title,'') LIKE ? OR cwd LIKE ?) ORDER BY source_updated_at DESC, rowid DESC LIMIT ?")
+        .all('%' + query + '%', '%' + query + '%', '%' + query + '%', limit) as { thread_id: string; display_title: string | null; cwd: string | null }[];
+      return rows.filter(row => uuid(row.thread_id)).map(row => ({ threadId: row.thread_id, hostId: 'local' as const,
+        title: row.display_title?.trim() || '未命名任务', projectPath: row.cwd! }));
+    } catch { throw new CodexAppError('unavailable'); } finally { db?.close(); }
+  }
+  /**
+   * Compatible means this app-server answers. account/read is asked as a bonus, but only an explicit
+   * signed-out answer refuses: that call reaches the network, and a blocked or slow network is not
+   * evidence that the App is missing or unusable. An actual send still fails closed on its own.
+   */
   async compatible(): Promise<boolean> {
-    try { await this.start(); const auth = await this.rpc('account/read', { refreshToken: false }); return !!auth?.account; }
-    catch { return false; }
+    try { await this.start(); } catch { return false; }
+    try { const auth = await this.rpc('account/read', { refreshToken: false }); return auth?.account !== null && auth?.account !== undefined; }
+    catch { return true; }
   }
   override async discover(threadId: string): Promise<{ available: boolean }> {
     if (!uuid(threadId)) throw new CodexAppError('invalid_target');
