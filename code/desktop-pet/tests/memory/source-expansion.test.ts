@@ -15,7 +15,13 @@ async function setup(t:TestContext){
   const first=(input:MemoryTurnInput):MemoryTurnPlan=>({...none(input),request:'forget',suppressSources:['cat-raw','request'].map(id=>({id,version:input.sources.find(s=>s.id===id)!.version})),changes:[change({type:'soft_delete',id:'cat',expectedVersion:1},'delete-cat',input.scope)]});
   const complete=(input:MemoryTurnInput):MemoryTurnPlan=>({...first(input),suppressSources:[...first(input).suppressSources,{id:'seed:assistant',version:1}],retainSources:[{source:{id:'seed:assistant',version:1},fragmentId:'f0',start:5,end:10,supportSourceIds:['daily']}]});
   const port=(provider:(input:MemoryTurnInput)=>Promise<MemoryTurnPlan>,max:0|1|null=1,budget=32768)=>lifecycle(store,provider,undefined,{context:{...contextOptions,maxRecentMessages:2},turn:{provider:{plan:provider},inputTokenBudget:budget,countTokens:memoryTurnInputUpperBound,...(max===null?{}:{maxSupplementaryPlans:max})}});
-  const assertUnchanged=()=>{assert.equal(store.inspect(owned,'cat')!.state,'active');assert.equal(store.inspect(owned,'cat-raw')!.state,'active');assert.equal(store.inspect(owned,'request')!.state,'active');assert.equal(store.inspect(owned,'seed:assistant')!.state,'active');assert.equal(store.lifecycle.outcome(owned,'request','忘记猫名'),null);assert.equal(store.visible(owned,'transcript').filter(r=>r.fragment).length,0);};
+  const assertUnchanged=(recorded:'none'|'clarification'='none')=>{assert.equal(store.inspect(owned,'cat')!.state,'active');assert.equal(store.inspect(owned,'cat-raw')!.state,'active');assert.equal(store.inspect(owned,'request')!.state,'active');assert.equal(store.inspect(owned,'seed:assistant')!.state,'active');
+    // A clarification is a recorded DECISION now, not an absence of one. That is still not a business
+    // effect, so the record must carry no changes while everything else stays untouched.
+    const outcome=store.lifecycle.outcome(owned,'request','忘记猫名');
+    if(recorded==='none')assert.equal(outcome,null);
+    else{assert.equal(outcome?.status,'needs_clarification');assert.deepEqual(outcome?.affectedIds,[]);assert.deepEqual(outcome?.results,[]);assert.equal(outcome?.retrievalInvalidated,false);}
+    assert.equal(store.visible(owned,'transcript').filter(r=>r.fragment).length,0);};
   return {f,store,owned,first,complete,port,assertUnchanged,run:(p:ReturnType<typeof port>,s=signal())=>p.prepareTurn(owned,'request','忘记猫名',s)};
 }
 
@@ -89,7 +95,9 @@ test('old role write is rejected during supplementary planning without poisoning
 test('cancellation while awaiting supplementary plan cannot persist its late fragments',async t=>{
   const f=await setup(t),delayed=deferred<MemoryTurnPlan>();let expanded!:MemoryTurnInput,calls=0;const controller=new AbortController();
   const pending=f.run(f.port(async input=>{if(++calls===1)return f.first(input);expanded=input;return delayed.promise;}),controller.signal);
-  while(calls<2)await new Promise(resolve=>setImmediate(resolve));controller.abort(new Error('cancel-expanded'));
+  // Bounded on purpose: an unbounded wait here turns any missing second plan into a silent spin that
+  // no test timeout can interrupt, which is how a real regression once looked like a hang.
+  for(let spins=0;calls<2&&spins<2000;spins++)await new Promise(resolve=>setImmediate(resolve));controller.abort(new Error('cancel-expanded'));
   await assert.rejects(pending,/cancel-expanded/);delayed.resolve(f.complete(expanded));await new Promise(resolve=>setImmediate(resolve));f.assertUnchanged();
 });
 
@@ -122,5 +130,5 @@ test('same-role epoch change before expansion prevents a second model call',asyn
 
 test('clarification after supplementation remains a clarification with no effects',async t=>{
   const f=await setup(t);let calls=0;const result=await f.run(f.port(async input=>++calls===1?f.first(input):{...none(input),request:'forget',clarification:'你指哪段经历？'}));
-  assert.equal(result.status,'needs_clarification');assert.equal(calls,2);f.assertUnchanged();
+  assert.equal(result.status,'needs_clarification');assert.equal(calls,2);f.assertUnchanged('clarification');
 });

@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import type { TurnScope } from '../contracts/index.js';
 import type { SourceVersion } from '../contracts/memory-lifecycle.js';
 import type { MemoryRecord } from './ledger.js';
+import { MemoryRuleError } from './scope.js';
 
 export interface SourceNode {
   id: string; kind: MemoryRecord['kind']; state: MemoryRecord['state']; version: number;
@@ -16,7 +17,11 @@ export const readable = (node: SourceNode): boolean => node.state === 'active' &
  * add related long-term records and direct supports, never walk an assistant's whole context backwards. */
 export function related(graph: Map<string, SourceNode>, seed: string): Set<string> {
   const found=new Set([seed]);
-  for(let changed=true;changed;){
+  // Every iteration must add a node, so graph.size iterations is the hard ceiling. The read path is
+  // synchronous, so a widening of the evidence rules that stops making progress would freeze the
+  // whole backend with no timeout able to interrupt it.
+  for(let changed=true,guard=0;changed;){
+    if(++guard>graph.size+2)throw new MemoryRuleError('source_graph_not_converging');
     changed=false;
     const add=(id:string)=>{if(!found.has(id)){found.add(id);changed=true;}};
     for(const id of [...found]){
@@ -36,7 +41,9 @@ export function related(graph: Map<string, SourceNode>, seed: string): Set<strin
 /** Optional preflight enrichment. Submission recomputes this against the actual mutation plan. */
 export function effectCandidates(graph:Map<string,SourceNode>,seeds:Iterable<string>):Set<string>{
   const roots=new Set(seeds);
-  for(let changed=true;changed;){changed=false;for(const id of descendants(graph,roots)){
+  for(let changed=true,guard=0;changed;){
+    if(++guard>graph.size+2)throw new MemoryRuleError('source_graph_not_converging');
+    changed=false;for(const id of descendants(graph,roots)){
     const node=graph.get(id);if(node?.kind==='summary')for(const ref of node.sources){
       const source=graph.get(ref.id);if(source?.kind==='transcript'&&source.state==='active'&&!roots.has(ref.id)){roots.add(ref.id);changed=true;}
     }
@@ -45,7 +52,8 @@ export function effectCandidates(graph:Map<string,SourceNode>,seeds:Iterable<str
 }
 export function descendants(graph: Map<string, SourceNode>, roots: Iterable<string>): Set<string> {
   const found = new Set(roots);
-  for (let changed=true;changed;) {
+  for (let changed=true,guard=0;changed;) {
+    if(++guard>graph.size+2)throw new MemoryRuleError('source_graph_not_converging');
     changed=false;
     for (const node of graph.values()) if (!found.has(node.id) && node.sources.some(source=>found.has(source.id))) {found.add(node.id);changed=true;}
   }

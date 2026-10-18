@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
-import type { SummaryInput, SummaryProposal } from '../../contracts/memory-lifecycle.js';
+import type { MemoryTurnInput, MemoryTurnPlan, SummaryInput, SummaryProposal } from '../../contracts/memory-lifecycle.js';
 import { fixture, scope, message, NOW, change } from './sqlite-fixture.js';
-import { lifecycle, summaryProposal, forget, signal, deferred } from './lifecycle-fixture.js';
+import { lifecycle, summaryProposal, forget, none, signal, deferred } from './lifecycle-fixture.js';
 
 test('summary threshold, bounded input and restart coverage avoid duplicate generation',async t=>{
   const f=fixture();t.after(f.cleanup);let store=f.open();let calls=0;let input!:SummaryInput;
@@ -79,13 +79,20 @@ test('summary budget failure and cancellation make no persistent proposal',async
   await assert.rejects(pending,/summary-cancel/);delayed.resolve(summaryProposal(input));await new Promise(resolve=>setImmediate(resolve));assert.deepEqual(store.visible(scope(),'summary'),[]);
 });
 
-test('summary ancestor group exceeding raw count is rejected before model without dropping unseen text',async t=>{
+test('a summary bundle that cannot fit the raw budget is skipped, and a forget that needs it is rejected instead of half applied',async t=>{
   const f=fixture();t.after(f.cleanup);const store=f.open();store.append(scope(),[message('a','那次面试失败了'),message('b','那次面试让我失望')]);
   const generated=await lifecycle(store).summarizePending(scope(),signal());store.append(scope(),[message('request','请忘记摘要里的面试经历')]);let calls=0;
-  const port=lifecycle(store,async input=>{calls++;return forget(input,[generated.summaryId!]);},undefined,{context:{inputTokenBudget:10000,maxRecentMessages:1,maxMemories:0,summaryLimit:2,countTokens:()=>1,relevance:()=>1}});
+  // The plan references the skipped summary by id: the fixture helper would look its version up in the
+  // turn input, and it is deliberately absent from it.
+  const port=lifecycle(store,async input=>{calls++;const plan:MemoryTurnPlan={...none(input),request:'forget',suppressSources:[{id:generated.summaryId!,version:1}],changes:[],reason:'skip bundle'};return plan;},undefined,{context:{inputTokenBudget:10000,maxRecentMessages:1,maxMemories:0,summaryLimit:2,countTokens:()=>1,relevance:()=>1}});
   const outcome=await port.prepareTurn(scope(),'request','请忘记摘要里的面试经历',signal());
-  assert.equal(outcome.rejectionCode,'turn_source_group_exceeds_budget');assert.equal(calls,0);
-  assert.equal(store.inspect(scope(),'a')!.state,'active');assert.equal(store.inspect(scope(),generated.summaryId!)!.state,'active');
+  // The summary plus its two raw ancestors is a bundle of 3 transcripts against a budget of 1, so the
+  // bundle is skipped whole (recorded as omitted) rather than rejecting the read. The plan may then only
+  // reference what was actually read, so the forget is refused: never a partial forget.
+  assert.equal(outcome.status,'rejected');assert.equal(calls,1);
+  assert.equal(store.inspect(scope(),generated.summaryId!)!.state,'active');
+  assert.equal(store.inspect(scope(),'a')!.state,'active');assert.equal(store.inspect(scope(),'b')!.state,'active');
+  assert.equal(store.lifecycle.outcome(scope(),'request','请忘记摘要里的面试经历'),null);
 });
 
 test('explicit summary plus its raw ancestor is a valid plan, not a duplicate inferred suppression',async t=>{

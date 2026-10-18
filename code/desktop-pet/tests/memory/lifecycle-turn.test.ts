@@ -70,8 +70,12 @@ test('ambiguous target and explicit no-action forget do not mutate business data
   const f=fixture();t.after(f.cleanup);const store=f.open();store.append(scope(),[message('raw','面试失败了，另外我养的猫叫团子'),message('request','忘记那件事')]);
   const before=store.revision(scope());const port=lifecycle(store,async input=>({...none(input),request:'forget',clarification:'你指的是哪件事？'}));
   assert.equal((await port.prepareTurn(scope(),'request','忘记那件事',signal())).status,'needs_clarification');assert.equal(store.revision(scope()),before);
+  // A recorded clarification now settles this turn: repeating the same message must not be re-decided, so
+  // the unexecutable-plan case gets its own turn instead of reusing 'request'.
+  store.append(scope(),[message('unexecutable','忘记那件事')]);
+  const afterAppend=store.revision(scope());
   const unexecutable=lifecycle(store,async input=>({...none(input),request:'forget',reason:'mixed source cannot safely preserve unrelated facts'}));
-  assert.equal((await unexecutable.prepareTurn(scope(),'request','忘记那件事',signal())).status,'rejected');assert.equal(store.revision(scope()),before);
+  assert.equal((await unexecutable.prepareTurn(scope(),'unexecutable','忘记那件事',signal())).status,'rejected');assert.equal(store.revision(scope()),afterAppend);
   assert.equal(store.inspect(scope(),'raw')!.text,'面试失败了，另外我养的猫叫团子');assert.equal(store.inspect(scope(),'request')!.state,'active');
 });
 

@@ -84,7 +84,8 @@ export function prepareSourcePlan(db: Database.Database, store: SqliteMemoryStor
     roots.add(input.currentMessageId);
   }
   // Summary ancestors may still contain the forgotten words. Expired payloads are metadata only.
-  for (let changed=true;changed;) {
+  for (let changed=true,guard=0;changed;) {
+    if(++guard>graph.size+2)throw new MemoryRuleError('source_graph_not_converging');
     changed=false;
     for (const id of descendants(graph,[...roots,...mutationRoots])) {
       const node=graph.get(id);

@@ -12,8 +12,12 @@ import {SqliteManagementForget,type ManagementForgetTicket} from './sqlite-manag
 import type {MemoryRecordAction,MemoryRecordActionResult} from '../contracts/memory-dynamics.js';
 export type {ManagementForgetTicket} from './sqlite-management-forget.js';
 import {applySourcePlan,prepareSourcePlan} from './sqlite-source-plan.js';
+import {lifecycleDiagnostic} from './lifecycle-diagnostic.js';
 
 const hash = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+/** Absolute ceiling on the records one turn may carry. The token budget is the real limit; this only
+ *  exists so a pathological evidence chain cannot make the synchronous read path unbounded. */
+const MAX_TURN_SOURCES = 2048;
 export interface InputBudget<T> { readonly inputTokenBudget: number; readonly countTokens: (input: T) => number }
 export interface TurnReadOptions extends InputBudget<MemoryTurnInput> { readonly maxRecentMessages: number; readonly maxMemories: number; readonly summaryLimit: number }
 export interface SummaryReadOptions extends InputBudget<SummaryInput> { readonly minMessages: number; readonly maxMessages: number }
@@ -139,34 +143,56 @@ export class SqliteLifecycleState {
       const input=():MemoryTurnInput=>({scope:owned,currentMessageId,sources:[...chosen.values()].map(record=>this.#source(owned,record)),
         messages:[...chosen.values()].filter(record=>record.kind==='transcript'&&record.id!==currentMessageId).sort((a,b)=>(a.logicalOrder??0)-(b.logicalOrder??0)||a.id.localeCompare(b.id)).map(record=>record.message!).concat(current.message!),
         relevantMemories:[...chosen.values()].filter(record=>record.kind==='memory').map(record=>this.#reference(record))});
-      const fits=()=>{
-        const records=[...chosen.values()];
-        return records.filter(r=>r.kind==='memory').length<=options.maxMemories && records.filter(r=>r.kind==='transcript').length<=options.maxRecentMessages && records.filter(r=>r.kind==='summary').length<=options.summaryLimit && this.#fits(input(),options);
-      };
-      if(!fits())throw new MemoryRuleError('current_message_exceeds_turn_budget');
-      const includeNodes=(ids:Iterable<string>,required:boolean)=>{
-        const nodes=[...ids].map(key=>graph.get(key)).filter((item):item is NonNullable<typeof item>=>!!item&&readable(item));
-        const added:string[]=[];
-        const future=nodes.some(item=>item.kind==='transcript'&&item.order>=node.order&&item.id!==currentMessageId);
-        if(!future)for(const item of nodes)if(!chosen.has(item.id)){chosen.set(item.id,this.store.inspect(owned,item.id)!);added.push(item.id);}
-        if(future||!fits()){
-          for(const key of added)chosen.delete(key);
-          if(required)throw new MemoryRuleError(future?'turn_group_contains_future_source':'turn_source_group_exceeds_budget');
+      // The transcript count stays a real ceiling on the whole group, but only the CURRENT message and
+      // the memories maintenance must act on are required to be read. Recent summaries are enrichment:
+      // one summary drags its entire transitive coverage into the group, so requiring them made the
+      // group grow monotonically until every turn was rejected with turn_source_group_exceeds_budget
+      // while the token budget was wide open, and no long-term memory was written again. A summary that
+      // does not fit is skipped as ONE bundle (never truncated inside the chain) and recorded, so the
+      // turn still completes instead of being rejected for its enrichment.
+      const windowIds = new Set<string>(), omittedIds = new Set<string>();
+      const count = (kind: MemoryRecord['kind']) => { let total = 0; for (const record of chosen.values()) if (record.kind === kind) total++; return total; };
+      const groupFits = () => count('memory') <= options.maxMemories && count('summary') <= options.summaryLimit
+        && count('transcript') <= options.maxRecentMessages && chosen.size <= MAX_TURN_SOURCES && this.#fits(input(), options);
+      if (!groupFits()) throw new MemoryRuleError('current_message_exceeds_turn_budget');
+      // Evidence that does not fit is skipped as a whole candidate, never truncated inside a chain: half
+      // a chain would let a forget leave text behind. A REQUIRED candidate that does not fit still
+      // rejects the turn, because proceeding without it is exactly the silent failure being guarded.
+      const includeNodes = (ids: Iterable<string>, required: boolean, windowId?: string) => {
+        const nodes = [...ids].map(key => graph.get(key)).filter((item): item is NonNullable<typeof item> => !!item && readable(item));
+        const added: string[] = [];
+        const future = nodes.some(item => item.kind === 'transcript' && item.order >= node.order && item.id !== currentMessageId);
+        if (!future) for (const item of nodes) if (!chosen.has(item.id)) { chosen.set(item.id, this.store.inspect(owned, item.id)!); added.push(item.id); }
+        const window = windowId !== undefined && !windowIds.has(windowId) && added.includes(windowId) ? windowId : undefined;
+        if (window !== undefined) windowIds.add(window);
+        if (future || !groupFits()) {
+          for (const key of added) chosen.delete(key);
+          if (window !== undefined) windowIds.delete(window);
+          if (!future) for (const key of added) omittedIds.add(key);
+          if (required) {
+            lifecycleDiagnostic('read-turn-reject id=' + currentMessageId + ' code=' + (future ? 'turn_group_contains_future_source' : 'turn_source_group_exceeds_budget')
+              + ' transcripts=' + count('transcript') + '/' + options.maxRecentMessages + ' summaries=' + count('summary') + '/' + options.summaryLimit
+              + ' memories=' + count('memory') + '/' + options.maxMemories + ' sources=' + chosen.size + ' added=' + added.length);
+            throw new MemoryRuleError(future ? 'turn_group_contains_future_source' : 'turn_source_group_exceeds_budget');
+          }
           return false;
         }
         return true;
       };
-      const include=(id:string,required:boolean)=>{
-        const core=related(graph,id);
-        if(includeNodes(core,required))includeNodes(effectCandidates(graph,core),false);
+      const include = (id: string, required: boolean, window = false) => {
+        const core = related(graph, id);
+        if (includeNodes(core, required, window ? id : undefined)) includeNodes(effectCandidates(graph, core), false);
       };
-      include(currentMessageId,true);
-      for(const memory of this.store.searchForMaintenance(owned,text,options.maxMemories,'lexical'))include(memory.id,true);
-      const prior=[...graph.values()].filter(item=>readable(item)&&item.order<node.order&&!this.store.imports.isEvidence(owned,item.id)).sort((a,b)=>b.order-a.order||a.id.localeCompare(b.id));
-      for(const item of prior.filter(item=>item.kind==='transcript').slice(0,Math.max(0,options.maxRecentMessages-1)))include(item.id,false);
-      for(const item of prior.filter(item=>item.kind==='summary').slice(0,options.summaryLimit))include(item.id,true);
-      const ticket=Object.freeze({input:structuredClone(input()),epoch:this.#epoch(owned),textHash:hash(text)});
-      this.#turns.set(ticket,structuredClone(ticket));return ticket;
+      include(currentMessageId, true);
+      for (const memory of this.store.searchForMaintenance(owned, text, options.maxMemories, 'lexical')) include(memory.id, true);
+      const prior = [...graph.values()].filter(item => readable(item) && item.order < node.order && !this.store.imports.isEvidence(owned, item.id)).sort((a, b) => b.order - a.order || a.id.localeCompare(b.id));
+      for (const item of prior.filter(item => item.kind === 'transcript').slice(0, Math.max(0, options.maxRecentMessages - 1))) include(item.id, false, true);
+      for (const item of prior.filter(item => item.kind === 'summary').slice(0, options.summaryLimit)) include(item.id, false);
+      lifecycleDiagnostic('read-turn id=' + currentMessageId + ' window=' + windowIds.size + '/' + options.maxRecentMessages
+        + ' transcripts=' + count('transcript') + ' summaries=' + count('summary') + ' memories=' + count('memory')
+        + ' sources=' + chosen.size + (omittedIds.size ? ' omitted=' + omittedIds.size : ''));
+      const ticket = Object.freeze({ input: structuredClone(input()), epoch: this.#epoch(owned), textHash: hash(text) });
+      this.#turns.set(ticket, structuredClone(ticket)); return ticket;
     })();
   }
   discardTurn(ticket: TurnTicket): void { this.#turns.delete(ticket); }
@@ -259,7 +285,14 @@ export class SqliteLifecycleState {
         const base = { scope, request: plan.request, results: [] as readonly MemoryChangeResult[], affectedIds: [] as readonly string[], retrievalInvalidated: false, clarification: null };
         if (plan.clarification !== null) {
           if (!plan.clarification?.trim() || plan.changes.length || plan.suppressSources.length || (plan.retainSources?.length??0)) throw new MemoryRuleError('clarification_with_mutations');
-          return { ...base, status: 'needs_clarification' as const, clarification: plan.clarification };
+          const outcome = { ...base, status: 'needs_clarification' as const, clarification: plan.clarification };
+          // Recorded like any other outcome. This used to return before the INSERT below, so a clarified
+          // turn left NO row at all: it could not be told apart from a turn that never ran, the console had
+          // nothing to explain, and a retry could not recognise the prior decision. A clarification is a
+          // decision ("insufficient information — ask"), not the absence of one.
+          this.db.prepare('INSERT INTO memory_turn_outcomes(character_id,current_message_id,scope_json,text_hash,plan_hash,outcome_json) VALUES(?,?,?,?,?,?)')
+            .run(scope.characterId, ticket.input.currentMessageId, JSON.stringify(scope), ticket.textHash, hash(plan), JSON.stringify(outcome));
+          return outcome;
         }
         const {results,affectedIds}=applySourcePlan(this.db,this.store,ticket.input,plan,{prune:!this.managementCurrents.has(ticket.input.currentMessageId)});
         this.store.emotion.invalidate();

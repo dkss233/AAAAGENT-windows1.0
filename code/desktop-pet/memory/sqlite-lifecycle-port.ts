@@ -4,6 +4,7 @@ import { MemoryRuleError, bindScope } from './scope.js';
 import { SqliteMemoryPort, abortable, checkAbort, type SqliteContextOptions } from './sqlite-port.js';
 import type { InputBudget, SummaryReadOptions } from './sqlite-lifecycle-state.js';
 import { SqliteMemoryStore } from './sqlite-store.js';
+import { lifecycleDiagnostic } from './lifecycle-diagnostic.js';
 
 export interface SqliteLifecycleOptions {
   readonly context: SqliteContextOptions;
@@ -29,7 +30,21 @@ export class SqliteLifecycleMemoryPort extends SqliteMemoryPort implements Backg
     return this.prepare(scope,currentMessageId,text,signal,true);
   }
   async prepareBackgroundTurn(scope: TurnScope, currentMessageId: string, text: string, signal: AbortSignal): Promise<MemoryTurnOutcome> {
-    return this.prepare(scope,currentMessageId,text,signal,false);
+    // Always recorded, never gated: this is the only place that can tell "the background turn never ran"
+    // apart from "it ran and was rejected", and both look identical in the database (no outcome row).
+    const limits = this.lifecycleOptions.turn.readLimits ?? this.lifecycleOptions.context;
+    lifecycleDiagnostic('background-enter id=' + currentMessageId + ' maxRecentMessages=' + limits.maxRecentMessages
+      + ' maxMemories=' + limits.maxMemories + ' summaryLimit=' + limits.summaryLimit
+      + ' inputTokenBudget=' + this.lifecycleOptions.turn.inputTokenBudget + ' aborted=' + signal.aborted);
+    try {
+      const outcome = await this.prepare(scope, currentMessageId, text, signal, false);
+      lifecycleDiagnostic('background-exit id=' + currentMessageId + ' status=' + outcome.status
+        + (outcome.rejectionCode ? ' rejectionCode=' + outcome.rejectionCode : '') + ' affected=' + outcome.affectedIds.length);
+      return outcome;
+    } catch (error) {
+      lifecycleDiagnostic('background-throw id=' + currentMessageId + ' error=' + (error instanceof Error ? error.message : String(error)));
+      throw error;
+    }
   }
   private async prepare(scope:TurnScope,currentMessageId:string,text:string,signal:AbortSignal,registerForeground:boolean):Promise<MemoryTurnOutcome> {
     checkAbort(signal); const owned = bindScope(scope, scope.characterId);
@@ -37,7 +52,15 @@ export class SqliteLifecycleMemoryPort extends SqliteMemoryPort implements Backg
     if (prior) {if(registerForeground)this.store.lifecycle.registerCurrent(owned,currentMessageId,text,prior);return prior;}
     let ticket;
     try {ticket=this.store.lifecycle.readTurn(owned,currentMessageId,text,{...(this.lifecycleOptions.turn.readLimits??this.lifecycleOptions.context),...this.lifecycleOptions.turn});}
-    catch(error){if(!(error instanceof MemoryRuleError))throw error;this.store.pending.fail(owned,currentMessageId);return {scope:owned,request:'none',status:'rejected',results:[],affectedIds:[],retrievalInvalidated:false,clarification:null,rejectionCode:error.message};}
+    catch(error){if(!(error instanceof MemoryRuleError))throw error;
+      // A read failure means the turn never started: nothing was applied and nothing is pending, so it is
+      // NOT a privacy hold. Marking it 'failed' did create one, has() counts 'failed', and nothing ever
+      // releases it — so a single 'turn_source_group_exceeds_budget' (the source group that must be read
+      // grew past the configured budget) froze that character's memory reads and writes permanently, on
+      // every following turn. The rejection is still returned and still visible; it just must not take the
+      // durable-hold path that is reserved for writes whose outcome is unknown.
+      this.store.pending.releaseClarification(owned,currentMessageId);
+      return {scope:owned,request:'none',status:'rejected',results:[],affectedIds:[],retrievalInvalidated:false,clarification:null,rejectionCode:error.message};}
     try {
       checkAbort(signal);
       let plan = await abortable(this.lifecycleOptions.turn.provider.plan(structuredClone(ticket.input), signal), signal);
@@ -54,7 +77,11 @@ export class SqliteLifecycleMemoryPort extends SqliteMemoryPort implements Backg
       }
       checkAbort(signal); const outcome=this.store.lifecycle.commitTurn(ticket,plan);
       if(registerForeground)this.store.lifecycle.registerCurrent(owned,currentMessageId,text,outcome);
-      if(outcome.status==='rejected'||outcome.status==='needs_clarification')this.store.pending.fail(owned,currentMessageId);
+      // 'rejected' stays a durable hold: the write did not land and the state is genuinely unknown, so
+      // memory must stay conservative. 'needs_clarification' is NOT that case — the planner applied
+      // nothing and asked a question instead, so the request is answered rather than failed.
+      if(outcome.status==='rejected')this.store.pending.fail(owned,currentMessageId);
+      else if(outcome.status==='needs_clarification')this.store.pending.releaseClarification(owned,currentMessageId);
       return outcome;
     } catch(error) {if(!this.store.closed)this.store.pending.fail(owned,currentMessageId);throw error;
     } finally { this.store.lifecycle.discardTurn(ticket); }
