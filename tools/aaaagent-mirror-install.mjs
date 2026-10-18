@@ -133,5 +133,11 @@ export async function installWithMirror(root, say = console.log) {
   say('');
   say('  [3/3] 编译完成。');
   say('');
+
+  // Doctor is a release-readiness report, not a build step: report it, never block a first install.
+  say('  运行环境自检（doctor，仅供参考）…');
+  const doctor = await run('npm', ['run', 'doctor'], repo, say);
+  say(doctor === 0 ? '  自检通过。' : '  自检有项目未通过（不影响启动，需要时再排查）。');
+  say('');
   return true;
 }

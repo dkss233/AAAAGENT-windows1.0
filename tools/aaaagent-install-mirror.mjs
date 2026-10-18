@@ -14,6 +14,15 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 if (!await installWithMirror(root, console.log)) process.exit(1);
 
+if (process.argv.includes('--no-launch')) {
+  console.log('');
+  console.log('  ============================================');
+  console.log('   安装与构建完成');
+  console.log('  ============================================');
+  console.log('');
+  process.exit(0);
+}
+
 console.log('');
 console.log('  ============================================');
 console.log('   安装完成，正在启动桌宠');
