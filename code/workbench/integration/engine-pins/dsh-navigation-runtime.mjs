@@ -13,7 +13,7 @@ const sourceMapTrailer = /(?:\r?\n)?\/\/# sourceMappingURL=[^\r\n]*(?:\r?\n)?$/;
 
 /** The fixed client-modules server removes debug trailers and serves one exact factory registration. */
 export function expectedDshNavigationModule(client, rev) {
-  if (sha256(client) !== navigationSource.patchedSha256 || !/^[a-f0-9]{12}$/.test(rev)) unavailable();
+  if (sha256(client) !== navigationSource.sourceSha256 || !/^[a-f0-9]{12}$/.test(rev)) unavailable();
   let source = client.toString('utf8').replace(sourceUrlTrailer, '').replace(sourceMapTrailer, '');
   if (!source.endsWith('\n')) source += '\n';
   return Buffer.from(source + ';\n//# sourceMappingURL=??' + navigationSource.package + '/client.js.map&rev=' + rev + '\n');
@@ -40,7 +40,7 @@ export async function verifyDshNavigationHost({ profile, readHost, launchUrl, ex
     if (host.origin !== expectedOrigin || host.runtimeRoot !== profile.runtimeRoot || host.home !== profile.home ||
         host.dataHome !== profile.dshHome || host.projectRoot !== profile.projectRoot ||
         host.inventorySha256 !== profile.runtime.inventorySha256 || !host.nonce ||
-        sha256(client) !== navigationSource.patchedSha256 ||
+        sha256(client) !== navigationSource.sourceSha256 ||
         sha256(readFileSync(join(profile.runtimeRoot, controllerPath))) !== navigationSource.sessionClientSha256) unavailable();
     const origin = new URL(host.origin), url = new URL(launchUrl);
     if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || !origin.port || origin.pathname !== '/' ||

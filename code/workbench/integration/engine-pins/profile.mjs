@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -76,7 +76,18 @@ export function installEngineProfile(projectRoot, runtimeRoot, t3Home, { codexHo
   writeFileSync(launcher, codexLauncher(runtime, home, codexHome ?? join(home,'.codex')), { flag: 'wx', mode: 0o700 });
   mkdirSync(home, { recursive: true, mode: 0o700 });
   restrictPrivatePathSync(home);
-  for (const name of ['.codex', '.dsh']) mkdirSync(join(home, name), { mode: 0o700 });
+  // Idempotent on purpose: repairing an install whose engine was rebuilt must not fail just because
+  // these data homes already exist. Nothing inside them is touched.
+  for (const name of ['.codex', '.dsh']) mkdirSync(join(home, name), { recursive: true, mode: 0o700 });
+  // The session-entry client plugin belongs to the WEB PROFILE, not to the engine: the Loader anchors
+  // baseUrl at the profile directory and resolves plugin names from there, so a package that is only
+  // in the engine's node_modules fails to import. The engine ships the bytes; this places them.
+  const pluginSource = join(runtime.root, 'dsh/node_modules/@aaaagent/dsh-session-entry');
+  if (existsSync(pluginSource)) {
+    const pluginTarget = join(home, '.dsh/profiles/web/node_modules/@aaaagent/dsh-session-entry');
+    mkdirSync(dirname(pluginTarget), { recursive: true, mode: 0o700 });
+    cpSync(pluginSource, pluginTarget, { recursive: true });
+  }
   const dshPresetOverlay=join(projectRoot,'artifacts/runtime/engine-bindings/dsh-presets.patch.yml');
   writeFileSync(dshPresetOverlay,presetOverlay(projectRoot,home,runtime.nodeExecutable,dshHome ?? join(home,'.dsh')),{flag:'wx',mode:0o600});
   const profile = { version: 1, projectRoot, runtimeRoot, home, dshWebLog: join(home, 'dsh-web.log'), codexLauncher: launcher, dshPresetOverlay, codexHome: codexHome ?? join(home,'.codex'), dshHome: dshHome ?? join(home,'.dsh') };

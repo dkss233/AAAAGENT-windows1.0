@@ -1,6 +1,8 @@
 import type { EmotionManagement } from '../contracts/emotion-state.js';
 import { restrictPrivatePathSync } from '../core/platform-files.js';
 import { createSelfSetup } from './self-setup.js';
+import { createCustomTtsManagement } from './custom-tts.js';
+import { engineInstallPort } from './engine-install.js';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type { MemoryImportManagement } from '../contracts/memory-import.js';
@@ -13,6 +15,8 @@ import { readFile, writeFile, unlink, rename } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import type { PresentationControls } from '../contracts/presentation-presets.js';
 import { presentationAssetRoutes } from './presentation-assets.js';
+import { modelInstallPort } from './model-install.js';
+import { wakeInstallPort } from './wake-install.js';
 import type { ManagementMemoryPort } from '../contracts/management.js';
 import type { TrialConfiguration } from '../app/trial-config.js';
 import { readDesktopCoordinatorProfile } from '../app/desktop-workbench.js';
@@ -40,6 +44,7 @@ import { HarnessForwarding } from '../harness/forwarding.js';
 import { ForwardReceipts } from '../harness/receipts.js';
 import { HarnessConnection } from '../harness/connection.js';
 import { CodexAppConnection, verifyCodexAppBuild } from '../harness/codex-app.js';
+import { CodexWindowsConnection } from '../harness/codex-windows.js';
 import { harnessLaunchUrl, relayPresetReady, workPresetReady, RELAY_PRESET_ID } from '../harness/preset.js';
 import type { EngineProfile } from '../../workbench/integration/engine-pins/profile.mjs';
 import type { DailyNativeMount } from '../../workbench/integration/engine-pins/daily-native-mount.mjs';
@@ -78,9 +83,18 @@ export async function startRuntimeManagement(base: TrialConfiguration, configFil
   };
   let engineProfile: EngineProfile | undefined;
   let engineProfileInvalid = false;
+  let readEngineProfileFile: ((root: string) => EngineProfile | undefined) | undefined;
   try { const { readEngineProfile } = await import(new URL('../../../workbench/integration/engine-pins/profile.mjs', import.meta.url).href);
+    readEngineProfileFile = readEngineProfile;
     engineProfile = readEngineProfile(base.projectRoot); }
   catch { engineProfileInvalid = true; process.stderr.write('Project engine profile unavailable; no global engine fallback.\n'); }
+  /** The console can install the engine while this backend runs, so the answer is re-read on demand
+   *  instead of frozen at startup. A valid profile is cached; an absent one is retried. */
+  const currentEngineProfile = (): EngineProfile | undefined => {
+    if (engineProfile) return engineProfile;
+    try { engineProfile = readEngineProfileFile?.(base.projectRoot); } catch { return undefined; }
+    return engineProfile;
+  };
   let workbench: WorkbenchService | undefined;
   let model: ProjectTerminalModelCallPort | null = null;
   let derive: ProjectTerminalDeriver | undefined;
@@ -186,21 +200,51 @@ export async function startRuntimeManagement(base: TrialConfiguration, configFil
     const log = engineProfile?.dshWebLog ?? resolve(harnessDirectory, 'web.log');
     // Status must never start the host by itself: the host costs ~420 MB, so "is it up?" is answered
     // by a short-cached liveness read and nothing more. Starting it is the operator's explicit choice
-    // (the console's button, 启动Harness.cmd, or the first work operation).
+    // (the console's 任务转发 button, or the first work operation).
     const harness = new HarnessConnection(async () => harnessLaunchUrl(log), 5000, !!engineProfile,
       engineProfile ? async origin => {
         const { verifyDshNavigationRuntime } = await import(new URL('../../../workbench/integration/engine-pins/dsh-navigation-runtime.mjs', import.meta.url).href);
         return (await verifyDshNavigationRuntime(base.projectRoot, origin)).capabilityVersion;
       } : 0);
-    return new HarnessForwarding({ receipts, projects:projects!,
-      codex: new CodexAppConnection(resolve(homedir(), '.codex')), compatible: verifyCodexAppBuild,
+    // The macOS App is reached over its private IPC socket and asar build; Windows has a supported
+    // app-server over stdio instead, so the platform picks the implementation rather than the gate.
+    const windowsCodex = process.platform === 'win32';
+    const codexConnection: CodexAppConnection = windowsCodex
+      ? new CodexWindowsConnection(resolve(homedir(), '.codex'))
+      : new CodexAppConnection(resolve(homedir(), '.codex'));
+    // Probing the Windows side boots its app-server child, so a console poll must not pay for it.
+    // The probe boots an app-server and can take ~16 s, so status answers from a cached verdict and
+    // refreshes it in the background: the console must never block on a compatibility check.
+    let codexCheck = { at: 0, value: false, running: false };
+    const codexCompatible = windowsCodex ? async () => {
+      if (!codexCheck.running && Date.now() - codexCheck.at > 60000) {
+        codexCheck = { ...codexCheck, running: true };
+        void (codexConnection as CodexWindowsConnection).compatible()
+          .then(value => { codexCheck = { at: Date.now(), value, running: false }; })
+          .catch(() => { codexCheck = { at: Date.now(), value: false, running: false }; });
+      }
+      return codexCheck.value;
+    } : verifyCodexAppBuild;
+    // Every Harness entry point that talks to the Host goes through here first: a cold Host needs
+    // 10-20 s to boot, and the 4 s status window is only acceptable for polls.
+    const requireHost = async (logPath: string, strict = true): Promise<boolean> => {
+      const current = currentEngineProfile();
+      if (!current) throw Error('Harness engine runtime unavailable');
+      const { ensureHarnessHost } = await import('../harness/on-demand.js');
+      const started = await ensureHarnessHost(current, logPath, 120000);
+      if (!started && strict) throw Error('Harness host did not start');
+      return started;
+    };
+    return new HarnessForwarding({ receipts, projects:projects!, enginePresent: () => !!currentEngineProfile(),
+      codex: codexConnection, compatible: codexCompatible,
       // Confirming a task is the moment work actually runs, and the operator is waiting for it, so
       // that path starts the host and waits. Everything else stays passive.
       startHarness: async () => {
-        if (!engineProfile) return false;
+        const profile = currentEngineProfile();
+        if (!profile) return false;
         try {
           const { ensureHarnessHost } = await import('../harness/on-demand.js');
-          return await ensureHarnessHost(engineProfile, log, 120000);
+          return await ensureHarnessHost(profile, log, 120000);
         } catch (error) { process.stderr.write('Harness start failed: ' + String(error).slice(0, 200) + '\n'); return false; }
       },
       harness: engineProfile ? new Proxy(harness, {
@@ -208,12 +252,40 @@ export async function startRuntimeManagement(base: TrialConfiguration, configFil
           if (property !== 'createWorkSession') return Reflect.get(target, property, receiver);
           return async (sessionId: string, cwd: string) => {
             const { ensureHarnessHost } = await import('../harness/on-demand.js');
-            await ensureHarnessHost(engineProfile, log);
+            const current = currentEngineProfile();
+            if (!current) throw Error('Harness engine runtime unavailable');
+            // Confirming a task is the one moment the operator is actually waiting on the host, so wait
+            // for the whole boot. The 4 s status window is fine for polls, but DSH needs 10-20 s; a
+            // create against a host that has not bound its port yet throws and leaves the receipt
+            // stuck at "unknown", which looks like the task vanished.
+            if (!(await ensureHarnessHost(current, log, 120000))) throw Error('Harness host did not start');
             return target.createWorkSession(sessionId, cwd);
           };
         },
       }) : harness,
-      nativeWork: harness, workPresetReady: () => workPresetReady(location),
+      // The work path needs the host too, and it is NOT the proxied `harness` above: every entry that
+      // talks to the Host starts it first and waits for the whole boot. Without this, confirming a task
+      // against a cold Host failed in milliseconds and the receipt stuck at "unknown".
+      nativeWork: {
+        workHostUrl: () => harness.workHostUrl(),
+        workAuthUrl: () => harness.workAuthUrl(),
+        workSessionUrl: binding => harness.workSessionUrl(binding),
+        workSessionUrlById: sessionId => harness.workSessionUrlById(sessionId),
+        createWorkSession: async (sessionId: string, cwd: string) => {
+          await requireHost(log);
+          return harness.createWorkSession(sessionId, cwd);
+        },
+        submitWork: async (sessionId: string, requestId: string, text: string) => {
+          await requireHost(log);
+          return harness.submitWork(sessionId, requestId, text);
+        },
+        workReceipt: async (sessionId: string, requestId: string) => {
+          const started = await requireHost(log, false);
+          if (!started) return { status: 'unknown' as const, detail: '暂时无法核实这次任务的状态；不会自动重发。' };
+          return harness.workReceipt(sessionId, requestId);
+        },
+      },
+      workPresetReady: () => workPresetReady(location),
       presetReady: () => relayPresetReady(location), presetId: RELAY_PRESET_ID,
       // Where Harness sessions run. The project default is a private, empty workspace under the
       // engine home; an operator who wants the pet to work in their own tree points
@@ -228,10 +300,19 @@ export async function startRuntimeManagement(base: TrialConfiguration, configFil
     tasks = makeForwarding(receipts);
   } catch { process.stderr.write('Task relay unavailable; companion data unchanged.\n'); }
   let server: Awaited<ReturnType<typeof startManagementServer>>;
-  try { server = await startManagementServer({ ...(emotion?{emotion}:{}), selfSetup, ...(memoryImport?{memoryImport}:{}), balances, ...(wake?{wake}:{}), uiRoot: resolve(base.projectRoot, 'code/desktop-pet/management/ui'), settings, memory, ...(wechat?{wechat}:{}), ...(projects ? { projects } : {}), ...(projectMemory ? { projectMemory, projectMemoryProcessingAvailable } : {}), ...(workbench ? { workbench } : {}), ...(nativeFrameOrigin ? { nativeFrameOrigin } : {}), ...(tasks ? { tasks } : {}), ...(pendingMemory?{pendingMemory}:{}), ...(presentation ? { presentation, presentationAssets: await presentationAssetRoutes(base.projectRoot) } : {}),
+  try { server = await startManagementServer({ ...(emotion?{emotion}:{}), selfSetup, ...(memoryImport?{memoryImport}:{}), balances, ...(wake?{wake}:{}), uiRoot: resolve(base.projectRoot, 'code/desktop-pet/management/ui'), settings, memory, ...(wechat?{wechat}:{}), ...(projects ? { projects } : {}), ...(projectMemory ? { projectMemory, projectMemoryProcessingAvailable } : {}), ...(workbench ? { workbench } : {}), ...(nativeFrameOrigin ? { nativeFrameOrigin } : {}), ...(tasks ? { tasks } : {}), ...(pendingMemory?{pendingMemory}:{}), ...(presentation ? { presentation, presentationAssets: await presentationAssetRoutes(base.projectRoot) } : {}), ...(presentation ? { modelInstall: modelInstallPort(base.projectRoot) } : {}), ...(wake ? { wakeInstall: wakeInstallPort(base.projectRoot) } : {}),
+    // The custom-speech editor writes the configuration pair itself. Seeded from the block the backend
+    // launched with, so the page shows what is actually in force rather than what was last submitted.
+    customTts: createCustomTtsManagement(configFile, base.customTts),
+    engineInstall: engineInstallPort(base.projectRoot),
     snapshot: async () => ({ apiVersion: 1, balances:balances.snapshot(), accounting:await accountingSnapshot(base), runtime: runtime.identity(), modules: runtime.modules(), events: runtime.recentEvents(),
       settings: settings.snapshot(), adapters: availableAdapters(base, settings.registeredVoices), credentials: credentialRegistry(base).list(), characters: memory.characters() }) });
   } catch (error) { await selfSetup.close(); await tasks?.close(); workbenchStore?.close(); await t3Service?.stop(); await projectMemory?.close(); await projects?.close(); throw error; }
+  // Warm the ACL verdict cache before the console can ask for it. Verifying each owned path costs one
+  // powershell start on Windows, and the console's own fetch gives up after four seconds, so the
+  // first snapshot used to fail while later ones were instant. Paying it here, once, keeps the
+  // button working on the first press after every restart.
+  try { credentialRegistry(base).list(); } catch { /* The snapshot reports unavailable credentials itself. */ }
   if (workbench) void workbench.recoverTerminalDelivery().catch(() => undefined);
   if (dailyMountOptions && t3Service) try {
     const { startDailyNativeMount } = await import(new URL('../../../workbench/integration/engine-pins/daily-native-mount.mjs', import.meta.url).href);
@@ -259,7 +340,7 @@ export async function startRuntimeManagement(base: TrialConfiguration, configFil
     try { balances.close(); await selfSetup.close(); await dailyMount?.close(); await server.close(); await memoryImport?.close(); } finally { await tasks?.close(); workbenchStore?.close(); await t3Service?.stop(); await projectMemory?.close(); await projects?.close(); }
     // The Harness host is detached, so it outlives the pet by design — right for a restart, wasteful
     // once the operator is done with it (~420 MB). Stop only the host this run started; a host from
-    // 启动Harness.cmd or an earlier session is not ours to kill. AAAAGENT_KEEP_HARNESS=1 keeps it.
+    // an earlier session or the console's button is not ours to kill. AAAAGENT_KEEP_HARNESS=1 keeps it.
     if (engineProfile && process.env.AAAAGENT_KEEP_HARNESS !== '1') try {
       const { stopOwnedHarnessHost } = await import('../harness/on-demand.js');
       await stopOwnedHarnessHost(engineProfile.dshWebLog);

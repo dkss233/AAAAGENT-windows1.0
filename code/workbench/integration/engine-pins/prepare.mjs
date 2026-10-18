@@ -5,7 +5,7 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prepareCodex, codexLock } from '../prepare-codex.mjs';
 import { prepareDshController } from '../dsh-controller.mjs';
-import { prepareDshNativeNavigation, navigationSource } from '../dsh-patches/native-session-navigation.mjs';
+// The session-entry navigation is a client plugin now (copied below), not a patch of DSH's bundle.
 import { engineDirectory, engineInventory, engineLock, here, sha256, verifyEngineRuntime } from './runtime.mjs';
 
 function checkedArchive(name, downloads) {
@@ -62,10 +62,11 @@ export async function assembleEngines(stage, { downloads, cache }) {
   const controller = join(dsh, 'node_modules/@deepseek-ai/dsh-api-session-controller'), patched = controller + '.aaaagent-patched';
   await prepareDshController(controller, patched);
   rmSync(controller, { recursive: true }); renameSync(patched, controller);
-  const nativeClient = join(dsh, 'node_modules', navigationSource.package, 'lib/client.js');
-  const nativeCandidate = nativeClient + '.aaaagent-navigation';
-  prepareDshNativeNavigation(nativeClient, nativeCandidate);
-  renameSync(nativeCandidate, nativeClient);
+  // Session-entry navigation ships as our own client plugin, so the published DSH browser bundle is
+  // left byte-identical: no textual patching and no resulting hash to re-pin on every upgrade.
+  const sessionEntry = resolve(here, '../../../desktop-pet/plugins/dsh-session-entry');
+  if (!existsSync(join(sessionEntry, 'lib/client.js'))) throw Error('Session entry plugin missing');
+  cpSync(sessionEntry, join(dsh, 'node_modules/@aaaagent/dsh-session-entry'), { recursive: true });
   const files = engineInventory(stage);
   writeFileSync(join(stage, '.aaaagent-engine.json'), JSON.stringify({ engines: engineLock, files }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   return { inventorySha256: sha256(JSON.stringify(files)), fileCount: Object.keys(files).length };

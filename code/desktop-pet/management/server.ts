@@ -18,6 +18,9 @@ import { resolve } from 'node:path';
 import type { CharacterId } from '../contracts/index.js';
 import { ManagementError, type ManagementMemoryPort, type ManagementSnapshot, type RecordQuery, type RecordEdit } from '../contracts/management.js';
 import type { PresentationControls } from '../contracts/presentation-presets.js';
+import type { ModelInstallPort } from './model-install.js';
+import type { EngineInstallPort } from './engine-install.js';
+import type { WakeInstallPort } from './wake-install.js';
 import type { ManagementSettingsStore } from './settings-store.js';
 import { memoryDynamicsRoute } from './memory-dynamics-routes.js';
 import type {PendingMemoryManagement} from './pending-memory.js';
@@ -28,8 +31,9 @@ import type { ProjectMemoryPort } from '../contracts/project-memory.js';
 import { taskRoute, type TaskManagement } from './task-routes.js';
 import { workbenchRoute } from '../app/workbench-routes.js';
 import type { WorkbenchService } from '../app/workbench-service.js';
+import { customTtsRoute, type CustomTtsManagement } from './custom-tts.js';
 
-interface RuntimeServerOptions { emotion?: EmotionManagement; mode?: 'runtime'; selfSetup?:SelfSetupManagement; memoryImport?: MemoryImportManagement; balances?: BalanceManagement; wake?: WakeManagement; wechat?: WeChatManagement; uiRoot: string; memory: ManagementMemoryPort; settings: ManagementSettingsStore; snapshot(): ManagementSnapshot | Promise<ManagementSnapshot>; token?: string; presentation?: PresentationControls; presentationAssets?: ReadonlyMap<string, string>; pendingMemory?:PendingMemoryManagement; projects?: ProjectIndexPort; projectMemory?: ProjectMemoryPort; projectMemoryProcessingAvailable?: boolean; tasks?: TaskManagement; workbench?: WorkbenchService; nativeFrameOrigin?: () => string | undefined }
+interface RuntimeServerOptions { emotion?: EmotionManagement; mode?: 'runtime'; selfSetup?:SelfSetupManagement; memoryImport?: MemoryImportManagement; balances?: BalanceManagement; wake?: WakeManagement; wechat?: WeChatManagement; customTts?: CustomTtsManagement; uiRoot: string; memory: ManagementMemoryPort; settings: ManagementSettingsStore; snapshot(): ManagementSnapshot | Promise<ManagementSnapshot>; token?: string; presentation?: PresentationControls; presentationAssets?: ReadonlyMap<string, string>; modelInstall?: ModelInstallPort; wakeInstall?: WakeInstallPort; engineInstall?: EngineInstallPort; pendingMemory?:PendingMemoryManagement; projects?: ProjectIndexPort; projectMemory?: ProjectMemoryPort; projectMemoryProcessingAvailable?: boolean; tasks?: TaskManagement; workbench?: WorkbenchService; nativeFrameOrigin?: () => string | undefined }
 type ServerOptions = RuntimeServerOptions | { mode:'setup'; selfSetup:SelfSetupManagement; uiRoot:string; token?:string; presentationAssets?:undefined };
 const character = (value: unknown): CharacterId => { if (!isProductCharacter(value)) throw new ManagementError('invalid_request', '仅可访问当前陪伴角色。'); return value; };
 const integer = (value: unknown, fallback: number, min: number, max: number) => { const n = value === null || value === undefined ? fallback : Number(value); if (!Number.isSafeInteger(n) || n < min || n > max) throw new ManagementError('invalid_request', '数值范围无效。'); return n; };
@@ -65,6 +69,9 @@ export async function startManagementServer(options: ServerOptions) {
         names.set('/appearance.mjs', 'appearance.mjs');
         names.set('/native-workbench-view.mjs', 'native-workbench-view.mjs');
         names.set('/context-budget-view.mjs', 'context-budget-view.mjs');
+        // This list is an allow-list, so a view module that is not added here 404s and takes the whole
+        // console down with it (app.mjs imports it statically, so nothing renders).
+        names.set('/custom-tts-view.mjs', 'custom-tts-view.mjs');
         const name = names.get(url.pathname); if (!name) throw new ManagementError('not_found', '没有这个页面。');
         let data: Buffer; try { data = await readFile(resolve(options.uiRoot, name)); } catch { throw new ManagementError('unavailable', '管理页面文件尚未就绪。'); }
         if (name === 'index.html') {
@@ -110,7 +117,26 @@ export async function startManagementServer(options: ServerOptions) {
         if (req.method === 'GET') { json(res, 200, { catalog: options.presentation.catalog, policy: options.presentation.snapshot() }); return; }
         if (req.method === 'PUT') { const b = await body(req); json(res, 200, { catalog: options.presentation.catalog, policy: await options.presentation.save(str(b.modelId, 100), integer(b.expectedRevision, -1, 0, Number.MAX_SAFE_INTEGER), b.enabledIds, b.emotions, b.hiddenIds, b.hiddenValues) }); return; }
       }
+      // Swapping the Live2D rig needs a folder the operator picks in a native dialog, so the backend
+      // runs the installer as a task and the console polls it. The running pet keeps the old model
+      // until restart: the rig is loaded into memory at startup and the renderer assets are rebuilt.
+      if (url.pathname === '/api/presentation/model' && options.modelInstall) {
+        if (req.method === 'GET') { json(res, 200, options.modelInstall.status()); return; }
+        if (req.method === 'POST') { json(res, 200, options.modelInstall.start()); return; }
+      }
+      if (await customTtsRoute(req, url, options.customTts, () => body(req), value => json(res, 200, value))) return;
       if (url.pathname === '/api/wake' && options.wake) { json(res, 200, await wakeRoute(req.method, options.wake, () => body(req))); return; }
+      // The wake-word models are a ~33 MB verified download, so the console starts it and polls.
+      if (url.pathname === '/api/wake/models' && options.wakeInstall) {
+        if (req.method === 'GET') { json(res, 200, options.wakeInstall.status()); return; }
+        if (req.method === 'POST') { json(res, 200, options.wakeInstall.start()); return; }
+      }
+      // The DSH engine runtime is a ~1 GB verified download plus an npm install, so the console
+      // starts it and polls; nothing here blocks the request path.
+      if (url.pathname === '/api/engine/runtime' && options.engineInstall) {
+        if (req.method === 'GET') { json(res, 200, options.engineInstall.status()); return; }
+        if (req.method === 'POST') { json(res, 200, options.engineInstall.start()); return; }
+      }
       if (url.pathname === '/api/wechat' && options.wechat) { json(res, 200, await wechatRoute(req.method, options.wechat, () => body(req))); return; }
       if (req.method === 'GET' && url.pathname === '/api/snapshot') { json(res, 200, await options.snapshot()); return; }
       if (req.method === 'GET' && url.pathname === '/api/records') {

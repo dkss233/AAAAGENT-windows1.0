@@ -13,7 +13,7 @@ const targetKey=t=>t?.hostId+'/'+t?.threadId;
 const projectKey=p=>JSON.stringify([p?.id,p?.version,p?.name,p?.source,p?.detailRef.rootPath,p?.detailRef.entryFile]);
 export function createTasksView(client,render,getHost){
  const s={snapshot:null,targets:[],targetsReady:false,query:'',target:null,text:'',project:null,projectQuery:'',projects:null,showProjects:false,requests:[],selected:null,confirmation:null,revision:0,lastPrepared:null,error:'',message:'',busy:false,stale:true};
- let epoch=0,identity=null,connection=null,returnFocus='tasks-prepare';
+ let epoch=0,identity=null,connection=null,returnFocus='tasks-prepare',installTimer=null;
  const reads=new Map(),uncertain=new Set();
  const host=()=>getHost(),online=()=>host().connection==='online';
  const ready=()=>online()&&!s.stale&&s.snapshot?.connection.harness==='ready'&&s.snapshot.connection.codex==='compatible'&&s.snapshot.connection.preset==='ready';
@@ -111,6 +111,25 @@ export function createTasksView(client,render,getHost){
   // The Harness host costs ~420 MB, so nothing starts it automatically. Offer an explicit start when
   // it is down; that request waits for the boot, so report progress while it works and refresh after.
   const harnessDown=!s.busy&&!!c&&c.harness!=='ready';
+  // No engine runtime installed yet: the same button prepares it instead of starting it.
+  const engineAbsent=c?.engine==='absent';
+  async function installEngine(){
+   if(s.busy||!online())return;
+   s.busy=true;s.error='';s.message='正在准备 DSH 引擎运行时（校验并下载约 1 GB，可能需要几分钟）…';render();
+   try{
+    let state=await client.request('/api/engine/runtime',{method:'POST',body:{}});
+    const deadline=Date.now()+60*60*1000;
+    while(state?.running&&Date.now()<deadline){
+     await new Promise(resolve=>{installTimer=setTimeout(resolve,2000);});
+     state=await client.request('/api/engine/runtime');
+    }
+    if(state?.running){s.message='安装仍在进行，可以稍后回来看状态。';}
+    else if(state?.completed&&state?.installed){s.message='DSH 引擎运行时已就绪，现在可以启动 Harness。';}
+    else if(state?.cancelled){s.message='';s.error='引擎安装已取消。';}
+    else{s.message='';s.error=state?.detail??'引擎运行时未安装成功，请查看 .local\\engine-prepare.log。';}
+   }catch(e){s.message='';s.error=e?.status===404?'当前版本不支持在控制台安装引擎运行时。':'安装未完成：'+(e?.message??'未知原因');}
+   finally{if(installTimer){clearTimeout(installTimer);installTimer=null;}s.busy=false;render();await refresh();}
+  }
   async function startHarness(){
    if(s.busy||!online())return;
    s.busy=true;s.error='';s.message='正在启动 Harness 主机…（通常需要十到二十秒）';render();
@@ -119,10 +138,10 @@ export function createTasksView(client,render,getHost){
    finally{s.busy=false;render();await refresh();}
   }
   const connections=el('div',{class:'task-connections'},...[
-   ['Harness',c?({ready:'已就绪',unavailable:'不可用',authentication_required:'需要认证',incompatible:'版本不兼容'})[c.harness]:'尚未核验'],
+   ['Harness',engineAbsent?'未安装':(c?({ready:'已就绪',unavailable:'不可用',authentication_required:'需要认证',incompatible:'版本不兼容'})[c.harness]:'尚未核验')],
    ['Codex 桌面任务',c?({compatible:'连接兼容',incompatible:'连接不兼容'})[c.codex]:'尚未核验'],
    ['转发配置',c?({ready:'已就绪',unavailable:'不可用'})[c.preset]:'尚未核验']
-  ].map(([label,status])=>el('div',{},el('span',{},label),badge(status))),harnessDown&&button('启动 Harness',startHarness,{id:'tasks-start-harness',disabled:!online()||s.busy||pending}),button('刷新连接与任务',refresh,{id:'tasks-refresh',disabled:!online()||s.busy||pending}));
+  ].map(([label,status])=>el('div',{},el('span',{},label),badge(status))),harnessDown&&button(engineAbsent?'安装 DSH 引擎':'启动 Harness',engineAbsent?installEngine:startHarness,{id:'tasks-start-harness',disabled:!online()||s.busy||pending}),button('刷新连接与任务',refresh,{id:'tasks-refresh',disabled:!online()||s.busy||pending}));
   const composer=el('section',{class:'task-composer'},el('h2',{},'发送到现有任务'),el('form',{class:'searchbar',onSubmit:e=>{e.preventDefault();if(!s.busy)loadTargets();}},field('查找本机现有任务','tasks-query',s.query,v=>{s.query=v},{maxLength:200}),el('button',{type:'submit',id:'tasks-search',disabled:!online()||s.busy||reads.has('targets')},'查找')),
    el('div',{class:'record-list task-targets',id:'task-targets',tabIndex:0,'aria-label':'现有本机任务'},s.targets.length?s.targets.map(t=>button(el('div',{},el('strong',{},t.title),el('small',{},t.projectPath||'未提供项目目录'),el('small',{},t.threadId)),()=>chooseTarget(t),{id:'task-target-'+t.threadId,'data-task-target':t.threadId,class:'record-row','aria-pressed':targetKey(s.target)===targetKey(t),disabled:s.busy})):el('p',{class:'empty'},reads.has('targets')?'正在查找现有任务…':'没有可选任务，请调整查询或核对连接。')),
    s.target&&el('p',{class:'task-selection'},'已选：'+s.target.title+' · '+s.target.threadId),
@@ -133,7 +152,7 @@ export function createTasksView(client,render,getHost){
    el('div',{class:'actions'},button('准备发送',prepare,{id:'tasks-prepare',class:'primary',disabled:!allowedPrepare()})));
   const history=el('section',{class:'task-history'},el('h2',{},'最近转发'),el('p',{class:'subtle'},'最多显示 50 条回执；已接收不代表任务完成。'),
    el('div',{class:'record-list task-request-list',tabIndex:0,'data-scroll-key':'task-requests','aria-label':'最近转发记录'},s.requests.length?s.requests.map(r=>button(el('div',{},el('div',{class:'section-head'},badge(phases[effectivePhase(r)]),el('small',{},time(r.createdAt))),el('p',{},r.text),el('small',{},executionName(r)+(executor(r)==='codex'?' · '+titleFor(r.target):''))),()=>{s.selected=r.id;s.confirmation=null;render();},{id:'task-request-'+r.id,'data-task-request':r.id,class:'record-row','aria-pressed':s.selected===r.id})):el('p',{class:'empty'},'暂无转发记录。')),receiptDetail());
-  return el('div',{class:'tasks-page'},el('p',{class:'subtle'},'查看 Codex 与 Harness 的任务回执，也可在此手动发送到已有 Codex 任务。'),s.error&&notice(s.error,'error'),s.message&&notice(s.message),connections,s.stale&&notice('连接状态尚未更新，暂时不能发送。保留本页草稿与上次回执。','warning'),el('div',{class:'task-workspace'},composer,history),confirmation());
+  return el('div',{class:'tasks-page'},el('p',{class:'subtle'},'查看 Codex 与 Harness 的任务回执，也可在此手动发送到已有 Codex 任务。'),s.error&&notice(s.error,'error'),s.message&&notice(s.message),connections,engineAbsent&&notice('这台安装还没有 DSH 引擎运行时，Harness 相关功能不可用。点「安装 DSH 引擎」会在本机校验并准备一份（约 1 GB 下载），聊天、语音与记忆不受影响。','warning'),s.stale&&notice('连接状态尚未更新，暂时不能发送。保留本页草稿与上次回执。','warning'),el('div',{class:'task-workspace'},composer,history),confirmation());
  }
- return {sync,refresh,view,afterRender,dispose(){epoch++;cancelReads();}};
+ return {sync,refresh,view,afterRender,dispose(){epoch++;cancelReads();if(installTimer){clearTimeout(installTimer);installTimer=null;}}};
 }

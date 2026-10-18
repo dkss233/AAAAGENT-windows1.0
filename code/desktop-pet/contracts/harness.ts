@@ -34,7 +34,9 @@ export const FORWARD_TARGET_LIMIT = 1000;
 export interface ForwardTargets { limit?: typeof FORWARD_TARGET_LIMIT; items: readonly { threadId: string; hostId: 'local'; title: string; projectPath: string }[] }
 export interface ForwardSnapshot {
   requests: readonly ForwardRequest[];
-  connection: { harness: 'ready' | 'unavailable' | 'authentication_required' | 'incompatible'; codex: 'compatible' | 'incompatible'; preset: 'ready' | 'unavailable' };
+  /** engine: 'absent' means no engine runtime is installed here, so the console offers an install
+   *  instead of a start. Optional so an older payload stays valid. */
+  connection: { harness: 'ready' | 'unavailable' | 'authentication_required' | 'incompatible'; codex: 'compatible' | 'incompatible'; preset: 'ready' | 'unavailable'; engine?: 'present' | 'absent' };
 }
 export interface ForwardingPort {
   snapshot(): Promise<ForwardSnapshot>;

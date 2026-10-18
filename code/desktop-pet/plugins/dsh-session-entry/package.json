@@ -1,0 +1,21 @@
+{
+  "name": "@aaaagent/dsh-session-entry",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Open the DSH Session named by the desktop pet deep link (#aaaagent-session=1&sid=...).",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./client": { "default": "./lib/client.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["lib/index.js", "lib/client.js"],
+  "dsh": {
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-workspace", "@deepseek-ai/dsh-api-session-controller"],
+      "platform": "web"
+    }
+  }
+}

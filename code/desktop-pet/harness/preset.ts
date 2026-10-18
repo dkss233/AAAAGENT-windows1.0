@@ -8,7 +8,11 @@ export interface RelayPresetLocation { dshHome: string; projectRoot: string; nod
 /** DSH 0.2 Host presets are declarative rows; reuse the exact existing role compositions. */
 export function nativePresetHostOverlay(location: RelayPresetLocation): string {
   const row = (id: string, content: string) => `    - id: aaaagent-${id}\n      name: '@deepseek-ai/dsh-agent-preset'\n      config:\n        id: ${id}\n        name: ${id}\n        plugins:\n` + content.trimEnd().split('\n').map(line => '          ' + line).join('\n') + '\n';
-  return '- insert:\n' + row(RELAY_PRESET_ID, relayPresetContents(location)) + row('desktop-pet-work-v1', WORK_PRESET_CONTENTS);
+  // The session-entry client plugin is a plain Loader row: dsh-client-modules scans the plugin graph
+  // for packages declaring dsh.client, so inserting the package here is all it takes for the browser
+  // half to load. It carries the deep-link navigation that used to require patching DSH's own bundle.
+  const sessionEntry = "    - id: aaaagent-session-entry\n      name: '@aaaagent/dsh-session-entry'\n";
+  return '- insert:\n' + row(RELAY_PRESET_ID, relayPresetContents(location)) + row('desktop-pet-work-v1', WORK_PRESET_CONTENTS) + sessionEntry;
 }
 export function relayPresetContents(location: RelayPresetLocation): string {
   for (const value of Object.values(location)) if (!isAbsolute(value) || value.includes('\0') || value.includes('\n')) throw Error('Invalid relay location');

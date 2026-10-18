@@ -60,7 +60,8 @@ async function fixture(t) {
 
 test('actual authenticated index graph and full module bytes establish only matching owner capability', async t => {
   const f = await fixture(t), proof = await verifyDshNavigationHost(f.input());
-  assert.equal(proof.capabilityVersion, 1); assert.equal(proof.clientSha256, navigationSource.patchedSha256);
+  // The served client is the published bundle: the entry navigation is a plugin now, not a patch.
+  assert.equal(proof.capabilityVersion, 1); assert.equal(proof.clientSha256, navigationSource.sourceSha256);
   assert.equal(proof.actualServedBytesVerified, true); assert.equal(proof.authenticatedIndexVerified, true);
   assert.equal(proof.servedSha256, createHash('sha256').update(expectedDshNavigationModule(candidate, rev)).digest('hex'));
   assert.deepEqual(f.calls.map(x => x.method), ['GET', 'GET', 'GET']);
